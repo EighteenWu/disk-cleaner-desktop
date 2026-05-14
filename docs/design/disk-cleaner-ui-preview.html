@@ -1,0 +1,1167 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CleanDeck Desktop Preview</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --background: #f4f4f5;
+        --surface: #ffffff;
+        --foreground: #09090b;
+        --muted: #71717a;
+        --muted-surface: #fafafa;
+        --border: #e4e4e7;
+        --border-strong: #d4d4d8;
+        --primary: #18181b;
+        --primary-hover: #27272a;
+        --primary-foreground: #fafafa;
+        --safe: #047857;
+        --safe-bg: #ecfdf5;
+        --safe-border: #bbf7d0;
+        --warn: #b45309;
+        --warn-bg: #fffbeb;
+        --warn-border: #fde68a;
+        --info: #1d4ed8;
+        --info-bg: #eff6ff;
+        --info-border: #bfdbfe;
+        --danger: #dc2626;
+        --danger-bg: #fef2f2;
+        --danger-border: #fecaca;
+        --radius: 8px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--background);
+        color: var(--foreground);
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        font-size: 13px;
+      }
+
+      button,
+      input {
+        font: inherit;
+      }
+
+      .window {
+        display: grid;
+        width: 100vw;
+        height: 100vh;
+        grid-template-rows: 34px 58px minmax(0, 1fr) 34px;
+        background: var(--surface);
+      }
+
+      .titlebar {
+        display: flex;
+        align-items: center;
+        border-bottom: 1px solid var(--border);
+        background: #ffffff;
+        color: #27272a;
+        user-select: none;
+      }
+
+      .titlebar-brand {
+        display: flex;
+        width: 244px;
+        align-items: center;
+        gap: 8px;
+        padding: 0 12px;
+        font-weight: 600;
+      }
+
+      .app-mark {
+        display: grid;
+        width: 20px;
+        height: 20px;
+        place-items: center;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+        background: var(--muted-surface);
+      }
+
+      .menu {
+        display: flex;
+        height: 100%;
+        align-items: center;
+        gap: 2px;
+      }
+
+      .menu button,
+      .window-control {
+        height: 100%;
+        border: 0;
+        background: transparent;
+        color: #52525b;
+        padding: 0 12px;
+        cursor: pointer;
+      }
+
+      .menu button:hover,
+      .window-control:hover {
+        background: var(--muted-surface);
+        color: #09090b;
+      }
+
+      .title-spacer {
+        flex: 1;
+      }
+
+      .window-controls {
+        display: flex;
+        height: 100%;
+      }
+
+      .window-control.close:hover {
+        background: var(--danger);
+        color: #ffffff;
+      }
+
+      .commandbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        border-bottom: 1px solid var(--border);
+        background: #ffffff;
+        padding: 0 16px;
+      }
+
+      .command-title {
+        min-width: 0;
+      }
+
+      .command-title h1 {
+        margin: 0;
+        color: #09090b;
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .command-title p {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .command-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .button {
+        display: inline-flex;
+        height: 34px;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #ffffff;
+        color: #18181b;
+        padding: 0 12px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 500;
+        white-space: nowrap;
+      }
+
+      .button:hover {
+        background: var(--muted-surface);
+      }
+
+      .button.primary {
+        border-color: var(--primary);
+        background: var(--primary);
+        color: var(--primary-foreground);
+      }
+
+      .button.primary:hover {
+        background: var(--primary-hover);
+      }
+
+      .button.ghost {
+        border-color: transparent;
+        background: transparent;
+      }
+
+      .workbench {
+        display: grid;
+        min-height: 0;
+        grid-template-columns: 286px minmax(0, 1fr) 318px;
+        background: var(--background);
+      }
+
+      .pane {
+        min-height: 0;
+        border-right: 1px solid var(--border);
+        background: #ffffff;
+      }
+
+      .pane:last-child {
+        border-right: 0;
+      }
+
+      .left-pane,
+      .right-pane {
+        display: grid;
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+
+      .pane-header {
+        border-bottom: 1px solid var(--border);
+        padding: 12px 14px;
+      }
+
+      .pane-title {
+        margin: 0;
+        color: #09090b;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      .pane-description {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .pane-content {
+        min-height: 0;
+        overflow: auto;
+        padding: 12px;
+      }
+
+      .section {
+        margin-bottom: 16px;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        color: #52525b;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .drive-list,
+      .category-list,
+      .mode-list,
+      .detail-list {
+        display: grid;
+        gap: 8px;
+      }
+
+      .drive-row,
+      .category-row,
+      .mode-row {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: #ffffff;
+        padding: 10px;
+        cursor: pointer;
+      }
+
+      .drive-row:hover,
+      .category-row:hover,
+      .mode-row:hover {
+        background: var(--muted-surface);
+      }
+
+      .drive-row.selected,
+      .category-row.selected,
+      .mode-row.selected {
+        border-color: #18181b;
+        box-shadow: 0 0 0 1px #18181b;
+      }
+
+      .row-top {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .row-left {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .checkbox {
+        display: grid;
+        width: 17px;
+        height: 17px;
+        flex: 0 0 auto;
+        place-items: center;
+        border: 1px solid var(--border-strong);
+        border-radius: 4px;
+        background: #ffffff;
+        color: #ffffff;
+        font-size: 11px;
+        line-height: 1;
+      }
+
+      .selected .checkbox,
+      .checkbox.checked {
+        border-color: #18181b;
+        background: #18181b;
+      }
+
+      .drive-name,
+      .category-name {
+        color: #09090b;
+        font-weight: 700;
+      }
+
+      .row-meta {
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .meter {
+        overflow: hidden;
+        height: 6px;
+        margin-top: 8px;
+        border-radius: 999px;
+        background: #f4f4f5;
+      }
+
+      .meter span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: #18181b;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 3px 7px;
+        font-size: 11px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      .badge.safe {
+        border-color: var(--safe-border);
+        background: var(--safe-bg);
+        color: var(--safe);
+      }
+
+      .badge.warn {
+        border-color: var(--warn-border);
+        background: var(--warn-bg);
+        color: var(--warn);
+      }
+
+      .badge.info {
+        border-color: var(--info-border);
+        background: var(--info-bg);
+        color: var(--info);
+      }
+
+      .badge.danger {
+        border-color: var(--danger-border);
+        background: var(--danger-bg);
+        color: var(--danger);
+      }
+
+      .icon {
+        width: 16px;
+        height: 16px;
+        flex: 0 0 auto;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+      }
+
+      .center-pane {
+        display: grid;
+        min-width: 0;
+        grid-template-rows: auto auto minmax(0, 1fr);
+        background: #ffffff;
+      }
+
+      .summary-strip {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 1px;
+        border-bottom: 1px solid var(--border);
+        background: var(--border);
+      }
+
+      .metric {
+        background: #ffffff;
+        padding: 12px 14px;
+      }
+
+      .metric-label {
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .metric-value {
+        margin-top: 5px;
+        color: #09090b;
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .result-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        border-bottom: 1px solid var(--border);
+        background: #ffffff;
+        padding: 10px 12px;
+      }
+
+      .search {
+        display: flex;
+        min-width: 220px;
+        flex: 1;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: #ffffff;
+        padding: 0 10px;
+      }
+
+      .search input {
+        width: 100%;
+        height: 32px;
+        border: 0;
+        outline: 0;
+        color: #09090b;
+        background: transparent;
+      }
+
+      .tabs {
+        display: inline-flex;
+        flex: 0 0 auto;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--muted-surface);
+        padding: 2px;
+      }
+
+      .tab {
+        height: 28px;
+        border: 0;
+        border-radius: 4px;
+        background: transparent;
+        color: #52525b;
+        padding: 0 10px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 500;
+      }
+
+      .tab.active {
+        background: #ffffff;
+        color: #09090b;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+      }
+
+      .table-area {
+        min-height: 0;
+        overflow: auto;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+        text-align: left;
+        vertical-align: middle;
+      }
+
+      th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--muted-surface);
+        color: #71717a;
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+
+      td {
+        color: #27272a;
+        white-space: nowrap;
+      }
+
+      tbody tr {
+        cursor: pointer;
+      }
+
+      tbody tr:hover,
+      tbody tr.selected-row {
+        background: #fafafa;
+      }
+
+      .file-cell {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+
+      .file-cell > div {
+        min-width: 0;
+      }
+
+      .file-icon {
+        display: grid;
+        width: 28px;
+        height: 28px;
+        flex: 0 0 auto;
+        place-items: center;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        color: #52525b;
+      }
+
+      .file-name {
+        color: #09090b;
+        font-weight: 700;
+      }
+
+      .file-path {
+        max-width: 100%;
+        overflow: hidden;
+        margin-top: 2px;
+        color: var(--muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .size {
+        color: #09090b;
+        font-weight: 700;
+        text-align: right;
+        white-space: nowrap;
+      }
+
+      .right-pane .pane-content {
+        display: grid;
+        align-content: start;
+        gap: 12px;
+      }
+
+      .detail-block {
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        background: #ffffff;
+      }
+
+      .detail-block h3 {
+        margin: 0;
+        border-bottom: 1px solid var(--border);
+        padding: 10px 12px;
+        font-size: 13px;
+      }
+
+      .detail-body {
+        padding: 12px;
+      }
+
+      .kv {
+        display: grid;
+        grid-template-columns: 82px minmax(0, 1fr);
+        gap: 8px;
+        padding: 6px 0;
+      }
+
+      .kv span {
+        color: var(--muted);
+      }
+
+      .kv strong {
+        overflow: hidden;
+        color: #09090b;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .plan-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 7px 0;
+      }
+
+      .plan-row span {
+        color: var(--muted);
+      }
+
+      .plan-row strong {
+        color: #09090b;
+      }
+
+      .child-list {
+        display: grid;
+        gap: 6px;
+      }
+
+      .child-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 8px;
+      }
+
+      .child-name {
+        overflow: hidden;
+        color: #09090b;
+        font-weight: 600;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .child-meta {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .statusbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        border-top: 1px solid var(--border);
+        background: #ffffff;
+        padding: 0 12px;
+        color: #52525b;
+      }
+
+      .status-left,
+      .status-right {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+
+      .status-left span,
+      .status-right span {
+        white-space: nowrap;
+      }
+
+      .status-left span:last-child {
+        overflow: hidden;
+        min-width: 0;
+        max-width: 360px;
+        text-overflow: ellipsis;
+      }
+
+      .statusbar .button {
+        height: 26px;
+        padding: 0 10px;
+      }
+
+      .status-progress {
+        display: flex;
+        width: 240px;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .progress {
+        overflow: hidden;
+        height: 6px;
+        flex: 1;
+        border-radius: 999px;
+        background: #f4f4f5;
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: #18181b;
+      }
+
+      @media (max-width: 1180px) {
+        .workbench {
+          grid-template-columns: 260px minmax(0, 1fr);
+        }
+
+        .right-pane {
+          display: none;
+        }
+      }
+
+      @media (max-width: 860px) {
+        .window {
+          grid-template-rows: 34px 82px minmax(0, 1fr) 42px;
+        }
+
+        .titlebar-brand {
+          width: auto;
+        }
+
+        .menu {
+          display: none;
+        }
+
+        .commandbar {
+          align-items: stretch;
+          flex-direction: column;
+          justify-content: center;
+          padding: 10px;
+        }
+
+        .workbench {
+          grid-template-columns: 1fr;
+        }
+
+        .left-pane {
+          display: none;
+        }
+
+        .summary-strip {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="window">
+      <div class="titlebar">
+        <div class="titlebar-brand">
+          <div class="app-mark" aria-hidden="true">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M7 7l1 13h8l1-13" /></svg>
+          </div>
+          <span>CleanDeck</span>
+        </div>
+        <div class="menu" aria-label="应用菜单">
+          <button>文件</button>
+          <button>扫描</button>
+          <button>视图</button>
+          <button>帮助</button>
+        </div>
+        <div class="title-spacer"></div>
+        <div class="window-controls" aria-hidden="true">
+          <button class="window-control">—</button>
+          <button class="window-control">□</button>
+          <button class="window-control close">×</button>
+        </div>
+      </div>
+
+      <div class="commandbar">
+        <div class="command-title">
+          <h1>磁盘清理工作台</h1>
+          <p>选择盘符和扫描内容，清理前会生成可审查计划。</p>
+        </div>
+        <div class="command-actions">
+          <button class="button">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M12 5v14" /><path d="M5 12h14" /></svg>
+            选择盘符
+          </button>
+          <button class="button">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M7 10l5 5 5-5" /><path d="M12 15V3" /></svg>
+            导出报告
+          </button>
+          <button class="button">
+            <svg class="icon" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></svg>
+            暂停
+          </button>
+          <button class="button primary">
+            <svg class="icon" viewBox="0 0 24 24"><path d="M5 12h14" /><path d="M12 5l7 7-7 7" /></svg>
+            开始扫描
+          </button>
+        </div>
+      </div>
+
+      <div class="workbench">
+        <aside class="pane left-pane">
+          <div class="pane-header">
+            <h2 class="pane-title">扫描设置</h2>
+            <p class="pane-description">桌面工具式操作区，先选择盘符，再选择扫描内容。</p>
+          </div>
+          <div class="pane-content">
+            <section class="section">
+              <div class="section-title">
+                <span>盘符</span>
+                <button class="button ghost">刷新</button>
+              </div>
+              <div class="drive-list">
+                <div class="drive-row selected">
+                  <div class="row-top">
+                    <div class="row-left">
+                      <span class="checkbox">✓</span>
+                      <span class="drive-name">C:</span>
+                    </div>
+                    <span class="badge safe">NTFS</span>
+                  </div>
+                  <div class="row-meta">系统盘 · 142 GB 可用 / 476 GB</div>
+                  <div class="meter"><span style="width: 70%"></span></div>
+                </div>
+                <div class="drive-row selected">
+                  <div class="row-top">
+                    <div class="row-left">
+                      <span class="checkbox">✓</span>
+                      <span class="drive-name">D:</span>
+                    </div>
+                    <span class="badge safe">NTFS</span>
+                  </div>
+                  <div class="row-meta">工作盘 · 628 GB 可用 / 1.8 TB</div>
+                  <div class="meter"><span style="width: 64%"></span></div>
+                </div>
+                <div class="drive-row">
+                  <div class="row-top">
+                    <div class="row-left">
+                      <span class="checkbox"></span>
+                      <span class="drive-name">E:</span>
+                    </div>
+                    <span class="badge info">exFAT</span>
+                  </div>
+                  <div class="row-meta">移动盘 · 普通遍历 · 512 GB</div>
+                  <div class="meter"><span style="width: 57%"></span></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-title">扫描模式</div>
+              <div class="mode-list">
+                <div class="mode-row selected">
+                  <div class="row-top">
+                    <div class="row-left">
+                      <span class="checkbox">✓</span>
+                      <span class="category-name">快速扫描</span>
+                    </div>
+                  </div>
+                  <div class="row-meta">临时目录、浏览器缓存、崩溃日志、回收站。</div>
+                </div>
+                <div class="mode-row">
+                  <div class="row-top">
+                    <div class="row-left">
+                      <span class="checkbox"></span>
+                      <span class="category-name">全盘分析</span>
+                    </div>
+                  </div>
+                  <div class="row-meta">大文件、重复候选、项目缓存。耗时更长。</div>
+                </div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-title">分类</div>
+              <div class="category-list">
+                <div class="category-row selected">
+                  <div class="row-top">
+                    <div class="row-left"><span class="checkbox">✓</span><span class="category-name">临时文件</span></div>
+                    <strong>2.91 GB</strong>
+                  </div>
+                  <div class="row-meta">1,246 项 · 默认安全</div>
+                </div>
+                <div class="category-row selected">
+                  <div class="row-top">
+                    <div class="row-left"><span class="checkbox">✓</span><span class="category-name">浏览器缓存</span></div>
+                    <strong>1.83 GB</strong>
+                  </div>
+                  <div class="row-meta">894 项 · 可恢复</div>
+                </div>
+                <div class="category-row">
+                  <div class="row-top">
+                    <div class="row-left"><span class="checkbox"></span><span class="category-name">下载目录</span></div>
+                    <strong>3.24 GB</strong>
+                  </div>
+                  <div class="row-meta">13 项 · 需要手动审查</div>
+                </div>
+                <div class="category-row">
+                  <div class="row-top">
+                    <div class="row-left"><span class="checkbox"></span><span class="category-name">锁定项</span></div>
+                    <strong>918 MB</strong>
+                  </div>
+                  <div class="row-meta">142 项 · 不可清理</div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </aside>
+
+        <section class="center-pane">
+          <div class="summary-strip">
+            <div class="metric">
+              <div class="metric-label">预计可释放</div>
+              <div class="metric-value">6.31 GB</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">候选项</div>
+              <div class="metric-value">2,914</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">锁定项</div>
+              <div class="metric-value">142</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">扫描进度</div>
+              <div class="metric-value">72%</div>
+            </div>
+          </div>
+
+          <div class="result-toolbar">
+            <label class="search">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M21 21l-4.3-4.3" /><circle cx="11" cy="11" r="7" /></svg>
+              <input placeholder="搜索路径、分类或规则" />
+            </label>
+            <div class="tabs" aria-label="风险筛选">
+              <button class="tab active">全部</button>
+              <button class="tab">推荐</button>
+              <button class="tab">谨慎</button>
+              <button class="tab">锁定</button>
+            </div>
+            <button class="button">仅已选</button>
+          </div>
+
+          <div class="table-area">
+            <table aria-label="清理候选文件">
+              <colgroup>
+                <col style="width: 42px" />
+                <col />
+                <col style="width: 52px" />
+                <col style="width: 92px" />
+                <col style="width: 94px" />
+                <col style="width: 82px" />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th style="width: 42px"><span class="checkbox checked">✓</span></th>
+                  <th>对象</th>
+                  <th style="width: 58px">盘符</th>
+                  <th style="width: 104px">分类</th>
+                  <th style="width: 104px">风险</th>
+                  <th style="width: 86px; text-align: right">大小</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class="selected-row">
+                  <td><span class="checkbox checked">✓</span></td>
+                  <td>
+                    <div class="file-cell">
+                      <span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg></span>
+                      <div>
+                        <div class="file-name">Chrome Cache</div>
+                        <div class="file-path">C:\Users\979\AppData\Local\Google\Chrome\User Data\Default\Cache</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td>C:</td>
+                  <td>浏览器缓存</td>
+                  <td><span class="badge safe">安全推荐</span></td>
+                  <td class="size">842 MB</td>
+                </tr>
+                <tr>
+                  <td><span class="checkbox checked">✓</span></td>
+                  <td>
+                    <div class="file-cell">
+                      <span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M7 7l1 13h8l1-13" /></svg></span>
+                      <div>
+                        <div class="file-name">installer_unpack_rollback</div>
+                        <div class="file-path">C:\Users\979\AppData\Local\Temp\setup-cache</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td>C:</td>
+                  <td>安装残留</td>
+                  <td><span class="badge safe">安全推荐</span></td>
+                  <td class="size">1.27 GB</td>
+                </tr>
+                <tr>
+                  <td><span class="checkbox"></span></td>
+                  <td>
+                    <div class="file-cell">
+                      <span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M20 17.5A2.5 2.5 0 0 1 17.5 20h-11A2.5 2.5 0 0 1 4 17.5v-11A2.5 2.5 0 0 1 6.5 4H12l2 3h3.5A2.5 2.5 0 0 1 20 9.5z" /></svg></span>
+                      <div>
+                        <div class="file-name">video-editor-cache</div>
+                        <div class="file-path">D:\Media\Cache\PreviewRender</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td>D:</td>
+                  <td>应用缓存</td>
+                  <td><span class="badge warn">谨慎推荐</span></td>
+                  <td class="size">2.06 GB</td>
+                </tr>
+                <tr>
+                  <td><span class="checkbox"></span></td>
+                  <td>
+                    <div class="file-cell">
+                      <span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" /></svg></span>
+                      <div>
+                        <div class="file-name">project-build-cache</div>
+                        <div class="file-path">D:\Work\xyzw-app\build\cache</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td>D:</td>
+                  <td>项目目录</td>
+                  <td><span class="badge info">需审查</span></td>
+                  <td class="size">618 MB</td>
+                </tr>
+                <tr>
+                  <td><span class="checkbox"></span></td>
+                  <td>
+                    <div class="file-cell">
+                      <span class="file-icon"><svg class="icon" viewBox="0 0 24 24"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" /></svg></span>
+                      <div>
+                        <div class="file-name">app-session.db</div>
+                        <div class="file-path">C:\Users\979\AppData\Roaming\SomeApp\session.db</div>
+                      </div>
+                    </div>
+                  </td>
+                  <td>C:</td>
+                  <td>应用配置</td>
+                  <td><span class="badge danger">已锁定</span></td>
+                  <td class="size">128 MB</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="pane right-pane">
+          <div class="pane-header">
+            <h2 class="pane-title">详情与清理计划</h2>
+            <p class="pane-description">显示当前选中项，清理前在这里确认风险。</p>
+          </div>
+          <div class="pane-content">
+            <section class="detail-block">
+              <h3>当前选中</h3>
+              <div class="detail-body detail-list">
+                <div class="kv"><span>对象</span><strong>Chrome Cache</strong></div>
+                <div class="kv"><span>类型</span><strong>目录 · 1,842 个子项</strong></div>
+                <div class="kv"><span>位置</span><strong>C:\Users\979\AppData\Local\Google...</strong></div>
+                <div class="kv"><span>风险</span><strong>安全推荐</strong></div>
+                <div class="kv"><span>原因</span><strong>浏览器缓存，超过 7 天</strong></div>
+                <div class="kv"><span>策略</span><strong>移动到回收站</strong></div>
+                <button class="button" style="width: 100%; margin-top: 8px">查看目录内容</button>
+              </div>
+            </section>
+
+            <section class="detail-block">
+              <h3>目录内容预览</h3>
+              <div class="detail-body child-list">
+                <div class="child-row">
+                  <div>
+                    <div class="child-name">Cache_Data</div>
+                    <div class="child-meta">目录 · 1,203 项</div>
+                  </div>
+                  <strong>612 MB</strong>
+                </div>
+                <div class="child-row">
+                  <div>
+                    <div class="child-name">Code Cache</div>
+                    <div class="child-meta">目录 · 331 项</div>
+                  </div>
+                  <strong>148 MB</strong>
+                </div>
+                <div class="child-row">
+                  <div>
+                    <div class="child-name">index-dir</div>
+                    <div class="child-meta">目录 · 44 项</div>
+                  </div>
+                  <strong>82 MB</strong>
+                </div>
+              </div>
+            </section>
+
+            <section class="detail-block">
+              <h3>清理计划</h3>
+              <div class="detail-body">
+                <div class="plan-row"><span>已选项目</span><strong>2,914</strong></div>
+                <div class="plan-row"><span>预计释放</span><strong>6.31 GB</strong></div>
+                <div class="plan-row"><span>扫描盘符</span><strong>C:, D:</strong></div>
+                <div class="plan-row"><span>锁定跳过</span><strong>142</strong></div>
+                <div class="plan-row"><span>删除方式</span><strong>回收站</strong></div>
+              </div>
+            </section>
+
+            <section class="detail-block">
+              <h3>安全规则</h3>
+              <div class="detail-body">
+                <div class="plan-row"><span>系统目录</span><strong>锁定</strong></div>
+                <div class="plan-row"><span>Roaming 配置</span><strong>锁定</strong></div>
+                <div class="plan-row"><span>用户文档</span><strong>手动审查</strong></div>
+                <div class="plan-row"><span>永久删除</span><strong>关闭</strong></div>
+              </div>
+            </section>
+
+            <section class="detail-block">
+              <h3>缓存识别</h3>
+              <div class="detail-body">
+                <div class="plan-row"><span>规则来源</span><strong>Chrome Profile Cache</strong></div>
+                <div class="plan-row"><span>路径置信度</span><strong>高</strong></div>
+                <div class="plan-row"><span>运行占用</span><strong>未锁定</strong></div>
+                <div class="plan-row"><span>默认动作</span><strong>允许清理</strong></div>
+              </div>
+            </section>
+
+            <button class="button primary" style="width: 100%">
+              <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M7 7l1 13h8l1-13" /></svg>
+              预览并清理
+            </button>
+          </div>
+        </aside>
+      </div>
+
+      <div class="statusbar">
+        <div class="status-left">
+          <span>扫描中</span>
+          <div class="status-progress">
+            <div class="progress"><span style="width: 72%"></span></div>
+            <strong>72%</strong>
+          </div>
+          <span>当前：C:\Users\979\AppData\Local\Temp</span>
+        </div>
+        <div class="status-right">
+          <span>候选 2,914</span>
+          <span>预计释放 6.31 GB</span>
+          <span>后端 Walk</span>
+          <button class="button primary">预览清理</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

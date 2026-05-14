@@ -1,0 +1,12 @@
+node_modules/
+target/
+target-*/
+dist/
+apps/desktop/dist/
+*.log
+__pycache__/
+.env
+.env.*
+apps/desktop/src-tauri/target/
+.ace-tool/
+.trellis/

@@ -1,0 +1,12 @@
+{
+  "name": "cleandeck-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "pnpm --filter @cleandeck/desktop dev",
+    "build": "pnpm --filter @cleandeck/desktop build",
+    "lint": "pnpm --filter @cleandeck/desktop lint",
+    "test": "pnpm --filter @cleandeck/desktop test",
+    "tauri": "pnpm --filter @cleandeck/desktop tauri"
+  }
+}

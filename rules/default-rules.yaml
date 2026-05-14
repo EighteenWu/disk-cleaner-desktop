@@ -1,0 +1,71 @@
+version: 1
+name: DiskClean conservative default rules
+publisher: DiskClean
+rules:
+  - id: user.temp
+    name: 用户临时目录
+    app: Windows
+    category: 临时文件
+    level: 推荐清理
+    default: true
+    paths:
+      - "%TEMP%"
+    clean: contents
+    keep_days: 3
+    note: 运行态仍会跳过系统保护路径、状态数据和应用运行依赖。
+
+  - id: chrome.cache
+    name: Chrome 缓存
+    app: Google Chrome
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Cache"
+    clean: contents
+    keep_days: 3
+    close:
+      - chrome.exe
+    note: 浏览器缓存可重新生成；浏览器运行中或命中 profile/数据库数据时会跳过。
+
+  - id: npm.cache.review
+    name: npm 下载缓存
+    app: npm
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\npm-cache"
+    clean: contents
+    keep_days: 14
+    close:
+      - node.exe
+      - npm.exe
+    note: 依赖缓存删除后可重新下载，但会影响离线构建和下次安装速度，默认不勾选。
+
+  - id: local.d.codex-tmp.review
+    name: D 盘 Codex 临时目录
+    app: Codex
+    category: 临时文件
+    level: 需要确认
+    default: false
+    paths:
+      - "D:\\codex-tmp"
+    clean: contents
+    keep_days: 7
+    note: 当前机器扫描发现的顶层临时目录；只建议清理旧文件，默认不勾选。
+
+  - id: local.d.pnpm-store.review
+    name: D 盘 pnpm 共享缓存
+    app: pnpm
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "D:\\.pnpm-store"
+    clean: contents
+    keep_days: 14
+    close:
+      - node.exe
+      - pnpm.exe
+    note: 共享依赖缓存可重建，但会影响离线构建和下次安装速度，默认不勾选。
