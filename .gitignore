@@ -9,4 +9,6 @@ __pycache__/
 .env.*
 apps/desktop/src-tauri/target/
 .ace-tool/
+.codex-run/
+.playwright-mcp/
 .trellis/
