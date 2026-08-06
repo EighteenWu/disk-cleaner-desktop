@@ -30,6 +30,9 @@
     "windows": {
       "wix": {
         "language": "zh-CN"
+      },
+      "nsis": {
+        "installMode": "perMachine"
       }
     },
     "icon": [
