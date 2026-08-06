@@ -3,10 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 
-const MAX_APP_LOG_ENTRIES: usize = 500;
+const MAX_APP_LOG_ENTRIES: usize = 200;
+const LOG_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const LOG_FILE_PATH: &[&str] = &["logs", "app.jsonl"];
 const RULE_SUBSCRIPTION_FILE_PATH: &[&str] = &["config", "rule-subscription.json"];
 
@@ -45,9 +47,11 @@ pub fn read_app_logs(root: &Path) -> Result<Vec<AppLogEntry>, String> {
         .map_err(|error| format!("读取应用日志失败：{}：{error}", path.display()))?;
     let mut logs = Vec::new();
 
+    let cutoff = retention_cutoff();
+
     for line in content.lines().filter(|line| !line.trim().is_empty()) {
         if let Ok(entry) = serde_json::from_str::<AppLogEntry>(line) {
-            if is_valid_log_entry(&entry) {
+            if is_valid_log_entry(&entry) && is_within_retention(&entry.time, &cutoff) {
                 logs.push(entry);
             }
         }
@@ -60,10 +64,11 @@ pub fn write_app_logs(root: &Path, logs: &[AppLogEntry]) -> Result<(), String> {
     let path = app_storage_path(root, LOG_FILE_PATH);
     ensure_parent_dir(&path)?;
 
+    let cutoff = retention_cutoff();
     let mut content = String::new();
     for log in logs
         .iter()
-        .filter(|log| is_valid_log_entry(log))
+        .filter(|log| is_valid_log_entry(log) && is_within_retention(&log.time, &cutoff))
         .take(MAX_APP_LOG_ENTRIES)
     {
         let line =
@@ -135,6 +140,64 @@ fn ensure_parent_dir(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("创建应用数据目录失败：{}：{error}", parent.display()))
 }
 
+fn retention_cutoff() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    iso_timestamp(now.saturating_sub(LOG_RETENTION_SECS))
+}
+
+fn iso_timestamp(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let secs_of_day = epoch_secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60
+    )
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+// Timestamps come from JS toISOString(): always UTC, always the same
+// fixed-width layout, so lexicographic ordering equals chronological ordering.
+fn is_within_retention(time: &str, cutoff: &str) -> bool {
+    if !is_iso_utc_timestamp(time) {
+        return true;
+    }
+    time >= cutoff
+}
+
+fn is_iso_utc_timestamp(time: &str) -> bool {
+    let bytes = time.as_bytes();
+    if bytes.len() != 24 || bytes[23] != b'Z' {
+        return false;
+    }
+
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        4 | 7 => *byte == b'-',
+        10 => *byte == b'T',
+        13 | 16 => *byte == b':',
+        19 => *byte == b'.',
+        23 => true,
+        _ => byte.is_ascii_digit(),
+    })
+}
+
 fn is_valid_log_entry(entry: &AppLogEntry) -> bool {
     matches!(entry.kind.as_str(), "scan" | "cleanup" | "operation")
         && !entry.id.is_empty()
@@ -154,7 +217,6 @@ fn is_valid_rule_subscription(subscription: &StoredRuleSubscription) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn app_logs_round_trip_as_jsonl() {
@@ -163,7 +225,7 @@ mod tests {
             AppLogEntry {
                 id: "1".to_string(),
                 kind: "operation".to_string(),
-                time: "2026-05-14T00:00:00.000Z".to_string(),
+                time: iso_days_ago(1),
                 title: "启动".to_string(),
                 message: "应用启动".to_string(),
                 detail: None,
@@ -171,7 +233,7 @@ mod tests {
             AppLogEntry {
                 id: "2".to_string(),
                 kind: "scan".to_string(),
-                time: "2026-05-14T00:00:01.000Z".to_string(),
+                time: iso_days_ago(2),
                 title: "扫描".to_string(),
                 message: "扫描完成".to_string(),
                 detail: Some("后端：rules".to_string()),
@@ -201,6 +263,105 @@ mod tests {
         assert_eq!(logs[0].id, "1");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_logs_are_pruned_and_recent_kept() {
+        let root = test_root("log-retention-window");
+        let logs = vec![
+            sample_log("fresh", &iso_days_ago(1)),
+            sample_log("stale", &iso_days_ago(8)),
+        ];
+
+        write_app_logs(&root, &logs).expect("write logs");
+        let stored = read_app_logs(&root).expect("read logs");
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "fresh");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_logs_are_pruned_on_read() {
+        let root = test_root("log-retention-on-read");
+        let path = app_storage_path(&root, LOG_FILE_PATH);
+        ensure_parent_dir(&path).expect("create parent");
+        let mut content = String::new();
+        for log in [
+            sample_log("fresh", &iso_days_ago(2)),
+            sample_log("stale", &iso_days_ago(30)),
+        ] {
+            content.push_str(&serde_json::to_string(&log).expect("serialize"));
+            content.push('\n');
+        }
+        fs::write(&path, content).expect("write log file");
+
+        let stored = read_app_logs(&root).expect("read logs");
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, "fresh");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unparseable_timestamps_are_kept() {
+        let root = test_root("log-retention-bad-time");
+        let logs = vec![
+            sample_log("garbage", "not-a-date"),
+            sample_log("truncated", "2026-05-14"),
+            sample_log("offset", "2026-05-14T00:00:00+02:00"),
+        ];
+
+        write_app_logs(&root, &logs).expect("write logs");
+        let stored = read_app_logs(&root).expect("read logs");
+
+        assert_eq!(stored, logs);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn entry_cap_keeps_newest_entries() {
+        let root = test_root("log-retention-cap");
+        let logs: Vec<AppLogEntry> = (0..MAX_APP_LOG_ENTRIES + 40)
+            .map(|index| sample_log(&format!("entry-{index}"), &iso_days_ago(1)))
+            .collect();
+
+        write_app_logs(&root, &logs).expect("write logs");
+        let stored = read_app_logs(&root).expect("read logs");
+
+        assert_eq!(stored.len(), MAX_APP_LOG_ENTRIES);
+        assert_eq!(stored[0].id, "entry-0");
+        assert_eq!(
+            stored[MAX_APP_LOG_ENTRIES - 1].id,
+            format!("entry-{}", MAX_APP_LOG_ENTRIES - 1)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn iso_timestamp_handles_leap_and_year_boundaries() {
+        assert_eq!(iso_timestamp(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_709_164_800), "2024-02-29T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_709_251_199), "2024-02-29T23:59:59.000Z");
+        assert_eq!(iso_timestamp(1_709_251_200), "2024-03-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_483_228_799), "2016-12-31T23:59:59.000Z");
+        assert_eq!(iso_timestamp(1_483_228_800), "2017-01-01T00:00:00.000Z");
+        assert_eq!(iso_timestamp(1_900_000_000), "2030-03-17T17:46:40.000Z");
+        // 1900 was not a leap year; 2000 was.
+        assert_eq!(iso_timestamp(951_782_400), "2000-02-29T00:00:00.000Z");
+    }
+
+    #[test]
+    fn retention_comparison_is_fail_open() {
+        let cutoff = iso_days_ago(7);
+        assert!(is_within_retention(&iso_days_ago(1), &cutoff));
+        assert!(!is_within_retention(&iso_days_ago(9), &cutoff));
+        assert!(is_within_retention("", &cutoff));
+        assert!(is_within_retention("whenever", &cutoff));
     }
 
     #[test]
@@ -240,6 +401,25 @@ mod tests {
         assert_eq!(read_rule_subscription(&root).expect("read missing"), None);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn sample_log(id: &str, time: &str) -> AppLogEntry {
+        AppLogEntry {
+            id: id.to_string(),
+            kind: "cleanup".to_string(),
+            time: time.to_string(),
+            title: "清理".to_string(),
+            message: "清理完成".to_string(),
+            detail: None,
+        }
+    }
+
+    fn iso_days_ago(days: u64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        iso_timestamp(now - days * 86_400)
     }
 
     fn test_root(name: &str) -> PathBuf {

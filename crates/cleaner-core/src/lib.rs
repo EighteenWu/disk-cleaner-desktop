@@ -3,13 +3,31 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
-    sync::{mpsc, OnceLock},
+    sync::{mpsc, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime},
 };
 use sysinfo::Disks;
 
+pub mod ai_rules;
+pub mod automation;
+pub mod inventory;
+pub mod local_rule_library;
 pub mod rules;
+
+pub use ai_rules::{
+    redacted_scan_summary, AiGeneratedRule, AiGeneratedRuleSet, AiRuleCleanMethod, AiRuleDraft,
+    AiRuleTier, ApprovedRuleEnvelope, RedactedScanBucket, RedactedScanSummary,
+    AI_REDACTION_VERSION, AI_SUMMARY_SCHEMA_VERSION,
+};
+
+pub use automation::*;
+pub use inventory::{
+    CoverageGap, CoverageGapReason, DirectoryAggregate, InventoryDisposition, InventoryEntry,
+    InventoryObjectType, InventoryPage, InventoryQueryItem, InventorySink, InventorySort,
+    ScanCoverage, ScanCoverageStatus, VolumeCoverage, VolumeSpaceSummary,
+};
+pub use local_rule_library::*;
 
 pub use rules::{
     compile_cleanup_rules_yaml, import_winapp2_ini, mandatory_rule_excludes,
@@ -20,12 +38,18 @@ pub use rules::{
 
 const MAX_QUICK_SCAN_ENTRIES: u64 = 25_000;
 const MAX_QUICK_SCAN_DEPTH: usize = 10;
+#[allow(dead_code)]
 const MAX_FULL_SCAN_DEPTH: usize = 96;
+#[allow(dead_code)]
 const MAX_FULL_SCAN_ENTRIES: u64 = 2_000_000;
+#[allow(dead_code)]
 const MAX_USN_RECORDS: usize = 2_000_000;
 const LARGE_FILE_THRESHOLD_BYTES: u64 = 512 * 1024 * 1024;
 const WINDOWS_ERROR_ACCESS_DENIED: u32 = 5;
 const MAX_PERMANENT_DELETE_WORKERS: usize = 8;
+const MAX_SCAN_WORKERS: usize = 8;
+/// Below this many roots the thread setup costs more than the overlap gains.
+const MIN_PARALLEL_SCAN_ROOTS: usize = 8;
 
 static BUILT_IN_RULES: OnceLock<Vec<CompiledCleanupRule>> = OnceLock::new();
 
@@ -180,6 +204,12 @@ pub struct ScanSnapshot {
     pub summary: ScanSummary,
     pub scan_backend: String,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub scan_session_id: Option<String>,
+    #[serde(default)]
+    pub coverage: ScanCoverage,
+    #[serde(default)]
+    pub space_summary: Vec<VolumeSpaceSummary>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -301,14 +331,230 @@ pub struct NoopCleanupController;
 
 impl CleanupController for NoopCleanupController {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ScanPhase {
+    Preparing,
+    Indexing,
+    Walking,
+    Analyzing,
+    Complete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    pub phase: ScanPhase,
+    pub scanned_files: u64,
+    pub candidate_count: u32,
+    pub reclaimable_bytes: u64,
+    pub current_path: String,
+    pub current_volume: String,
+    pub total_files: Option<u64>,
+    pub percent: Option<u8>,
+}
+
 pub trait ScanController: Send + Sync {
     fn checkpoint(&self) {}
+
+    fn on_phase(&self, _phase: ScanPhase) {}
+
+    fn on_total_files(&self, _total: Option<u64>) {}
+
+    fn on_volume(&self, _volume_id: &str) {}
+
+    fn on_location(&self, _path: &Path) {}
+
+    fn on_visited(&self, _count: u64) {}
+
+    fn on_candidate(&self, _size_bytes: u64) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopScanController;
 
 impl ScanController for NoopScanController {}
+
+const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug)]
+struct ScanProgressState {
+    phase: ScanPhase,
+    scanned_files: u64,
+    candidate_count: u32,
+    reclaimable_bytes: u64,
+    current_path: String,
+    current_volume: String,
+    total_files: Option<u64>,
+    last_emit: Option<Instant>,
+}
+
+impl ScanProgressState {
+    fn snapshot(&self) -> ScanProgress {
+        ScanProgress {
+            phase: self.phase,
+            scanned_files: self.scanned_files,
+            candidate_count: self.candidate_count,
+            reclaimable_bytes: self.reclaimable_bytes,
+            current_path: self.current_path.clone(),
+            current_volume: self.current_volume.clone(),
+            total_files: self.total_files,
+            // percent exists only when a real denominator was obtained (NTFS MFT
+            // record estimate); the recursive walk cannot know its total up front.
+            percent: self.total_files.map(|total| {
+                if total == 0 {
+                    0
+                } else {
+                    ((self.scanned_files.saturating_mul(100) / total).min(99)) as u8
+                }
+            }),
+        }
+    }
+}
+
+struct ScanProgressShared<'a> {
+    state: ScanProgressState,
+    sink: Box<dyn FnMut(ScanProgress) + Send + 'a>,
+}
+
+pub struct ScanProgressController<'a, C: ScanController + ?Sized> {
+    inner: &'a C,
+    shared: Mutex<ScanProgressShared<'a>>,
+}
+
+impl<'a, C: ScanController + ?Sized> ScanProgressController<'a, C> {
+    pub fn new<P>(inner: &'a C, sink: P) -> Self
+    where
+        P: FnMut(ScanProgress) + Send + 'a,
+    {
+        Self {
+            inner,
+            shared: Mutex::new(ScanProgressShared {
+                state: ScanProgressState {
+                    phase: ScanPhase::Preparing,
+                    scanned_files: 0,
+                    candidate_count: 0,
+                    reclaimable_bytes: 0,
+                    current_path: String::new(),
+                    current_volume: String::new(),
+                    total_files: None,
+                    last_emit: None,
+                },
+                sink: Box::new(sink),
+            }),
+        }
+    }
+
+    fn with_shared<F>(&self, apply: F)
+    where
+        F: FnOnce(&mut ScanProgressState) -> bool,
+    {
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let forced = apply(&mut shared.state);
+        let due = shared
+            .state
+            .last_emit
+            .map(|last| last.elapsed() >= SCAN_PROGRESS_INTERVAL)
+            .unwrap_or(true);
+
+        if forced || due {
+            shared.state.last_emit = Some(Instant::now());
+            let progress = shared.state.snapshot();
+            (shared.sink)(progress);
+        }
+    }
+
+    fn begin(&self) {
+        self.with_shared(|state| {
+            state.phase = ScanPhase::Preparing;
+            true
+        });
+    }
+
+    fn finish(&self) {
+        self.with_shared(|state| {
+            state.phase = ScanPhase::Complete;
+            state.current_path = String::new();
+            true
+        });
+    }
+
+    #[cfg(test)]
+    fn set_total_files(&self, total: Option<u64>) {
+        self.on_total_files(total);
+    }
+}
+
+impl<C: ScanController + ?Sized> ScanController for ScanProgressController<'_, C> {
+    fn checkpoint(&self) {
+        self.inner.checkpoint();
+    }
+
+    fn on_phase(&self, phase: ScanPhase) {
+        self.with_shared(|state| {
+            let changed = state.phase != phase;
+            state.phase = phase;
+            changed
+        });
+    }
+
+    fn on_total_files(&self, total: Option<u64>) {
+        self.with_shared(|state| {
+            state.total_files = total;
+            true
+        });
+    }
+
+    fn on_volume(&self, volume_id: &str) {
+        self.with_shared(|state| {
+            let changed = state.current_volume != volume_id;
+            if changed {
+                state.current_volume = volume_id.to_string();
+            }
+            changed
+        });
+    }
+
+    fn on_location(&self, path: &Path) {
+        // Called once per visited entry, so only pay for the path allocation when
+        // the throttle window is already open.
+        let mut shared = self
+            .shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let due = shared
+            .state
+            .last_emit
+            .map(|last| last.elapsed() >= SCAN_PROGRESS_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+
+        shared.state.current_path = path.to_string_lossy().to_string();
+        shared.state.last_emit = Some(Instant::now());
+        let progress = shared.state.snapshot();
+        (shared.sink)(progress);
+    }
+
+    fn on_visited(&self, count: u64) {
+        self.with_shared(|state| {
+            state.scanned_files = state.scanned_files.saturating_add(count);
+            false
+        });
+    }
+
+    fn on_candidate(&self, size_bytes: u64) {
+        self.with_shared(|state| {
+            state.candidate_count = state.candidate_count.saturating_add(1);
+            state.reclaimable_bytes = state.reclaimable_bytes.saturating_add(size_bytes);
+            false
+        });
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CacheClassification {
@@ -345,16 +591,21 @@ struct ScanRun {
     candidates: Vec<CleanupCandidate>,
     backend: String,
     warnings: Vec<String>,
+    coverage: ScanCoverage,
+    space_summary: Vec<VolumeSpaceSummary>,
 }
 
 #[derive(Clone, Debug)]
 struct VolumeScanRun {
     candidates: Vec<CleanupCandidate>,
-    backend: &'static str,
+    backend: String,
     warnings: Vec<String>,
+    coverage: VolumeCoverage,
+    space_summary: VolumeSpaceSummary,
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct FullWalkContext {
     volume: VolumeInfo,
     candidates: Vec<CleanupCandidate>,
@@ -364,6 +615,7 @@ struct FullWalkContext {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct UsnEntry {
     parent_reference: u64,
     name: String,
@@ -389,6 +641,9 @@ pub fn initial_scan_snapshot() -> ScanSnapshot {
         summary: summarize_with_progress(&candidates, 0),
         scan_backend: "idle".to_string(),
         warnings: Vec::new(),
+        scan_session_id: None,
+        coverage: ScanCoverage::default(),
+        space_summary: Vec::new(),
     }
 }
 
@@ -397,16 +652,72 @@ pub fn scan_snapshot_with_request(request: ScanRequest) -> ScanSnapshot {
     scan_snapshot_with_request_and_control(request, &control)
 }
 
+pub fn scan_snapshot_with_request_and_progress<C, P>(
+    request: ScanRequest,
+    control: &C,
+    on_progress: P,
+) -> ScanSnapshot
+where
+    C: ScanController + ?Sized,
+    P: FnMut(ScanProgress) + Send,
+{
+    let reporter = ScanProgressController::new(control, on_progress);
+    reporter.begin();
+    let snapshot = scan_snapshot_with_request_and_control(request, &reporter);
+    reporter.finish();
+    snapshot
+}
+
+pub fn scan_snapshot_with_request_and_progress_and_inventory<C, P>(
+    request: ScanRequest,
+    session_id: &str,
+    control: &C,
+    sink: &mut dyn InventorySink,
+    on_progress: P,
+) -> ScanSnapshot
+where
+    C: ScanController + ?Sized,
+    P: FnMut(ScanProgress) + Send,
+{
+    let reporter = ScanProgressController::new(control, on_progress);
+    reporter.begin();
+    let snapshot = scan_snapshot_with_request_and_control_and_inventory(
+        request,
+        &reporter,
+        Some(session_id),
+        sink,
+    );
+    reporter.finish();
+    snapshot
+}
+
 pub fn scan_snapshot_with_request_and_control<C: ScanController + ?Sized>(
     request: ScanRequest,
     control: &C,
 ) -> ScanSnapshot {
+    let mut sink = inventory::NullInventorySink;
+    scan_snapshot_with_request_and_control_and_inventory(request, control, None, &mut sink)
+}
+
+fn scan_snapshot_with_request_and_control_and_inventory<C: ScanController + ?Sized>(
+    request: ScanRequest,
+    control: &C,
+    session_id: Option<&str>,
+    sink: &mut dyn InventorySink,
+) -> ScanSnapshot {
     control.checkpoint();
+    control.on_phase(ScanPhase::Preparing);
     let volumes = detected_volumes();
     control.checkpoint();
     let selected_volumes = apply_volume_selection(volumes, &request.volume_ids);
-    let scan_run =
-        scan_candidates_with_control(&selected_volumes, request.mode, &request.rules, control);
+    let scan_run = scan_candidates_with_control(
+        &selected_volumes,
+        request.mode,
+        &request.rules,
+        control,
+        session_id,
+        sink,
+    );
     let candidates = scan_run.candidates;
     let summary = summarize_with_progress(&candidates, 100);
     let selected_candidate_id = candidates
@@ -421,6 +732,9 @@ pub fn scan_snapshot_with_request_and_control<C: ScanController + ?Sized>(
         summary,
         scan_backend: scan_run.backend,
         warnings: scan_run.warnings,
+        scan_session_id: session_id.map(str::to_string),
+        coverage: scan_run.coverage,
+        space_summary: scan_run.space_summary,
     }
 }
 
@@ -1049,13 +1363,11 @@ where
         return cleanup_recycle_bin_candidate(candidate, &path, progress, control);
     }
 
-    if candidate.cleanup_policy.rule_id.is_none() {
-        if let Err(warning) = validate_cleanup_target_path(&path) {
-            progress.advance_candidate(candidate, CleanupProgressStatus::Skipped);
-            return CandidateCleanupOutcome::Skipped {
-                warning: format!("{}：{}", candidate.display_name, warning),
-            };
-        }
+    if let Err(warning) = validate_cleanup_target_path(&path) {
+        progress.advance_candidate(candidate, CleanupProgressStatus::Skipped);
+        return CandidateCleanupOutcome::Skipped {
+            warning: format!("{}：{}", candidate.display_name, warning),
+        };
     }
 
     let Ok(metadata) = fs::symlink_metadata(&path) else {
@@ -1257,12 +1569,10 @@ where
         let child_path = entry.path();
         progress.start_path(candidate, &child_path);
 
-        if candidate.cleanup_policy.rule_id.is_none() {
-            if let Err(warning) = validate_cleanup_target_path(&child_path) {
-                warnings.push(format!("{}：{}", child_path.to_string_lossy(), warning));
-                progress.advance_path(candidate, &child_path, CleanupProgressStatus::Skipped);
-                continue;
-            }
+        if let Err(warning) = validate_cleanup_target_path(&child_path) {
+            warnings.push(format!("{}：{}", child_path.to_string_lossy(), warning));
+            progress.advance_path(candidate, &child_path, CleanupProgressStatus::Skipped);
+            continue;
         }
 
         let Ok(metadata) = fs::symlink_metadata(&child_path) else {
@@ -1510,15 +1820,13 @@ fn cleanup_permanent_child_path(
     child_path: PathBuf,
     cleanup_policy: &CleanupPolicy,
 ) -> DirectoryChildCleanupResult {
-    if cleanup_policy.rule_id.is_none() {
-        if let Err(warning) = validate_cleanup_target_path(&child_path) {
-            return DirectoryChildCleanupResult {
-                path: child_path.clone(),
-                status: CleanupProgressStatus::Skipped,
-                reclaimed_bytes: 0,
-                warning: Some(format!("{}：{}", child_path.to_string_lossy(), warning)),
-            };
-        }
+    if let Err(warning) = validate_cleanup_target_path(&child_path) {
+        return DirectoryChildCleanupResult {
+            path: child_path.clone(),
+            status: CleanupProgressStatus::Skipped,
+            reclaimed_bytes: 0,
+            warning: Some(format!("{}：{}", child_path.to_string_lossy(), warning)),
+        };
     }
 
     let Ok(metadata) = fs::symlink_metadata(&child_path) else {
@@ -1699,57 +2007,71 @@ fn permanent_delete_worker_count(item_count: usize) -> usize {
         .min(MAX_PERMANENT_DELETE_WORKERS)
 }
 
-fn validate_cleanup_target_path(path: &Path) -> Result<(), String> {
+fn evaluate_cleanup_target_path(path: &Path) -> PathGuardLevel {
     let normalized = normalize_path_for_id(path);
 
     if normalized.trim().is_empty() {
-        return Err("路径为空".to_string());
+        return PathGuardLevel::HardDeny("路径为空");
     }
 
     if is_drive_root_path(&normalized) {
-        return Err("不能清理盘符根目录".to_string());
-    }
-
-    if normalized.contains("\\$recycle.bin") {
-        return Err("回收站清空属于永久删除，必须通过回收站候选项手动确认执行".to_string());
+        return PathGuardLevel::HardDeny("不能清理盘符根目录");
     }
 
     if is_current_app_path(&normalized) {
-        return Err("不能清理 DiskClean 当前运行目录或工作目录".to_string());
+        return PathGuardLevel::HardDeny("不能清理 DiskClean 当前运行目录或工作目录");
     }
 
     if is_application_install_path(path, &normalized) {
-        return Err("不能清理应用安装目录或运行时依赖文件".to_string());
+        return PathGuardLevel::HardDeny("不能清理应用安装目录或运行时依赖文件");
     }
 
     if is_store_or_installer_system_path(&normalized) {
-        return Err("不能清理应用商店、安装回滚或程序数据系统目录".to_string());
+        return PathGuardLevel::HardDeny("不能清理应用商店、安装回滚或程序数据系统目录");
     }
 
     if is_dependency_runtime_path(&normalized) {
-        return Err("不能清理项目依赖目录或运行依赖文件".to_string());
-    }
-
-    if is_persistent_state_path(&normalized) {
-        return Err("不能清理账号、会话、数据库或应用持久化状态数据".to_string());
+        return PathGuardLevel::HardDeny("不能清理项目依赖目录或运行依赖文件");
     }
 
     if normalized.contains("\\program files\\")
         || normalized.contains("\\program files (x86)\\")
         || normalized.contains("\\programfiles\\")
     {
-        return Err("不能清理应用安装目录".to_string());
+        return PathGuardLevel::HardDeny("不能清理应用安装目录");
     }
 
     if is_user_content_path(&normalized) {
-        return Err("不能自动清理用户文档、桌面、图片、视频或音乐目录".to_string());
+        return PathGuardLevel::HardDeny("不能自动清理用户文档、桌面、图片、视频或音乐目录");
     }
 
     if is_protected_windows_path(&normalized) {
-        return Err("不能清理受保护的 Windows 系统目录".to_string());
+        return PathGuardLevel::HardDeny("不能清理受保护的 Windows 系统目录");
     }
 
-    Ok(())
+    if let PathGuardLevel::HardDeny(reason) = classify_path_state_markers(&normalized) {
+        return PathGuardLevel::HardDeny(reason);
+    }
+
+    // WHY: 回收站根候选项在 apply_cleanup_support_policy 里走专属确认流程，这里拦住其余绕过确认的深层路径。
+    if is_recycle_bin_path(&normalized) {
+        return PathGuardLevel::HardDeny(
+            "回收站清空属于永久删除，必须通过回收站候选项手动确认执行",
+        );
+    }
+
+    if is_dependency_store_path(&normalized) {
+        return PathGuardLevel::NeedsConfirm(REASON_DEPENDENCY_STORE);
+    }
+
+    classify_path_state_markers(&normalized)
+}
+
+fn validate_cleanup_target_path(path: &Path) -> Result<(), String> {
+    match evaluate_cleanup_target_path(path) {
+        PathGuardLevel::HardDeny(reason) => Err(reason.to_string()),
+        PathGuardLevel::NeedsConfirm(_) | PathGuardLevel::Allowed => Ok(()),
+    }
 }
 
 fn apply_cleanup_support_policy(mut candidate: CleanupCandidate) -> CleanupCandidate {
@@ -1782,12 +2104,36 @@ fn apply_cleanup_support_policy(mut candidate: CleanupCandidate) -> CleanupCandi
         );
     }
 
-    if candidate.cleanup_policy.rule_id.is_none() {
-        if let Err(reason) = validate_cleanup_target_path(&path) {
-            return mark_candidate_unsupported(candidate, &reason);
+    match evaluate_cleanup_target_path(&path) {
+        // HARD_DENY 对所有候选项生效，包括内置规则与订阅规则。
+        PathGuardLevel::HardDeny(reason) => mark_candidate_unsupported(candidate, reason),
+        PathGuardLevel::NeedsConfirm(reason)
+            if !is_built_in_rule_id(candidate.cleanup_policy.rule_id.as_deref()) =>
+        {
+            mark_candidate_needs_confirmation(candidate, reason)
         }
+        PathGuardLevel::NeedsConfirm(_) | PathGuardLevel::Allowed => candidate,
     }
+}
 
+fn is_built_in_rule_id(rule_id: Option<&str>) -> bool {
+    let Some(rule_id) = rule_id else {
+        return false;
+    };
+
+    built_in_rules()
+        .iter()
+        .any(|rule| rule.id == rule_id && rule.source == RuleSourceKind::BuiltIn)
+}
+
+fn mark_candidate_needs_confirmation(
+    mut candidate: CleanupCandidate,
+    reason: &str,
+) -> CleanupCandidate {
+    candidate.risk_level = RiskLevel::ReviewRequired;
+    candidate.default_selected = false;
+    candidate.selected = false;
+    candidate.reason = append_reason(candidate.reason, reason);
     candidate
 }
 
@@ -2916,13 +3262,7 @@ fn is_application_runtime_payload_path(normalized_path: &str) -> bool {
 }
 
 fn is_dependency_runtime_path(normalized_path: &str) -> bool {
-    normalized_path.contains("\\node_modules\\")
-        || normalized_path.ends_with("\\node_modules")
-        || normalized_path.contains("\\.venv\\")
-        || normalized_path.ends_with("\\.venv")
-        || normalized_path.contains("\\site-packages\\")
-        || normalized_path.contains("\\vendor\\")
-        || normalized_path.ends_with("\\vendor")
+    has_exact_segment(normalized_path, DEPENDENCY_RUNTIME_SEGMENTS)
         || normalized_path.contains("\\.cargo\\registry\\src\\")
 }
 
@@ -2935,46 +3275,119 @@ fn is_store_or_installer_system_path(normalized_path: &str) -> bool {
         || normalized_path.ends_with("\\config.msi")
 }
 
-fn is_persistent_state_path(normalized_path: &str) -> bool {
-    if is_windows_explorer_cache_database(normalized_path) {
-        return false;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PathGuardLevel {
+    Allowed,
+    NeedsConfirm(&'static str),
+    HardDeny(&'static str),
+}
+
+const REGENERABLE_CACHE_SEGMENTS: &[&str] =
+    &["cache", "cache2", "code cache", "gpucache", "shadercache"];
+const HARD_DENY_SEGMENT_MARKERS: &[&str] =
+    &["token", "session", "wallet", "keychain", "credential"];
+const LIVE_STATE_SEGMENTS: &[&str] = &[
+    "indexeddb",
+    "local storage",
+    "databases",
+    "blob_storage",
+    "network",
+];
+const LIVE_STATE_SEGMENT_PREFIXES: &[&str] = &[
+    "login data",
+    "cookies",
+    "history",
+    "preferences",
+    "local state",
+];
+const LIVE_STATE_EXTENSIONS: &[&str] = &["db", "sqlite", "sqlite3", "vscdb"];
+const CONFIRM_STATE_SEGMENTS: &[&str] = &["profile", "profiles"];
+const CONFIRM_STATE_SEGMENT_MARKERS: &[&str] = &["backup", "recovery", "autosave"];
+const DEPENDENCY_RUNTIME_SEGMENTS: &[&str] = &["node_modules", ".venv", "site-packages", "vendor"];
+const USER_CONTENT_SEGMENTS: &[&str] = &["desktop", "documents", "pictures", "videos", "music"];
+
+const REASON_SECRET: &str = "不能清理钱包、密钥串、凭据、令牌或会话等机密数据";
+const REASON_LIVE_STATE: &str = "不能清理账号、会话、数据库或应用持久化状态数据";
+const REASON_CONFIRM_STATE: &str = "命中备份、恢复、自动保存或浏览器 profile 数据，需要逐项确认";
+const REASON_DEPENDENCY_STORE: &str = "命中开发依赖缓存，删除后可能需要重新下载依赖，需要确认";
+
+fn path_segments(normalized_path: &str) -> impl Iterator<Item = &str> {
+    normalized_path
+        .split('\\')
+        .filter(|segment| !segment.is_empty())
+}
+
+fn has_exact_segment(normalized_path: &str, markers: &[&str]) -> bool {
+    path_segments(normalized_path).any(|segment| markers.contains(&segment))
+}
+
+fn has_segment_prefix(normalized_path: &str, markers: &[&str]) -> bool {
+    path_segments(normalized_path)
+        .any(|segment| markers.iter().any(|marker| segment.starts_with(marker)))
+}
+
+fn has_segment_substring(normalized_path: &str, markers: &[&str]) -> bool {
+    path_segments(normalized_path)
+        .any(|segment| markers.iter().any(|marker| segment.contains(marker)))
+}
+
+fn is_regenerable_cache_path(normalized_path: &str) -> bool {
+    has_exact_segment(normalized_path, REGENERABLE_CACHE_SEGMENTS)
+}
+
+fn regenerable_cache_tail(normalized_path: &str) -> Option<String> {
+    let segments: Vec<&str> = normalized_path.split('\\').collect();
+    segments
+        .iter()
+        .rposition(|segment| REGENERABLE_CACHE_SEGMENTS.contains(segment))
+        .map(|index| segments[index + 1..].join("\\"))
+}
+
+pub(crate) fn classify_path_state_markers(normalized_path: &str) -> PathGuardLevel {
+    // WHY: 机密与会话数据无论是否位于缓存目录都不可删除，因此排在缓存豁免之前。
+    if has_segment_substring(normalized_path, HARD_DENY_SEGMENT_MARKERS) {
+        return PathGuardLevel::HardDeny(REASON_SECRET);
     }
 
-    [
-        "\\indexeddb\\",
-        "\\local storage\\",
-        "\\session storage\\",
-        "\\sessions\\",
-        "\\databases\\",
-        "\\blob_storage\\",
-        "\\network\\",
-        "\\login data",
-        "\\cookies",
-        "\\history",
-        "\\preferences",
-        "\\local state",
-    ]
-    .iter()
-    .any(|marker| normalized_path.contains(marker))
-        || [
-            "token",
-            "session",
-            "wallet",
-            "keychain",
-            "credential",
-            "backup",
-            "recovery",
-            "autosave",
-            "profile",
-        ]
-        .iter()
-        .any(|marker| normalized_path.contains(marker))
-        || matches!(
-            Path::new(normalized_path)
+    if is_windows_explorer_cache_database(normalized_path) {
+        return PathGuardLevel::Allowed;
+    }
+
+    // WHY: 缓存可重新生成，优先于状态标记，否则 Firefox Profiles\xxx\cache2 会被祖先目录名误判为持久化状态。
+    // 仅豁免最后一个缓存段之前的祖先，缓存目录内部的 Cookies 等状态文件仍然拦截。
+    let scope = regenerable_cache_tail(normalized_path);
+    let scope = match &scope {
+        Some(tail) if tail.is_empty() => return PathGuardLevel::Allowed,
+        Some(tail) => tail.as_str(),
+        None => normalized_path,
+    };
+
+    if has_exact_segment(scope, LIVE_STATE_SEGMENTS)
+        || has_segment_prefix(scope, LIVE_STATE_SEGMENT_PREFIXES)
+        || path_segments(scope).last().is_some_and(|leaf| {
+            Path::new(leaf)
                 .extension()
-                .and_then(|extension| extension.to_str()),
-            Some("db" | "sqlite" | "sqlite3" | "vscdb")
-        )
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| LIVE_STATE_EXTENSIONS.contains(&extension))
+        })
+    {
+        return PathGuardLevel::HardDeny(REASON_LIVE_STATE);
+    }
+
+    if has_exact_segment(scope, CONFIRM_STATE_SEGMENTS)
+        || has_segment_substring(scope, CONFIRM_STATE_SEGMENT_MARKERS)
+    {
+        return PathGuardLevel::NeedsConfirm(REASON_CONFIRM_STATE);
+    }
+
+    PathGuardLevel::Allowed
+}
+
+fn is_persistent_state_path(normalized_path: &str) -> bool {
+    matches!(
+        classify_path_state_markers(normalized_path),
+        PathGuardLevel::HardDeny(_)
+    )
 }
 
 fn is_windows_explorer_cache_database(normalized_path: &str) -> bool {
@@ -3029,15 +3442,7 @@ fn looks_like_application_install_root(path: &Path) -> bool {
 }
 
 fn is_user_content_path(normalized_path: &str) -> bool {
-    [
-        "\\desktop\\",
-        "\\documents\\",
-        "\\pictures\\",
-        "\\videos\\",
-        "\\music\\",
-    ]
-    .iter()
-    .any(|marker| normalized_path.contains(marker))
+    has_exact_segment(normalized_path, USER_CONTENT_SEGMENTS)
 }
 
 fn is_protected_windows_path(normalized_path: &str) -> bool {
@@ -3196,6 +3601,9 @@ pub fn sample_scan_snapshot() -> ScanSnapshot {
         summary,
         scan_backend: "mock".to_string(),
         warnings: Vec::new(),
+        scan_session_id: None,
+        coverage: ScanCoverage::default(),
+        space_summary: Vec::new(),
     }
 }
 
@@ -3498,6 +3906,8 @@ fn scan_candidates_with_control<C: ScanController + ?Sized>(
     mode: ScanMode,
     request_rules: &[CompiledCleanupRule],
     control: &C,
+    session_id: Option<&str>,
+    inventory_sink: &mut dyn InventorySink,
 ) -> ScanRun {
     let scan_started = Instant::now();
     let rule_compile_started = Instant::now();
@@ -3508,12 +3918,18 @@ fn scan_candidates_with_control<C: ScanController + ?Sized>(
     let primary_scan_started = Instant::now();
     let mut run = match mode {
         ScanMode::Quick => quick_scan_candidates_with_control(volumes, control),
-        ScanMode::Full => full_scan_candidates_with_control(volumes, control),
+        ScanMode::Full => full_scan_candidates_with_control(
+            volumes,
+            control,
+            session_id.unwrap_or("transient"),
+            inventory_sink,
+        ),
     };
     let primary_scan_ms = primary_scan_started.elapsed().as_millis();
     control.checkpoint();
 
     let rule_scan_started = Instant::now();
+    control.on_phase(ScanPhase::Analyzing);
     let mut rule_run = scan_rule_candidates_with_control(volumes, &rules, control);
     let rule_scan_ms = rule_scan_started.elapsed().as_millis();
 
@@ -3542,16 +3958,18 @@ fn scan_candidates_with_control<C: ScanController + ?Sized>(
     run
 }
 
+pub fn built_in_rules() -> &'static [CompiledCleanupRule] {
+    BUILT_IN_RULES.get_or_init(|| {
+        compile_cleanup_rules_yaml(
+            include_str!("../../../rules/default-rules.yaml"),
+            RuleSourceKind::BuiltIn,
+        )
+        .rules
+    })
+}
+
 fn scan_rules(request_rules: &[CompiledCleanupRule]) -> Vec<CompiledCleanupRule> {
-    let mut rules = BUILT_IN_RULES
-        .get_or_init(|| {
-            compile_cleanup_rules_yaml(
-                include_str!("../../../rules/default-rules.yaml"),
-                RuleSourceKind::BuiltIn,
-            )
-            .rules
-        })
-        .clone();
+    let mut rules = built_in_rules().to_vec();
     rules.extend(request_rules.iter().cloned());
     rules
 }
@@ -3617,17 +4035,7 @@ fn scan_rule_candidates_with_control<C: ScanController + ?Sized>(
     let expand_ms = expand_started.elapsed().as_millis();
 
     let scan_started = Instant::now();
-    let mut stats_cache = ScanStatsCache::default();
-    let mut candidates = Vec::new();
-    for root in roots {
-        control.checkpoint();
-        let Some(candidate) =
-            scan_root_candidate_with_control(root, volumes, control, &mut stats_cache)
-        else {
-            continue;
-        };
-        candidates.push(candidate);
-    }
+    let candidates = scan_roots_parallel(roots, volumes, control);
     let scan_ms = scan_started.elapsed().as_millis();
 
     scan_debug_log!(
@@ -3645,7 +4053,83 @@ fn scan_rule_candidates_with_control<C: ScanController + ?Sized>(
         candidates,
         backend: "rules".to_string(),
         warnings,
+        coverage: ScanCoverage::default(),
+        space_summary: Vec::new(),
     }
+}
+
+/// Sizing a rule root means walking its whole subtree, so the work is dominated
+/// by disk latency rather than CPU. Running the roots one at a time left most of
+/// the queue depth unused; chunking them across scoped threads overlaps the
+/// waits. Chunks are merged in order so candidate ordering stays deterministic,
+/// which the frontend selection tests rely on.
+fn scan_roots_parallel<C: ScanController + ?Sized>(
+    roots: Vec<ScanRoot>,
+    volumes: &[VolumeInfo],
+    control: &C,
+) -> Vec<CleanupCandidate> {
+    if roots.len() < MIN_PARALLEL_SCAN_ROOTS {
+        let mut stats_cache = ScanStatsCache::default();
+
+        return roots
+            .into_iter()
+            .filter_map(|root| {
+                control.checkpoint();
+                control.on_location(&root.path);
+                scan_root_candidate_with_control(root, volumes, control, &mut stats_cache)
+            })
+            .collect();
+    }
+
+    let worker_count = scan_worker_count(roots.len());
+    let chunk_size = roots.len().div_ceil(worker_count);
+    let chunks: Vec<&[ScanRoot]> = roots.chunks(chunk_size).collect();
+
+    let chunk_results: Vec<Vec<CleanupCandidate>> = thread::scope(|scope| {
+        let handles: Vec<_> = chunks
+            .into_iter()
+            .map(|chunk| {
+                scope.spawn(move || {
+                    // Each worker keeps its own directory-stats cache. Sharing one
+                    // behind a lock would serialize the hot path again, and the
+                    // roots handed to different workers rarely overlap.
+                    let mut stats_cache = ScanStatsCache::default();
+
+                    chunk
+                        .iter()
+                        .filter_map(|root| {
+                            control.checkpoint();
+                            control.on_location(&root.path);
+                            scan_root_candidate_with_control(
+                                root.clone(),
+                                volumes,
+                                control,
+                                &mut stats_cache,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_default())
+            .collect()
+    });
+
+    chunk_results.into_iter().flatten().collect()
+}
+
+fn scan_worker_count(root_count: usize) -> usize {
+    let available_parallelism = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4);
+
+    root_count
+        .max(1)
+        .min(available_parallelism)
+        .min(MAX_SCAN_WORKERS)
 }
 
 fn expand_rule_paths_with_control<C: ScanController + ?Sized>(
@@ -3916,14 +4400,19 @@ fn quick_scan_candidates_with_control<C: ScanController + ?Sized>(
 
     let mut candidates = Vec::new();
     let mut stats_cache = ScanStatsCache::default();
+    // Quick scan visits a fixed root list of unknown size, so no denominator exists.
+    control.on_total_files(None);
+    control.on_phase(ScanPhase::Walking);
     for root in roots {
         control.checkpoint();
+        control.on_location(&root.path);
         let Some(candidate) =
             scan_root_candidate_with_control(root, volumes, control, &mut stats_cache)
         else {
             continue;
         };
         if selected_volumes.is_empty() || selected_volumes.contains(&candidate.volume_id) {
+            control.on_candidate(candidate.size_bytes);
             candidates.push(candidate);
         }
     }
@@ -3932,27 +4421,39 @@ fn quick_scan_candidates_with_control<C: ScanController + ?Sized>(
         candidates,
         backend: "quick-walk".to_string(),
         warnings: Vec::new(),
+        coverage: ScanCoverage::default(),
+        space_summary: Vec::new(),
     }
 }
 
 fn full_scan_candidates_with_control<C: ScanController + ?Sized>(
     volumes: &[VolumeInfo],
     control: &C,
+    session_id: &str,
+    inventory_sink: &mut dyn InventorySink,
 ) -> ScanRun {
     let mut all_candidates = Vec::new();
     let mut backends = Vec::new();
     let mut warnings = Vec::new();
+    let mut volume_coverages = Vec::new();
+    let mut space_summary = Vec::new();
+
+    control.on_total_files(full_scan_total_files_estimate(volumes));
 
     for volume in volumes.iter().filter(|volume| volume.selected) {
         control.checkpoint();
-        let run = scan_full_volume_with_control(volume, control);
+        control.on_volume(&volume.id);
+        let run = scan_full_volume_with_control(volume, control, session_id, inventory_sink);
         backends.push(format!("{}:{}", volume.id, run.backend));
         warnings.extend(run.warnings);
         all_candidates.extend(run.candidates);
+        volume_coverages.push(run.coverage);
+        space_summary.push(run.space_summary);
     }
 
     all_candidates.sort_by(|left, right| right.size_bytes.cmp(&left.size_bytes));
 
+    let coverage = combine_scan_coverage(volume_coverages);
     ScanRun {
         candidates: all_candidates,
         backend: if backends.is_empty() {
@@ -3961,31 +4462,168 @@ fn full_scan_candidates_with_control<C: ScanController + ?Sized>(
             backends.join(", ")
         },
         warnings,
+        coverage,
+        space_summary,
     }
 }
 
 fn scan_full_volume_with_control<C: ScanController + ?Sized>(
     volume: &VolumeInfo,
     control: &C,
+    session_id: &str,
+    inventory_sink: &mut dyn InventorySink,
 ) -> VolumeScanRun {
     control.checkpoint();
-    if supports_fast_index(&volume.filesystem) {
-        match scan_ntfs_usn_volume(volume, control) {
-            Ok(candidates) => VolumeScanRun {
-                candidates,
-                backend: "ntfs-usn",
-                warnings: Vec::new(),
-            },
-            Err(error) => {
-                let mut run = walk_full_volume_with_control(volume, control);
-                run.warnings
-                    .push(fast_scan_fallback_warning(volume, &error));
-                run
+    control.on_phase(ScanPhase::Walking);
+    let run = inventory::scan_volume_inventory(session_id, volume, control, inventory_sink);
+    let warnings = run
+        .coverage
+        .gaps
+        .iter()
+        .filter(|gap| {
+            !matches!(
+                gap.reason,
+                CoverageGapReason::ReparseNotFollowed | CoverageGapReason::IdentityFallback
+            )
+        })
+        .map(|gap| {
+            format!(
+                "{}: 全盘 inventory 存在 {:?} 覆盖缺口（{} 项）",
+                volume.id, gap.reason, gap.count
+            )
+        })
+        .collect();
+    VolumeScanRun {
+        candidates: run.candidates,
+        backend: run.coverage.backend.clone(),
+        warnings,
+        coverage: run.coverage,
+        space_summary: run.summary,
+    }
+}
+
+fn combine_scan_coverage(volumes: Vec<VolumeCoverage>) -> ScanCoverage {
+    let status = if volumes.is_empty() {
+        ScanCoverageStatus::NotStarted
+    } else if volumes
+        .iter()
+        .any(|volume| volume.status == ScanCoverageStatus::Failed)
+    {
+        ScanCoverageStatus::Failed
+    } else if volumes
+        .iter()
+        .any(|volume| volume.status == ScanCoverageStatus::Cancelled)
+    {
+        ScanCoverageStatus::Cancelled
+    } else if volumes
+        .iter()
+        .any(|volume| volume.status == ScanCoverageStatus::Partial)
+    {
+        ScanCoverageStatus::Partial
+    } else {
+        ScanCoverageStatus::Complete
+    };
+    let gaps = volumes
+        .iter()
+        .flat_map(|volume| volume.gaps.iter().cloned())
+        .collect();
+    ScanCoverage {
+        status,
+        visited_entries: volumes.iter().map(|volume| volume.visited_entries).sum(),
+        indexed_entries: volumes.iter().map(|volume| volume.indexed_entries).sum(),
+        logical_bytes: volumes.iter().map(|volume| volume.logical_bytes).sum(),
+        allocated_bytes: volumes.iter().map(|volume| volume.allocated_bytes).sum(),
+        volumes,
+        gaps,
+    }
+}
+
+fn full_scan_total_files_estimate(volumes: &[VolumeInfo]) -> Option<u64> {
+    let mut total = 0_u64;
+
+    for volume in volumes.iter().filter(|volume| volume.selected) {
+        if !supports_fast_index(&volume.filesystem) {
+            return None;
+        }
+        total = total.saturating_add(ntfs_mft_record_estimate(volume)?);
+    }
+
+    (total > 0).then_some(total)
+}
+
+#[cfg(windows)]
+fn ntfs_mft_record_estimate(volume: &VolumeInfo) -> Option<u64> {
+    use std::{mem::size_of, ptr::null_mut};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING,
+        },
+        System::{
+            Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER},
+            IO::DeviceIoControl,
+        },
+    };
+
+    struct VolumeHandle(HANDLE);
+
+    impl Drop for VolumeHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
             }
         }
-    } else {
-        walk_full_volume_with_control(volume, control)
     }
+
+    let device_path = volume_device_path(volume).ok()?;
+    let wide_path = device_path
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let _handle = VolumeHandle(handle);
+    let mut data = NTFS_VOLUME_DATA_BUFFER::default();
+    let mut bytes_returned = 0_u32;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_NTFS_VOLUME_DATA,
+            null_mut(),
+            0,
+            &mut data as *mut NTFS_VOLUME_DATA_BUFFER as *mut _,
+            size_of::<NTFS_VOLUME_DATA_BUFFER>() as u32,
+            &mut bytes_returned,
+            null_mut(),
+        )
+    };
+
+    if ok == 0 || data.BytesPerFileRecordSegment == 0 || data.MftValidDataLength <= 0 {
+        return None;
+    }
+
+    let records = data.MftValidDataLength as u64 / u64::from(data.BytesPerFileRecordSegment);
+    Some(records)
+}
+
+#[cfg(not(windows))]
+fn ntfs_mft_record_estimate(_volume: &VolumeInfo) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -3994,6 +4632,7 @@ fn walk_full_volume(volume: &VolumeInfo) -> VolumeScanRun {
     walk_full_volume_with_control(volume, &control)
 }
 
+#[allow(dead_code)]
 fn walk_full_volume_with_control<C: ScanController + ?Sized>(
     volume: &VolumeInfo,
     control: &C,
@@ -4022,11 +4661,14 @@ fn walk_full_volume_with_control<C: ScanController + ?Sized>(
 
     VolumeScanRun {
         candidates: context.candidates,
-        backend: "walk",
+        backend: "walk".to_string(),
         warnings: context.warnings,
+        coverage: VolumeCoverage::default(),
+        space_summary: VolumeSpaceSummary::default(),
     }
 }
 
+#[allow(dead_code)]
 fn fast_scan_fallback_warning(volume: &VolumeInfo, error: &str) -> String {
     if error.contains("访问被拒绝") || error.contains("错误码 5") {
         return format!(
@@ -4041,6 +4683,7 @@ fn fast_scan_fallback_warning(volume: &VolumeInfo, error: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn walk_full_directory<C: ScanController + ?Sized>(
     path: &Path,
     depth: usize,
@@ -4075,8 +4718,10 @@ fn walk_full_directory<C: ScanController + ?Sized>(
 
         context.visited_entries += 1;
         stats.children_count = stats.children_count.saturating_add(1);
+        control.on_visited(1);
 
         let child_path = entry.path();
+        control.on_location(&child_path);
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -4097,6 +4742,7 @@ fn walk_full_directory<C: ScanController + ?Sized>(
             if let Some(candidate) =
                 full_directory_candidate(&child_path, child_stats, &context.volume)
             {
+                control.on_candidate(candidate.size_bytes);
                 context.candidates.push(candidate);
             }
         } else if file_type.is_file() {
@@ -4104,6 +4750,7 @@ fn walk_full_directory<C: ScanController + ?Sized>(
             stats.size_bytes = stats.size_bytes.saturating_add(size_bytes);
 
             if let Some(candidate) = full_file_candidate(&child_path, size_bytes, &context.volume) {
+                control.on_candidate(candidate.size_bytes);
                 context.candidates.push(candidate);
             }
         }
@@ -4371,9 +5018,7 @@ fn is_known_browser_cache(normalized_path: &str) -> bool {
     ((normalized_path.contains("\\google\\chrome\\")
         || normalized_path.contains("\\microsoft\\edge\\")
         || normalized_path.contains("\\mozilla\\firefox\\"))
-        && (normalized_path.contains("\\cache")
-            || normalized_path.contains("\\code cache")
-            || normalized_path.contains("\\cache2")))
+        && is_regenerable_cache_path(normalized_path))
         || normalized_path.contains("\\microsoft\\windows\\inetcache")
 }
 
@@ -4423,6 +5068,18 @@ fn should_skip_full_scan_path(path: &Path) -> bool {
         || is_dependency_runtime_path(&normalized)
 }
 
+fn inventory_disposition_for_path(path: &Path) -> InventoryDisposition {
+    if should_skip_full_scan_path(path) {
+        return InventoryDisposition::Blocked;
+    }
+
+    match evaluate_cleanup_target_path(path) {
+        PathGuardLevel::HardDeny(_) => InventoryDisposition::Blocked,
+        PathGuardLevel::NeedsConfirm(_) => InventoryDisposition::AnalysisOnly,
+        PathGuardLevel::Allowed => InventoryDisposition::Normal,
+    }
+}
+
 fn format_windows_volume_open_error(device_path: &str, error: u32) -> String {
     if error == WINDOWS_ERROR_ACCESS_DENIED {
         return format!(
@@ -4443,6 +5100,7 @@ fn format_usn_ioctl_error(error: u32) -> String {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
     volume: &VolumeInfo,
     control: &C,
@@ -4566,6 +5224,7 @@ fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
                         )
                     };
                     let name = String::from_utf16_lossy(name_slice);
+                    control.on_visited(1);
                     entries.insert(
                         record.FileReferenceNumber,
                         UsnEntry {
@@ -4595,6 +5254,7 @@ fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
 
     let mut candidates = Vec::new();
     let mut seen_paths = HashSet::new();
+    control.on_phase(ScanPhase::Analyzing);
 
     for (reference, entry) in entries.iter() {
         control.checkpoint();
@@ -4623,13 +5283,17 @@ fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
             continue;
         }
 
+        control.on_location(&path);
+
         if is_directory {
             let stats = scan_directory_stats_with_control(&path, control);
             if let Some(candidate) = full_directory_candidate(&path, stats, volume) {
+                control.on_candidate(candidate.size_bytes);
                 candidates.push(candidate);
             }
         } else if let Ok(metadata) = fs::metadata(&path) {
             if let Some(candidate) = full_file_candidate(&path, metadata.len(), volume) {
+                control.on_candidate(candidate.size_bytes);
                 candidates.push(candidate);
             }
         }
@@ -4640,6 +5304,7 @@ fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
     _volume: &VolumeInfo,
     _control: &C,
@@ -4655,6 +5320,7 @@ fn volume_device_path(volume: &VolumeInfo) -> Result<String, String> {
     Err(format!("不支持的卷标识：{}", volume.id))
 }
 
+#[allow(dead_code)]
 fn build_usn_path(
     entries: &HashMap<u64, UsnEntry>,
     reference: u64,
@@ -5367,6 +6033,7 @@ fn scan_directory_stats_uncached<C: ScanController + ?Sized>(
 
             visited += 1;
             stats.children_count = stats.children_count.saturating_add(1);
+            control.on_visited(1);
 
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -5435,6 +6102,7 @@ fn scan_directory_stats_for_policy_uncached<C: ScanController + ?Sized>(
         }
 
         let child_path = entry.path();
+        control.on_visited(1);
         let Ok(metadata) = fs::symlink_metadata(&child_path) else {
             continue;
         };
@@ -5924,6 +6592,57 @@ rules:
     }
 
     #[test]
+    fn scan_worker_count_stays_within_bounds() {
+        assert_eq!(scan_worker_count(0), 1);
+        assert_eq!(scan_worker_count(1), 1);
+        assert!(scan_worker_count(1_000) <= MAX_SCAN_WORKERS);
+        assert!(scan_worker_count(1_000) >= 1);
+    }
+
+    #[test]
+    fn parallel_root_scan_preserves_root_order() {
+        let root = env::temp_dir().join(format!(
+            "diskclean-parallel-order-test-{}-{}",
+            std::process::id(),
+            stable_hash("parallel-order")
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        // More roots than MIN_PARALLEL_SCAN_ROOTS so the chunked path is used.
+        let root_count = MIN_PARALLEL_SCAN_ROOTS * 3;
+        let mut scan_roots = Vec::with_capacity(root_count);
+
+        for index in 0..root_count {
+            let directory = root.join(format!("cache-{index:03}"));
+            fs::create_dir_all(&directory).expect("cache directory should be created");
+            fs::write(directory.join("payload.tmp"), vec![7_u8; index + 1])
+                .expect("payload should be written");
+            scan_roots.push(ScanRoot {
+                path: directory,
+                display_name: format!("Cache {index:03}"),
+                category: "测试缓存".to_string(),
+                rule: None,
+            });
+        }
+
+        let expected_paths: Vec<String> = scan_roots
+            .iter()
+            .map(|scan_root| normalize_path_for_id(&scan_root.path))
+            .collect();
+        let volumes = vec![test_volume_with_id(&root, "P", true)];
+        let control = NoopScanController;
+        let candidates = scan_roots_parallel(scan_roots, &volumes, &control);
+        let actual_paths: Vec<String> = candidates
+            .iter()
+            .map(|candidate| normalize_path_for_id(Path::new(&candidate.path)))
+            .collect();
+
+        assert_eq!(actual_paths, expected_paths);
+
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    #[test]
     fn rule_scan_skips_paths_on_unselected_volumes_before_candidate_scan() {
         let root = env::temp_dir().join(format!(
             "diskclean-rule-volume-filter-test-{}-{}",
@@ -6206,6 +6925,196 @@ rules:
         assert!(checkpoints.load(Ordering::SeqCst) > 0);
 
         fs::remove_dir_all(&root).expect("test directory should be removed");
+    }
+
+    fn walk_progress_events(label: &str) -> Vec<ScanProgress> {
+        let root = env::temp_dir().join(format!(
+            "cleandeck-scan-progress-{}-{}",
+            std::process::id(),
+            stable_hash(label)
+        ));
+        let cache = root.join("App").join("Cache");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&cache).expect("cache directory should be created");
+        for index in 0..24 {
+            fs::write(cache.join(format!("cache-{index}.bin")), [7_u8; 32])
+                .expect("cache file should be written");
+        }
+
+        let volume = VolumeInfo {
+            id: "T".to_string(),
+            label: "Test".to_string(),
+            mount_point: root.to_string_lossy().to_string(),
+            filesystem: "exFAT".to_string(),
+            total_bytes: 0,
+            available_bytes: 0,
+            selected: true,
+            supports_fast_index: false,
+        };
+
+        let events = Mutex::new(Vec::new());
+        {
+            let inner = NoopScanController;
+            let reporter = ScanProgressController::new(&inner, |progress: ScanProgress| {
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            });
+            reporter.begin();
+            reporter.set_total_files(None);
+            reporter.on_phase(ScanPhase::Walking);
+            let _ = walk_full_volume_with_control(&volume, &reporter);
+            reporter.finish();
+        }
+
+        fs::remove_dir_all(&root).expect("test directory should be removed");
+        events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn scan_progress_throttling_keeps_first_and_final_events() {
+        let events = walk_progress_events("throttle");
+
+        assert!(events.len() >= 2);
+        assert_eq!(
+            events.first().map(|event| event.phase),
+            Some(ScanPhase::Preparing)
+        );
+        assert_eq!(
+            events.last().map(|event| event.phase),
+            Some(ScanPhase::Complete)
+        );
+        assert!(events.iter().any(|event| event.phase == ScanPhase::Walking));
+        // Throttling must collapse per-entry emissions well below the visited count.
+        assert!(events.len() < 24);
+    }
+
+    #[test]
+    fn scan_progress_scanned_files_is_monotonic() {
+        let events = walk_progress_events("monotonic");
+
+        let mut previous = 0_u64;
+        for event in &events {
+            assert!(event.scanned_files >= previous);
+            previous = event.scanned_files;
+        }
+
+        assert!(previous >= 24);
+    }
+
+    #[test]
+    fn scan_progress_walk_path_reports_no_percent() {
+        let events = walk_progress_events("no-percent");
+
+        assert!(events
+            .iter()
+            .all(|event| event.percent.is_none() && event.total_files.is_none()));
+    }
+
+    #[test]
+    fn scan_progress_reports_running_candidate_totals() {
+        let events = walk_progress_events("candidates");
+        let final_event = events.last().expect("final event should exist");
+
+        assert!(final_event.candidate_count > 0);
+        assert!(final_event.reclaimable_bytes > 0);
+    }
+
+    #[test]
+    fn scan_progress_serializes_to_camel_case_json() {
+        let progress = ScanProgress {
+            phase: ScanPhase::Indexing,
+            scanned_files: 421_339,
+            candidate_count: 12,
+            reclaimable_bytes: 4096,
+            current_path: "C:\\Windows\\Temp".to_string(),
+            current_volume: "C".to_string(),
+            total_files: Some(1_000_000),
+            percent: Some(42),
+        };
+        let json = serde_json::to_value(progress).expect("progress should serialize");
+
+        assert_eq!(
+            json.get("phase").and_then(|value| value.as_str()),
+            Some("indexing")
+        );
+        assert_eq!(
+            json.get("scannedFiles").and_then(|value| value.as_u64()),
+            Some(421_339)
+        );
+        assert_eq!(
+            json.get("candidateCount").and_then(|value| value.as_u64()),
+            Some(12)
+        );
+        assert_eq!(
+            json.get("reclaimableBytes")
+                .and_then(|value| value.as_u64()),
+            Some(4096)
+        );
+        assert!(json.get("currentPath").is_some());
+        assert!(json.get("currentVolume").is_some());
+        assert_eq!(
+            json.get("totalFiles").and_then(|value| value.as_u64()),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            json.get("percent").and_then(|value| value.as_u64()),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn scan_progress_percent_uses_real_denominator_and_caps_below_complete() {
+        let events = Mutex::new(Vec::new());
+        {
+            let inner = NoopScanController;
+            let reporter = ScanProgressController::new(&inner, |progress: ScanProgress| {
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            });
+            reporter.set_total_files(Some(200));
+            reporter.on_visited(100);
+            reporter.on_phase(ScanPhase::Analyzing);
+            reporter.on_visited(500);
+            reporter.on_phase(ScanPhase::Indexing);
+        }
+
+        let events = events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let percents = events
+            .iter()
+            .filter_map(|event| event.percent)
+            .collect::<Vec<_>>();
+
+        assert!(percents.contains(&50));
+        assert!(percents.iter().all(|percent| *percent <= 99));
+    }
+
+    #[test]
+    fn scan_progress_reports_zero_percent_for_empty_denominator() {
+        let events = Mutex::new(Vec::new());
+        {
+            let inner = NoopScanController;
+            let reporter = ScanProgressController::new(&inner, |progress: ScanProgress| {
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            });
+            reporter.set_total_files(Some(0));
+        }
+
+        let events = events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        assert_eq!(events.last().and_then(|event| event.percent), Some(0));
     }
 
     #[test]
@@ -7199,5 +8108,165 @@ rules:
             .get("summary")
             .and_then(|summary| summary.get("estimatedReclaimBytes"))
             .is_some());
+    }
+
+    const FIREFOX_CACHE: &str =
+        "C:\\Users\\979\\AppData\\Local\\Mozilla\\Firefox\\Profiles\\ab12cd.default-release\\cache2";
+
+    #[test]
+    fn firefox_profile_cache_is_cleanable_despite_profile_segment() {
+        let normalized = normalize_path_for_id(Path::new(FIREFOX_CACHE));
+
+        assert!(!is_persistent_state_path(&normalized));
+        assert!(is_known_browser_cache(&normalized));
+        assert_eq!(
+            evaluate_cleanup_target_path(Path::new(FIREFOX_CACHE)),
+            PathGuardLevel::Allowed
+        );
+        assert!(validate_cleanup_target_path(Path::new(FIREFOX_CACHE)).is_ok());
+
+        let entry = Path::new(FIREFOX_CACHE).join("entries\\3F2A1B00");
+        assert!(validate_cleanup_target_path(&entry).is_ok());
+    }
+
+    #[test]
+    fn profile_state_files_stay_hard_denied() {
+        for path in [
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Preferences",
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cookies-journal",
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data",
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Login Data-wal",
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Local State",
+            "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\IndexedDB",
+        ] {
+            assert!(
+                matches!(
+                    evaluate_cleanup_target_path(Path::new(path)),
+                    PathGuardLevel::HardDeny(_)
+                ),
+                "{path} should be hard denied"
+            );
+        }
+    }
+
+    #[test]
+    fn state_inside_cache_directory_stays_hard_denied() {
+        let cookies = Path::new(FIREFOX_CACHE).join("Cookies");
+        let wallet = Path::new(FIREFOX_CACHE).join("wallet");
+
+        assert!(matches!(
+            evaluate_cleanup_target_path(&cookies),
+            PathGuardLevel::HardDeny(_)
+        ));
+        assert!(matches!(
+            evaluate_cleanup_target_path(&wallet),
+            PathGuardLevel::HardDeny(_)
+        ));
+    }
+
+    #[test]
+    fn user_content_directories_stay_hard_denied() {
+        for path in [
+            "C:\\Users\\979\\Documents\\taxes\\2025.xlsx",
+            "C:\\Users\\979\\Desktop\\notes\\todo.txt",
+            "C:\\Users\\979\\Pictures\\2025\\img.png",
+        ] {
+            assert!(
+                matches!(
+                    evaluate_cleanup_target_path(Path::new(path)),
+                    PathGuardLevel::HardDeny(_)
+                ),
+                "{path} should be hard denied"
+            );
+        }
+    }
+
+    #[test]
+    fn dependency_dirs_are_denied_but_download_caches_only_need_confirmation() {
+        assert!(matches!(
+            evaluate_cleanup_target_path(Path::new("D:\\Work\\demo\\node_modules\\react")),
+            PathGuardLevel::HardDeny(_)
+        ));
+
+        let npm_cache = Path::new("C:\\Users\\979\\AppData\\Local\\npm-cache");
+        assert!(matches!(
+            evaluate_cleanup_target_path(npm_cache),
+            PathGuardLevel::NeedsConfirm(_)
+        ));
+        assert!(validate_cleanup_target_path(npm_cache).is_ok());
+
+        let candidate = apply_cleanup_support_policy(test_cleanup_candidate(
+            "npm-cache",
+            npm_cache,
+            ObjectType::Directory,
+        ));
+        assert_eq!(candidate.risk_level, RiskLevel::ReviewRequired);
+        assert_ne!(candidate.delete_strategy, DeleteStrategy::Skip);
+        assert!(!candidate.selected);
+    }
+
+    #[test]
+    fn hard_deny_applies_to_rule_backed_candidates() {
+        let mut candidate = test_cleanup_candidate(
+            "subscription-docs",
+            Path::new("C:\\Users\\979\\Documents\\taxes"),
+            ObjectType::Directory,
+        );
+        candidate.cleanup_policy = CleanupPolicy {
+            rule_id: Some("subscription.docs".to_string()),
+            method: RuleCleanupMethod::Contents,
+            keep_days: 0,
+            exclude_patterns: Vec::new(),
+        };
+
+        let candidate = apply_cleanup_support_policy(candidate);
+
+        assert_eq!(candidate.risk_level, RiskLevel::Blocked);
+        assert_eq!(candidate.delete_strategy, DeleteStrategy::Skip);
+        assert!(!candidate.selected);
+    }
+
+    #[test]
+    fn built_in_rules_keep_needs_confirm_exemption() {
+        assert!(is_built_in_rule_id(Some("npm.cache.review")));
+        assert!(!is_built_in_rule_id(Some("subscription.npm")));
+        assert!(!is_built_in_rule_id(None));
+    }
+
+    #[test]
+    fn subscription_rule_targeting_denied_path_is_not_cleanable() {
+        let compilation = compile_cleanup_rules_yaml(
+            r#"
+version: 1
+rules:
+  - id: evil.docs
+    name: 文档清理
+    app: Evil
+    category: 临时文件
+    level: 推荐清理
+    default: true
+    paths:
+      - "%USERPROFILE%\\Documents\\Reports"
+    clean: contents
+    note: 订阅规则不应获得豁免。
+"#,
+            RuleSourceKind::Subscription,
+        );
+
+        assert!(compilation.report.valid);
+        let rule = &compilation.rules[0];
+        assert_ne!(rule.risk_level, RiskLevel::SafeRecommended);
+        assert!(!rule.default_selected);
+
+        let mut candidate = test_cleanup_candidate(
+            "evil",
+            Path::new("C:\\Users\\979\\Documents\\Reports"),
+            ObjectType::Directory,
+        );
+        candidate.cleanup_policy = cleanup_policy_for_rule(rule);
+        let candidate = apply_cleanup_support_policy(candidate);
+
+        assert_eq!(candidate.risk_level, RiskLevel::Blocked);
+        assert_eq!(candidate.delete_strategy, DeleteStrategy::Skip);
     }
 }

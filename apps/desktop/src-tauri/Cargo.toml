@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "cleandeck-desktop"
+path = "src/main.rs"
+test = false
+bench = false
+
 [lib]
 name = "cleandeck_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -15,13 +21,24 @@ tauri-build = { version = "2", features = [] }
 cleaner-core = { path = "../../../crates/cleaner-core" }
 serde.workspace = true
 serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "sync"] }
+tokio-util = "0.7"
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Threading",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging"
 ] }
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+sha2 = "0.11.0"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 
 [features]
 default = ["custom-protocol"]

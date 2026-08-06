@@ -4,15 +4,33 @@ import { isPermissionGranted, requestPermission, sendNotification } from "@tauri
 import { mockChildren, mockCleanupPlan, mockCleanupReport, mockSnapshot } from "./mockData";
 import type {
   AdminStatus,
+  ActiveRuleSnapshot,
+  AutomationConfig,
+  AutomationRunReport,
+  AutomationSchedulerStatus,
+  AiProviderGenerationRequest,
+  AiProviderGenerationResponse,
+  AiProviderConnectionResult,
+  AiProviderModelQuery,
+  AiProviderProfile,
+  AiGeneratedRuleSet,
+  AiRuleDraft,
+  ApprovedRuleEnvelope,
   CleanupCandidate,
   CleanupPlan,
   CleanupProgress,
   CleanupReport,
   DeleteStrategy,
   AppLogEntry,
+  InventoryPage,
+  InventorySort,
   RuleCompilation,
+  RuleLibraryLoadResult,
+  RuleLibraryMutationRequest,
+  RuleLibrarySnapshot,
   RuleSourceKind,
   RuleValidationReport,
+  ScanProgress,
   ScanRequest,
   ScanSnapshot,
   StoredRuleSubscription
@@ -24,6 +42,7 @@ import {
 } from "./ruleSubscriptionStorage";
 
 const CLEANUP_PROGRESS_EVENT = "cleanup-progress";
+const SCAN_PROGRESS_EVENT = "scan-progress";
 const MAX_RULE_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
 
 export interface RuleSubscriptionLoadResult {
@@ -128,6 +147,64 @@ export async function listCandidateChildren(candidate: CleanupCandidate): Promis
   } catch {
     return candidate.id === "chrome-cache" ? mockChildren : [];
   }
+}
+
+export async function listInventoryChildren(
+  scanSessionId: string,
+  parentEntryId: string | null,
+  cursor: string | null = null,
+  limit = 100,
+  sort: InventorySort = "name"
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    return { items: [], nextCursor: null };
+  }
+  return await invoke<InventoryPage>("list_inventory_children", {
+    scanSessionId,
+    parentEntryId,
+    cursor,
+    limit,
+    sort
+  });
+}
+
+export async function searchInventory(
+  scanSessionId: string,
+  query: string,
+  cursor: string | null = null,
+  limit = 100
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    return { items: [], nextCursor: null };
+  }
+  return await invoke<InventoryPage>("search_inventory", {
+    scanSessionId,
+    query,
+    cursor,
+    limit
+  });
+}
+
+export async function listInventoryLargest(
+  scanSessionId: string,
+  cursor: string | null = null,
+  limit = 100
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    return { items: [], nextCursor: null };
+  }
+  return await invoke<InventoryPage>("list_inventory_largest", {
+    scanSessionId,
+    cursor,
+    limit
+  });
+}
+
+export async function closeInventorySession(scanSessionId: string): Promise<void> {
+  if (!hasTauriRuntime()) {
+    return;
+  }
+  await invoke("close_inventory_session", { scanSessionId });
 }
 
 export async function previewCleanupPlan(candidates: CleanupCandidate[], selectedIds: string[]): Promise<CleanupPlan> {
@@ -250,6 +327,16 @@ export async function listenCleanupProgress(
   return await listen<CleanupProgress>(CLEANUP_PROGRESS_EVENT, (event) => handler(event.payload));
 }
 
+export async function listenScanProgress(
+  handler: (progress: ScanProgress) => void
+): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    return () => {};
+  }
+
+  return await listen<ScanProgress>(SCAN_PROGRESS_EVENT, (event) => handler(event.payload));
+}
+
 function hasTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -304,6 +391,30 @@ export async function clearRuleSubscriptionCache(): Promise<void> {
   } catch {
     clearStoredRuleSubscription();
   }
+}
+
+export async function loadRuleLibrary(): Promise<RuleLibraryLoadResult> {
+  return await invoke<RuleLibraryLoadResult>("load_rule_library");
+}
+
+export async function commitRuleLibrary(
+  expectedGeneration: number,
+  snapshot: RuleLibrarySnapshot
+): Promise<RuleLibrarySnapshot> {
+  return await invoke<RuleLibrarySnapshot>("commit_rule_library", {
+    expectedGeneration,
+    snapshot
+  });
+}
+
+export async function mutateRuleLibrary(
+  request: RuleLibraryMutationRequest
+): Promise<RuleLibrarySnapshot> {
+  return await invoke<RuleLibrarySnapshot>("mutate_rule_library", { request });
+}
+
+export async function getActiveRuleSnapshot(): Promise<ActiveRuleSnapshot> {
+  return await invoke<ActiveRuleSnapshot>("get_active_rule_snapshot");
 }
 
 export async function validateRulesYaml(content: string, source: RuleSourceKind): Promise<RuleCompilation> {
@@ -493,4 +604,102 @@ function invalidRuleReport(field: string, message: string): RuleValidationReport
     ],
     warnings: []
   };
+}
+
+export async function buildAiScanSummary(snapshot: ScanSnapshot): Promise<import("./types").RedactedScanSummary> {
+  return await invoke<import("./types").RedactedScanSummary>("build_ai_scan_summary", { snapshot });
+}
+
+export async function listAiProviderProfiles(): Promise<AiProviderProfile[]> {
+  return await invoke<AiProviderProfile[]>("list_ai_provider_profiles");
+}
+
+export async function saveAiProviderProfile(profile: AiProviderProfile): Promise<AiProviderProfile[]> {
+  return await invoke<AiProviderProfile[]>("save_ai_provider_profile", { profile });
+}
+
+export async function deleteAiProviderProfile(profileId: string): Promise<AiProviderProfile[]> {
+  return await invoke<AiProviderProfile[]>("delete_ai_provider_profile", { profileId });
+}
+
+export async function saveAiProviderCredential(profileId: string, secret: string): Promise<void> {
+  await invoke("save_ai_provider_credential", { profileId, secret });
+}
+
+export async function deleteAiProviderCredential(profileId: string): Promise<void> {
+  await invoke("delete_ai_provider_credential", { profileId });
+}
+
+export async function listAiProviderModels(
+  query: AiProviderModelQuery
+): Promise<import("./types").AiProviderModel[]> {
+  return await invoke<import("./types").AiProviderModel[]>("list_ai_provider_models", { query });
+}
+
+export async function testAiProviderConnection(
+  query: AiProviderModelQuery
+): Promise<AiProviderConnectionResult> {
+  return await invoke<AiProviderConnectionResult>("test_ai_provider_connection", { query });
+}
+
+export async function generateAiRules(
+  profileId: string,
+  request: AiProviderGenerationRequest
+): Promise<AiProviderGenerationResponse> {
+  return await invoke<AiProviderGenerationResponse>("generate_ai_rules", { profileId, request });
+}
+
+export async function cancelAiRuleGeneration(): Promise<void> {
+  await invoke("cancel_ai_rule_generation");
+}
+
+export async function reviseAiRuleDraft(
+  draft: AiRuleDraft,
+  expectedRevision: number,
+  rules: AiGeneratedRuleSet
+): Promise<AiRuleDraft> {
+  return await invoke<AiRuleDraft>("revise_ai_rule_draft", { draft, expectedRevision, rules });
+}
+
+export async function validateAiRuleDraft(
+  draft: AiRuleDraft,
+  expectedRevision: number,
+  expectedSummaryHash: string
+): Promise<AiRuleDraft> {
+  return await invoke<AiRuleDraft>("validate_ai_rule_draft", {
+    draft,
+    expectedRevision,
+    expectedSummaryHash
+  });
+}
+
+export async function approveAiRuleDraft(
+  draft: AiRuleDraft,
+  expectedRevision: number,
+  expectedSummaryHash: string
+): Promise<ApprovedRuleEnvelope> {
+  return await invoke<ApprovedRuleEnvelope>("approve_ai_rule_draft", {
+    draft,
+    expectedRevision,
+    expectedSummaryHash
+  });
+}
+
+export async function getAutomationConfig(): Promise<AutomationConfig> {
+  return await invoke<AutomationConfig>("get_automation_config");
+}
+
+export async function saveAutomationConfig(config: AutomationConfig): Promise<AutomationConfig> {
+  return await invoke<AutomationConfig>("save_automation_config", {
+    expectedRevision: config.revision,
+    config: { ...config, updatedAt: new Date().toISOString() }
+  });
+}
+
+export async function getAutomationSchedulerStatus(): Promise<AutomationSchedulerStatus> {
+  return await invoke<AutomationSchedulerStatus>("get_automation_scheduler_status");
+}
+
+export async function listAutomationReports(): Promise<AutomationRunReport[]> {
+  return await invoke<AutomationRunReport[]>("list_automation_reports");
 }
