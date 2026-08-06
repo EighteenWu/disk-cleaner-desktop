@@ -9,13 +9,6 @@ import type {
   VolumeInfo
 } from "./types";
 
-export type ScanControlAction = "start" | "pause" | "resume" | "rescan";
-
-export interface ScanControlState {
-  action: ScanControlAction;
-  label: string;
-}
-
 export interface VisibleWindow {
   startIndex: number;
   endIndex: number;
@@ -114,20 +107,6 @@ export function cleanupStatusClass(candidate: CleanupCandidate): string {
 
 export function isCleanupSelectable(candidate: CleanupCandidate): boolean {
   return candidate.riskLevel !== "blocked" && candidate.deleteStrategy !== "skip";
-}
-
-export function scanControlForStatus(scanStatus: ScanStatus): ScanControlState {
-  switch (scanStatus) {
-    case "scanning":
-      return { action: "pause", label: "暂停" };
-    case "paused":
-      return { action: "resume", label: "继续" };
-    case "complete":
-    case "failed":
-      return { action: "rescan", label: "重新扫描" };
-    case "idle":
-      return { action: "start", label: "开始扫描" };
-  }
 }
 
 export function visibleWindowForList(

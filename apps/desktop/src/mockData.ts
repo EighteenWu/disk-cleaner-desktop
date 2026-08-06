@@ -156,7 +156,18 @@ export const mockSnapshot: ScanSnapshot = {
     selectedBytes: 2112 * MiB
   },
   scanBackend: "mock",
-  warnings: []
+  warnings: [],
+  scanSessionId: null,
+  coverage: {
+    status: "notStarted",
+    visitedEntries: 0,
+    indexedEntries: 0,
+    logicalBytes: 0,
+    allocatedBytes: 0,
+    volumes: [],
+    gaps: []
+  },
+  spaceSummary: []
 };
 
 export const mockChildren: CleanupCandidate[] = [

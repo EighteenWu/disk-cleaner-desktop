@@ -10,7 +10,6 @@ import {
   mergeRefreshedVolumes,
   mergeCleanupReports,
   removeCandidates,
-  scanControlForStatus,
   scopeCandidatesToVolumes,
   selectedCandidateCategories,
   selectedSummary,
@@ -65,6 +64,22 @@ describe("candidate state", () => {
 
     expect(selectedCandidateIds(selected)).not.toContain("app-session-db");
     expect(allCleanableSelected(selected)).toBe(true);
+  });
+
+  it("selects only candidates in the current filtered result set", () => {
+    const candidates = mockSnapshot.candidates.map((candidate) => ({
+      ...candidate,
+      selected: candidate.id === "video-editor-cache"
+    }));
+    const visible = filterCandidates(candidates, "chrome", "all");
+    const selected = setCandidateSelection(
+      candidates,
+      visible.map((candidate) => candidate.id),
+      true
+    );
+
+    expect(selectedCandidateIds(selected)).toContain("chrome-cache");
+    expect(selected.find((candidate) => candidate.id === "video-editor-cache")?.selected).toBe(true);
   });
 
   it("summarizes cleanup preview without backend round trips", () => {
@@ -188,16 +203,6 @@ describe("candidate state", () => {
     const result = filterCandidates(mockSnapshot.candidates, "Google Chrome", "all");
 
     expect(result.map((candidate) => candidate.id)).toEqual(["chrome-cache"]);
-  });
-});
-
-describe("scan controls", () => {
-  it("uses one primary scan control across statuses", () => {
-    expect(scanControlForStatus("idle")).toEqual({ action: "start", label: "开始扫描" });
-    expect(scanControlForStatus("scanning")).toEqual({ action: "pause", label: "暂停" });
-    expect(scanControlForStatus("paused")).toEqual({ action: "resume", label: "继续" });
-    expect(scanControlForStatus("complete")).toEqual({ action: "rescan", label: "重新扫描" });
-    expect(scanControlForStatus("failed")).toEqual({ action: "rescan", label: "重新扫描" });
   });
 });
 
