@@ -1,8 +1,10 @@
 version: 1
-name: DiskClean conservative default rules
+name: DiskClean built-in rule library
 publisher: DiskClean
+updated_at: 2026-07-26
 rules:
-  - id: user.temp
+  # ---------------------------------------------------------------- 临时文件
+  - id: windows.user.temp
     name: 用户临时目录
     app: Windows
     category: 临时文件
@@ -11,23 +13,367 @@ rules:
     paths:
       - "%TEMP%"
     clean: contents
-    keep_days: 3
-    note: 运行态仍会跳过系统保护路径、状态数据和应用运行依赖。
+    keep_days: 2
+    note: 软件安装包解压、程序运行时产生的临时文件都堆在这里，系统重启后也不会自动清空。删除后不影响任何已安装的软件，正在运行的程序占用的文件会自动跳过。
 
-  - id: chrome.cache
-    name: Chrome 缓存
+  - id: windows.system.temp
+    name: 系统临时目录
+    app: Windows
+    category: 临时文件
+    level: 推荐清理
+    default: true
+    paths:
+      - "%WINDIR%\\Temp"
+    clean: contents
+    keep_days: 2
+    note: 系统服务和安装程序留下的临时文件，通常能占几百 MB 到几 GB。清理不影响系统功能，需要管理员权限才能删干净，没有权限的项会自动跳过。
+
+  - id: windows.inetcache
+    name: IE / 系统组件网络缓存
+    app: Windows
+    category: 临时文件
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\INetCache\\IE"
+    clean: contents
+    keep_days: 3
+    note: 系统内嵌网页组件（帮助页、部分软件的登录窗口）下载的网页图片和脚本缓存。删除后这些页面下次打开会重新联网加载，不会丢登录状态。
+
+  # ---------------------------------------------------------------- Windows 更新
+  - id: windows.update.download
+    name: Windows 更新安装包
+    app: Windows Update
+    category: Windows 更新缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%WINDIR%\\SoftwareDistribution\\Download"
+    clean: contents
+    keep_days: 7
+    note: 已经装完的 Windows 更新安装包，系统装完后不会自己删，常见 1-5 GB。删除后不会卸载已装好的更新；如果有更新正在下载，会重新下一次。需要管理员权限。
+
+  - id: windows.delivery.optimization
+    name: Windows 更新分发缓存
+    app: Windows Update
+    category: Windows 更新缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%WINDIR%\\ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization"
+    clean: contents
+    keep_days: 7
+    note: 传递优化留下的更新分片，用来给局域网内其他电脑提供更新。删除只是让别人下更新时不能从你这里拿，对你自己的系统没有影响。需要管理员权限。
+
+  - id: windows.old.review
+    name: Windows.old 旧系统备份
+    app: Windows
+    category: Windows 更新缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%SYSTEMDRIVE%\\Windows.old"
+    clean: contents
+    keep_days: 0
+    note: 升级系统时留下的整套旧系统，通常 10-30 GB，是占用空间最大的一项。删除后无法再回退到升级前的系统版本，旧系统里的桌面文件和用户目录也会一起消失，删前请确认已经取回需要的文件。
+
+  # ---------------------------------------------------------------- Windows 缓存与诊断
+  - id: windows.thumbnail.icon.cache
+    name: 缩略图与图标缓存
+    app: Windows 资源管理器
+    category: Windows 缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer"
+    clean: contents
+    keep_days: 0
+    note: 图片、视频的预览小图和程序图标缓存，损坏时会出现图标变白、缩略图错乱。删除后系统会自动重建，代价是打开图片多的文件夹时第一次会慢一点，图标可能要重启资源管理器才恢复正常。
+
+  - id: windows.font.cache
+    name: 字体缓存
+    app: Windows
+    category: Windows 缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%WINDIR%\\ServiceProfiles\\LocalService\\AppData\\Local\\FontCache"
+    clean: contents
+    keep_days: 0
+    note: 系统为加快字体渲染建立的缓存，字体显示异常时清理它常常有效。删除后系统自动重建，重建期间部分程序的文字首次显示会略慢。需要管理员权限。
+
+  - id: windows.directx.shader.cache
+    name: DirectX 着色器缓存
+    app: DirectX
+    category: Windows 缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\D3DSCache"
+    clean: contents
+    keep_days: 7
+    note: 游戏和 3D 程序编译好的着色器缓存，用来加快后续启动。删除后完全自动重建，唯一代价是相关游戏下一次进入时加载稍慢或有短暂卡顿。
+
+  - id: windows.gpu.vendor.shader.cache
+    name: 显卡驱动着色器缓存
+    app: NVIDIA / AMD
+    category: Windows 缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\NVIDIA\\DXCache"
+      - "%LOCALAPPDATA%\\NVIDIA\\GLCache"
+      - "%LOCALAPPDATA%\\AMD\\DxCache"
+      - "%LOCALAPPDATA%\\AMD\\GLCache"
+      - "%PROGRAMDATA%\\NVIDIA Corporation\\NV_Cache"
+    clean: contents
+    keep_days: 7
+    note: 显卡驱动为游戏预编译的着色器，驱动更新后这里的旧缓存基本失效。删除后驱动自动重建，只影响游戏首次加载速度，不影响驱动本身和游戏存档。
+
+  - id: windows.crash.dumps
+    name: 程序崩溃转储文件
+    app: Windows
+    category: Windows 诊断数据
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\CrashDumps"
+    clean: contents
+    keep_days: 7
+    note: 程序崩溃时保存的内存快照，单个文件常有几百 MB。这些只给开发者排查崩溃用，普通使用完全不需要，删除不影响任何程序。
+
+  - id: windows.error.reporting
+    name: Windows 错误报告队列
+    app: Windows
+    category: Windows 诊断数据
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\WER"
+      - "%PROGRAMDATA%\\Microsoft\\Windows\\WER"
+    clean: contents
+    keep_days: 7
+    note: 等待上传给微软的错误报告和崩溃摘要。删除后只是这批报告不再上报，对系统稳定性和已装软件没有任何影响。
+
+  - id: windows.cbs.logs
+    name: 系统组件安装日志
+    app: Windows
+    category: Windows 日志文件
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%WINDIR%\\Logs\\CBS"
+    clean: contents
+    keep_days: 30
+    note: 系统更新和组件修复的过程日志，长期使用会累积到几百 MB。删除不影响系统运行，但如果近期出现过更新失败、正在排查问题，建议先留着。需要管理员权限。
+
+  - id: windows.prefetch.review
+    name: 预读取（Prefetch）数据
+    app: Windows
+    category: Windows 缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%WINDIR%\\Prefetch"
+    clean: contents
+    keep_days: 30
+    note: 系统记录常用程序启动顺序的加速文件，一般只有几十 MB，能腾出的空间很少。删除后系统会重新学习，代价是接下来几次开机和常用软件启动会稍慢，不建议为了省空间清理它。
+
+  # ---------------------------------------------------------------- 浏览器缓存
+  - id: chrome.web.cache
+    name: Chrome 网页缓存
     app: Google Chrome
     category: 浏览器缓存
     level: 推荐清理
     default: true
     paths:
       - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 1\\Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 1\\Code Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 2\\Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 2\\Code Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 3\\Cache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 3\\Code Cache"
     clean: contents
     keep_days: 3
+    note: 网页图片、脚本和样式的本地副本，经常是浏览器里最大的一块。删除不会退出登录、不会丢书签和历史，只是常去的网站第一次打开时要重新下载资源。建议先关闭 Chrome 再清理。
     close:
       - chrome.exe
-    note: 浏览器缓存可重新生成；浏览器运行中或命中 profile/数据库数据时会跳过。
 
+  - id: chrome.gpu.shader.cache
+    name: Chrome 显卡与着色器缓存
+    app: Google Chrome
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Default\\GPUCache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 1\\GPUCache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\Profile 2\\GPUCache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\ShaderCache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\GrShaderCache"
+      - "%LOCALAPPDATA%\\Google\\Chrome\\User Data\\GraphiteDawnCache"
+    clean: contents
+    keep_days: 3
+    note: 浏览器为网页动画和视频硬件加速生成的着色器缓存，完全可以重建。删除后不影响任何网站数据和登录状态。建议先关闭 Chrome。
+    close:
+      - chrome.exe
+
+  - id: edge.web.cache
+    name: Edge 网页缓存
+    app: Microsoft Edge
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 1\\Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 1\\Code Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 2\\Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 2\\Code Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 3\\Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 3\\Code Cache"
+    clean: contents
+    keep_days: 3
+    note: Edge 缓存的网页图片和脚本。删除不影响收藏夹、密码和登录状态，只是网站首次打开变慢。建议先关闭 Edge 再清理。
+    close:
+      - msedge.exe
+
+  - id: edge.gpu.shader.cache
+    name: Edge 显卡与着色器缓存
+    app: Microsoft Edge
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Default\\GPUCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 1\\GPUCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Profile 2\\GPUCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\ShaderCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\GrShaderCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\GraphiteDawnCache"
+    clean: contents
+    keep_days: 3
+    note: Edge 硬件加速用的着色器缓存，删除后自动重建，不涉及任何个人数据。建议先关闭 Edge。
+    close:
+      - msedge.exe
+
+  - id: edge.webview.cache
+    name: Edge WebView2 缓存
+    app: Microsoft Edge WebView2
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\EdgeWebView\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\EdgeWebView\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Microsoft\\EdgeWebView\\User Data\\Default\\GPUCache"
+    clean: contents
+    keep_days: 3
+    note: 很多桌面软件内嵌的网页界面共用这块缓存。删除后这些软件的内嵌页面首次加载稍慢，不会退出登录。
+
+  - id: firefox.web.cache
+    name: Firefox 网页缓存
+    app: Mozilla Firefox
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\cache2"
+      - "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\startupCache"
+      - "%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\thumbnails"
+    clean: contents
+    keep_days: 3
+    note: Firefox 的网页缓存、启动缓存和站点缩略图，都放在与个人配置分开的缓存目录里。删除不影响书签、密码和登录状态。建议先关闭 Firefox。
+    close:
+      - firefox.exe
+
+  - id: brave.web.cache
+    name: Brave 网页缓存
+    app: Brave
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\Default\\GPUCache"
+      - "%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data\\ShaderCache"
+    clean: contents
+    keep_days: 3
+    note: Brave 的网页与显卡缓存。删除不影响书签、密码、钱包和登录状态，只是网站首次打开变慢。建议先关闭 Brave。
+    close:
+      - brave.exe
+
+  - id: opera.web.cache
+    name: Opera 网页缓存
+    app: Opera
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Opera Software\\Opera Stable\\Cache"
+      - "%LOCALAPPDATA%\\Opera Software\\Opera Stable\\Code Cache"
+      - "%LOCALAPPDATA%\\Opera Software\\Opera Stable\\GPUCache"
+      - "%LOCALAPPDATA%\\Opera Software\\Opera GX Stable\\Cache"
+      - "%LOCALAPPDATA%\\Opera Software\\Opera GX Stable\\Code Cache"
+    clean: contents
+    keep_days: 3
+    note: Opera 与 Opera GX 的网页缓存。删除不影响书签、密码和登录状态。建议先关闭浏览器再清理。
+    close:
+      - opera.exe
+
+  - id: vivaldi.web.cache
+    name: Vivaldi 网页缓存
+    app: Vivaldi
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Vivaldi\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Vivaldi\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Vivaldi\\User Data\\Default\\GPUCache"
+      - "%LOCALAPPDATA%\\Vivaldi\\User Data\\ShaderCache"
+    clean: contents
+    keep_days: 3
+    note: Vivaldi 的网页与显卡缓存。删除不影响书签、密码和登录状态。建议先关闭 Vivaldi。
+    close:
+      - vivaldi.exe
+
+  - id: qqbrowser.web.cache
+    name: QQ 浏览器网页缓存
+    app: QQ 浏览器
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\Tencent\\QQBrowser\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Tencent\\QQBrowser\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Tencent\\QQBrowser\\User Data\\Default\\GPUCache"
+    clean: contents
+    keep_days: 3
+    note: QQ 浏览器缓存的网页图片和脚本。删除不影响收藏和登录状态，只是网站首次打开变慢。建议先关闭浏览器。
+    close:
+      - QQBrowser.exe
+
+  - id: browser360.web.cache
+    name: 360 浏览器网页缓存
+    app: 360 浏览器
+    category: 浏览器缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%LOCALAPPDATA%\\360Chrome\\Chrome\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\360Chrome\\Chrome\\User Data\\Default\\GPUCache"
+      - "%APPDATA%\\360se6\\User Data\\Default\\Cache"
+      - "%APPDATA%\\360se6\\User Data\\Default\\GPUCache"
+    clean: contents
+    keep_days: 3
+    note: 360 极速浏览器与 360 安全浏览器的网页缓存。删除不影响收藏夹和登录状态，只是网站首次打开变慢。建议先关闭浏览器。
+
+  # ---------------------------------------------------------------- 开发依赖缓存
   - id: npm.cache.review
     name: npm 下载缓存
     app: npm
@@ -36,36 +382,286 @@ rules:
     default: false
     paths:
       - "%LOCALAPPDATA%\\npm-cache"
+      - "%APPDATA%\\npm-cache"
     clean: contents
-    keep_days: 14
+    keep_days: 30
+    note: npm 下载过的安装包副本，可以重新下载。删除后离线环境将无法安装依赖，下一次 npm install 需要联网重新拉取，速度会明显变慢。不做前端开发可以放心清理。
     close:
       - node.exe
-      - npm.exe
-    note: 依赖缓存删除后可重新下载，但会影响离线构建和下次安装速度，默认不勾选。
 
-  - id: local.d.codex-tmp.review
-    name: D 盘 Codex 临时目录
-    app: Codex
-    category: 临时文件
-    level: 需要确认
-    default: false
-    paths:
-      - "D:\\codex-tmp"
-    clean: contents
-    keep_days: 7
-    note: 当前机器扫描发现的顶层临时目录；只建议清理旧文件，默认不勾选。
-
-  - id: local.d.pnpm-store.review
-    name: D 盘 pnpm 共享缓存
+  - id: pnpm.store.review
+    name: pnpm 共享包仓库
     app: pnpm
     category: 开发依赖缓存
     level: 需要确认
     default: false
     paths:
-      - "D:\\.pnpm-store"
+      - "%LOCALAPPDATA%\\pnpm\\store"
+      - "%LOCALAPPDATA%\\pnpm-store"
     clean: contents
-    keep_days: 14
+    keep_days: 30
+    note: pnpm 的全局包仓库，本机所有项目的依赖都从这里硬链接过去。删除会让已有项目的 node_modules 失效，需要重新 pnpm install 才能构建，离线环境会直接装不上。
     close:
       - node.exe
-      - pnpm.exe
-    note: 共享依赖缓存可重建，但会影响离线构建和下次安装速度，默认不勾选。
+
+  - id: yarn.cache.review
+    name: Yarn 下载缓存
+    app: Yarn
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Yarn\\Cache"
+    clean: contents
+    keep_days: 30
+    note: Yarn 缓存的依赖包。删除后可重新下载，但离线安装会失败，下一次安装依赖需要联网并且更慢。
+    close:
+      - node.exe
+
+  - id: pip.cache.review
+    name: pip 下载缓存
+    app: pip
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\pip\\Cache"
+    clean: contents
+    keep_days: 30
+    note: Python pip 下载和编译过的包缓存，容易累积到几 GB。删除后已装好的 Python 环境不受影响，但下次装包要重新下载，部分需要编译的包会明显变慢。
+    close:
+      - python.exe
+
+  - id: uv.cache.review
+    name: uv 下载缓存
+    app: uv
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\uv\\cache"
+    clean: contents
+    keep_days: 30
+    note: uv 的 Python 包与解释器缓存。删除后已有虚拟环境仍可用，但新建环境和装包需要联网重新下载，离线环境会失败。
+
+  - id: gradle.cache.review
+    name: Gradle 构建缓存
+    app: Gradle
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%USERPROFILE%\\.gradle\\caches"
+    clean: contents
+    keep_days: 30
+    note: Gradle 下载的依赖和构建缓存，Android 开发常见 5-20 GB。删除后项目代码不受影响，但下一次构建会重新下载全部依赖，通常要等十几分钟，离线环境会直接构建失败。
+    close:
+      - java.exe
+
+  - id: maven.cache.review
+    name: Maven 本地仓库
+    app: Maven
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%USERPROFILE%\\.m2\\repository"
+    clean: contents
+    keep_days: 60
+    note: Maven 下载的全部 Java 依赖。删除后所有 Java 项目下一次构建都要重新联网下载依赖，离线环境会构建失败；如果仓库里有内部私服包且私服已下线，可能再也拉不回来。
+    close:
+      - java.exe
+
+  - id: nuget.cache.review
+    name: NuGet 包缓存
+    app: NuGet
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%USERPROFILE%\\.nuget\\packages"
+      - "%LOCALAPPDATA%\\NuGet\\v3-cache"
+    clean: contents
+    keep_days: 30
+    note: .NET 项目的依赖包缓存。删除后代码和已编译程序不受影响，但下一次还原依赖需要联网重新下载，离线环境会失败。
+
+  - id: cargo.cache.review
+    name: Cargo 包缓存
+    app: Cargo
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%USERPROFILE%\\.cargo\\registry\\cache"
+    clean: contents
+    keep_days: 30
+    note: Rust 依赖的压缩包缓存，只清缓存不动已解压的源码。删除后可重新下载，离线构建会失败，下一次构建需要联网。
+    close:
+      - cargo.exe
+
+  - id: go.cache.review
+    name: Go 构建与模块缓存
+    app: Go
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\go-build"
+      - "%USERPROFILE%\\go\\pkg\\mod\\cache\\download"
+    clean: contents
+    keep_days: 30
+    note: Go 的编译中间产物和模块下载缓存。删除后可重新生成，代价是下一次编译要全量重编、依赖要重新联网下载，离线构建会失败。
+    close:
+      - go.exe
+
+  - id: composer.cache.review
+    name: Composer 下载缓存
+    app: Composer
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Composer\\cache"
+      - "%APPDATA%\\Composer\\cache"
+    clean: contents
+    keep_days: 30
+    note: PHP Composer 缓存的依赖包。删除后可重新下载，离线安装会失败，下一次 composer install 变慢。
+
+  - id: electron.builder.cache.review
+    name: Electron 与打包工具缓存
+    app: Electron
+    category: 开发依赖缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\electron\\Cache"
+      - "%LOCALAPPDATA%\\electron-builder\\Cache"
+    clean: contents
+    keep_days: 30
+    note: Electron 运行时和打包工具下载的二进制包，单份就有几百 MB。删除后不影响已装好的桌面软件，但下一次打包要重新联网下载对应版本。
+
+  # ---------------------------------------------------------------- 开发工具缓存
+  - id: vscode.cache
+    name: VS Code 缓存
+    app: Visual Studio Code
+    category: 开发工具缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Code\\Cache"
+      - "%APPDATA%\\Code\\CachedData"
+      - "%APPDATA%\\Code\\Code Cache"
+      - "%APPDATA%\\Code\\GPUCache"
+      - "%APPDATA%\\Code\\DawnGraphiteCache"
+      - "%APPDATA%\\Code\\DawnWebGPUCache"
+    clean: contents
+    keep_days: 7
+    note: VS Code 界面与旧版本的编译缓存，升级多次后会残留很多。删除不影响设置、插件和打开过的项目，只是启动一次会稍慢。请先关闭 VS Code 再清理。
+    close:
+      - Code.exe
+
+  - id: jetbrains.cache.review
+    name: JetBrains IDE 索引缓存
+    app: JetBrains IDE
+    category: 开发工具缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\JetBrains\\*\\caches"
+      - "%LOCALAPPDATA%\\JetBrains\\*\\tmp"
+    clean: contents
+    keep_days: 14
+    note: IntelliJ、PyCharm 等 IDE 为项目建立的代码索引，多个版本叠加常有几 GB。删除不会丢代码和配置，但下一次打开项目要重新建索引，大项目可能要等几分钟且期间跳转和补全不可用。
+
+  # ---------------------------------------------------------------- 应用缓存
+  - id: discord.cache
+    name: Discord 缓存
+    app: Discord
+    category: 应用缓存
+    level: 推荐清理
+    default: true
+    paths:
+      - "%APPDATA%\\discord\\Cache"
+      - "%APPDATA%\\discord\\Code Cache"
+      - "%APPDATA%\\discord\\GPUCache"
+    clean: contents
+    keep_days: 3
+    note: Discord 缓存的表情、图片和头像。删除不会退出登录、不会丢聊天记录，只是重新打开时图片要重新加载。建议先退出 Discord。
+    close:
+      - Discord.exe
+
+  - id: spotify.cache
+    name: Spotify 离线缓存
+    app: Spotify
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Spotify\\Data"
+      - "%LOCALAPPDATA%\\Spotify\\Storage"
+    clean: contents
+    keep_days: 7
+    note: Spotify 缓存的音频数据，默认能占好几 GB。删除不影响账号和歌单，但已缓存的歌曲需要重新联网加载，如果有下载好用于离线收听的内容会需要重新下载。
+    close:
+      - Spotify.exe
+
+  - id: teams.cache
+    name: Teams 缓存
+    app: Microsoft Teams
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Microsoft\\Teams\\Cache"
+      - "%APPDATA%\\Microsoft\\Teams\\Code Cache"
+      - "%APPDATA%\\Microsoft\\Teams\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: Teams 缓存的界面资源和头像图片，也是官方排查 Teams 卡顿的常用手段。删除后需要重新登录一次的情况偶有发生，聊天记录保存在云端不会丢失。请先完全退出 Teams。
+    close:
+      - Teams.exe
+
+  - id: adobe.media.cache.review
+    name: Adobe 媒体缓存
+    app: Adobe Creative Cloud
+    category: 应用缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%APPDATA%\\Adobe\\Common\\Media Cache"
+      - "%APPDATA%\\Adobe\\Common\\Media Cache Files"
+    clean: contents
+    keep_days: 14
+    note: Premiere、After Effects 为音视频素材生成的预览和波形缓存，做视频的机器上常有几十 GB。删除不影响工程文件和素材，但正在剪的项目再次打开时要重新分析素材，大工程可能要等很久。请先关闭 Adobe 软件。
+
+  - id: steam.cache
+    name: Steam 着色器与下载缓存
+    app: Steam
+    category: 游戏缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%PROGRAMFILES(X86)%\\Steam\\steamapps\\shadercache"
+      - "%PROGRAMFILES(X86)%\\Steam\\steamapps\\downloading"
+      - "%PROGRAMFILES(X86)%\\Steam\\steamapps\\temp"
+    clean: contents
+    keep_days: 7
+    note: Steam 预编译的游戏着色器和未完成的下载分片，常见几 GB 到几十 GB。删除不影响已装好的游戏和存档，但游戏首次进入会重新编译着色器（可能卡顿），未下完的游戏要从头下。只覆盖默认安装位置，装在其他盘的 Steam 库不在此列。请先退出 Steam。
+    close:
+      - steam.exe
+
+  - id: wechat.file.cache.review
+    name: 微信文件缓存
+    app: 微信
+    category: 应用缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Cache"
+      - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Video"
+      - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Image"
+    clean: contents
+    keep_days: 60
+    note: 微信自动下载的图片、视频和临时文件，长期使用常有几十 GB。注意：聊天里收到的图片和视频删掉后，如果对方已过期或撤回就再也点不开了，只有服务器还留着的才能重新下载。文档和收到的文件不在清理范围内。请先退出微信。
+    close:
+      - WeChat.exe

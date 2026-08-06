@@ -1,4 +1,4 @@
-use crate::RiskLevel;
+use crate::{classify_path_state_markers, PathGuardLevel, RiskLevel};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -1202,7 +1202,15 @@ enum PathSafety {
     Review(String),
 }
 
+// 编译期只能看到含环境变量与通配符的规则路径，因此这里统一按共享守卫表给出降级建议；
+// HARD_DENY 的最终拦截由运行期 evaluate_cleanup_target_path 对展开后的真实路径执行。
 fn evaluate_rule_path_safety(normalized_path: &str, source: &RuleSourceKind) -> PathSafety {
+    let state = classify_path_state_markers(normalized_path);
+
+    if let PathGuardLevel::HardDeny(reason) = state {
+        return PathSafety::Review(reason.to_string());
+    }
+
     if matches!(source, RuleSourceKind::BuiltIn) {
         return PathSafety::Allowed;
     }
@@ -1241,20 +1249,8 @@ fn evaluate_rule_path_safety(normalized_path: &str, source: &RuleSourceKind) -> 
         );
     }
 
-    if BLOCKED_STATE_MARKERS
-        .iter()
-        .any(|marker| normalized_path.contains(marker))
-    {
-        return PathSafety::Review(
-            "命中账号、会话、数据库或本地状态特征，建议谨慎评估后再清理".to_string(),
-        );
-    }
-
-    if REVIEW_STATE_MARKERS
-        .iter()
-        .any(|marker| normalized_path.contains(marker))
-    {
-        return PathSafety::Review("命中备份、恢复或 profile 特征，需要用户逐项确认".to_string());
+    if let PathGuardLevel::NeedsConfirm(reason) = state {
+        return PathSafety::Review(reason.to_string());
     }
 
     if REVIEW_DEPENDENCY_CACHE_MARKERS
