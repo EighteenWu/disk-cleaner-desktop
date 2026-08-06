@@ -12,3 +12,4 @@ apps/desktop/src-tauri/target/
 .codex-run/
 .playwright-mcp/
 .trellis/
+.claude/worktrees/
