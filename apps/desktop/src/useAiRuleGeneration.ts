@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   approveAiRuleDraft,
   buildAiScanSummary,
@@ -6,6 +6,7 @@ import {
   generateAiRules,
   listAiProviderModels,
   listAiProviderProfiles,
+  probeAiProviderGeneration,
   reviseAiRuleDraft,
   saveAiProviderCredential,
   saveAiProviderProfile,
@@ -14,20 +15,23 @@ import {
 } from "./api";
 import { aiGenerationRequest } from "./aiGeneration";
 import { aiDraftApprovalReady, aiDraftValidationReady } from "./aiDraftWorkflow";
-import { describeProviderError } from "./providerError";
+import { describeProviderError, describeProviderErrorOrTimeout } from "./providerError";
 import type { RuleSourcesState } from "./useRuleSources";
 import type {
   AiGeneratedRuleSet,
+  AiGenerationMode,
   AiProviderKind,
   AiProviderModel,
   AiProviderProfile,
   AiRuleDraft,
   AiRuleTier,
+  AiSessionEvent,
   RedactedScanSummary,
   ScanSnapshot
 } from "./types";
 
 const DEFAULT_PROVIDER_TIMEOUT_MS = 45_000;
+export const MAX_AI_SESSION_EVENTS = 10;
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 
@@ -50,7 +54,10 @@ export interface AiRuleGenerationState {
   models: AiProviderModel[];
   loadingModels: boolean;
   testingConnection: boolean;
+  probingGeneration: boolean;
   summary: RedactedScanSummary | null;
+  generationMode: AiGenerationMode;
+  setGenerationMode: (value: AiGenerationMode) => void;
   targetTier: AiRuleTier;
   setTargetTier: (value: AiRuleTier) => void;
   draft: AiRuleDraft | null;
@@ -59,8 +66,11 @@ export interface AiRuleGenerationState {
   setDraftEditor: (value: string) => void;
   generating: boolean;
   message: string;
+  sessionEvents: AiSessionEvent[];
+  clearSessionEvents: () => void;
   loadModels: () => Promise<void>;
   testConnection: () => Promise<void>;
+  probeGeneration: () => Promise<void>;
   saveProvider: () => Promise<void>;
   preparePreview: (snapshot: ScanSnapshot | null, ready: boolean) => Promise<void>;
   generate: () => Promise<void>;
@@ -68,6 +78,23 @@ export interface AiRuleGenerationState {
   applyDraftEdit: () => Promise<void>;
   validateDraft: () => Promise<void>;
   approveAndImportDraft: () => Promise<void>;
+}
+
+export function pushSessionEvent(
+  events: AiSessionEvent[],
+  event: Omit<AiSessionEvent, "at"> & { at?: string }
+): AiSessionEvent[] {
+  const next: AiSessionEvent = {
+    at: event.at ?? new Date().toISOString(),
+    kind: event.kind,
+    summaryHash: event.summaryHash,
+    mode: event.mode,
+    model: event.model,
+    latencyMs: event.latencyMs,
+    ruleCount: event.ruleCount,
+    message: event.message
+  };
+  return [next, ...events].slice(0, MAX_AI_SESSION_EVENTS);
 }
 
 export function useAiRuleGeneration(
@@ -85,13 +112,17 @@ export function useAiRuleGeneration(
   const [models, setModels] = useState<AiProviderModel[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
+  const [probingGeneration, setProbingGeneration] = useState(false);
   const [summary, setSummary] = useState<RedactedScanSummary | null>(null);
+  const [generationMode, setGenerationModeValue] = useState<AiGenerationMode>("allTiers");
   const [targetTierValue, setTargetTierValue] = useState<AiRuleTier>("light");
   const [draft, setDraft] = useState<AiRuleDraft | null>(null);
   const [draftEditor, setDraftEditorValue] = useState("");
   const [draftEditorDirty, setDraftEditorDirty] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [message, setMessage] = useState("");
+  const [sessionEvents, setSessionEvents] = useState<AiSessionEvent[]>([]);
+  const clearSessionEvents = useCallback(() => setSessionEvents([]), []);
 
   useEffect(() => {
     let disposed = false;
@@ -108,6 +139,10 @@ export function useAiRuleGeneration(
       disposed = true;
     };
   }, [translate]);
+
+  function recordSession(event: Omit<AiSessionEvent, "at"> & { at?: string }) {
+    setSessionEvents((current) => pushSessionEvent(current, event));
+  }
 
   function clearPreparedDraft() {
     setSummary(null);
@@ -127,6 +162,11 @@ export function useAiRuleGeneration(
       setTimeoutMs(profile.timeoutMs);
       setModel(profile.model);
     }
+  }
+
+  function setGenerationMode(value: AiGenerationMode) {
+    setGenerationModeValue(value);
+    clearPreparedDraft();
   }
 
   function setTargetTier(value: AiRuleTier) {
@@ -165,11 +205,60 @@ export function useAiRuleGeneration(
         profileId: selectedProfileIdValue || null,
         apiKey: apiKey.trim() || null
       });
-      setMessage(translate("rule.aiConnectionSucceeded", { count: result.modelCount }));
+      setMessage(
+        translate("rule.aiConnectionSucceeded", { count: result.modelCount })
+      );
     } catch (error) {
       setMessage(describeProviderError(error, translate));
     } finally {
       setTestingConnection(false);
+    }
+  }
+
+  async function probeGeneration() {
+    if (!model.trim()) {
+      setMessage(translate("rule.aiProbeNeedsModel"));
+      return;
+    }
+    setProbingGeneration(true);
+    const started = performance.now();
+    try {
+      const result = await probeAiProviderGeneration({
+        kind: providerKind,
+        baseUrl,
+        timeoutMs,
+        model: model.trim(),
+        profileId: selectedProfileIdValue || null,
+        apiKey: apiKey.trim() || null
+      });
+      const latencyMs = result.latencyMs;
+      const text = translate("rule.aiProbeSucceeded", { ms: latencyMs });
+      setMessage(text);
+      recordSession({
+        kind: "probe",
+        model: model.trim(),
+        latencyMs,
+        message: text
+      });
+    } catch (error) {
+      const elapsed = Math.round(performance.now() - started);
+      const text = describeProviderErrorOrTimeout(
+        error,
+        translate,
+        translate("rule.aiProbeTimeout", {
+          seconds: Math.round(timeoutMs / 1000),
+          ms: elapsed
+        })
+      );
+      setMessage(text);
+      recordSession({
+        kind: "error",
+        model: model.trim(),
+        latencyMs: elapsed,
+        message: text
+      });
+    } finally {
+      setProbingGeneration(false);
     }
   }
 
@@ -210,8 +299,17 @@ export function useAiRuleGeneration(
     }
     setDraft(null);
     try {
-      setSummary(await buildAiScanSummary(snapshot));
-      setMessage(translate("rule.aiPreviewReady"));
+      const nextSummary = await buildAiScanSummary(snapshot);
+      setSummary(nextSummary);
+      const text = translate("rule.aiPreviewReady");
+      setMessage(text);
+      recordSession({
+        kind: "preview",
+        summaryHash: nextSummary.summaryHash,
+        mode: generationMode,
+        model: model.trim() || undefined,
+        message: text
+      });
     } catch (error) {
       setMessage(describeProviderError(error, translate));
     }
@@ -224,17 +322,48 @@ export function useAiRuleGeneration(
     }
     setGenerating(true);
     setDraft(null);
+    const started = performance.now();
     try {
-      const response = await generateAiRules(
-        selectedProfileIdValue,
-        aiGenerationRequest(summary, targetTierValue)
+      const request = aiGenerationRequest(
+        summary,
+        generationMode,
+        generationMode === "singleTier" ? targetTierValue : null
       );
+      const response = await generateAiRules(selectedProfileIdValue, request);
+      const elapsed = Math.round(performance.now() - started);
       setDraft(response.draft);
       setDraftEditorValue(JSON.stringify(response.draft.rules, null, 2));
       setDraftEditorDirty(false);
-      setMessage(translate("rule.aiGenerated", { count: response.draft.rules.rules.length }));
+      const text = translate("rule.aiGenerated", { count: response.draft.rules.rules.length });
+      setMessage(text);
+      recordSession({
+        kind: "generate",
+        summaryHash: summary.summaryHash,
+        mode: generationMode,
+        model: response.draft.model,
+        latencyMs: elapsed,
+        ruleCount: response.draft.rules.rules.length,
+        message: text
+      });
     } catch (error) {
-      setMessage(describeProviderError(error, translate));
+      const elapsed = Math.round(performance.now() - started);
+      const text = describeProviderErrorOrTimeout(
+        error,
+        translate,
+        translate("rule.aiGenerationTimeout", {
+          seconds: Math.round(timeoutMs / 1000),
+          elapsedSeconds: Math.max(1, Math.round(elapsed / 1000))
+        })
+      );
+      setMessage(text);
+      recordSession({
+        kind: "error",
+        summaryHash: summary.summaryHash,
+        mode: generationMode,
+        model: model.trim() || undefined,
+        latencyMs: elapsed,
+        message: text
+      });
     } finally {
       setGenerating(false);
     }
@@ -308,7 +437,10 @@ export function useAiRuleGeneration(
     models,
     loadingModels,
     testingConnection,
+    probingGeneration,
     summary,
+    generationMode,
+    setGenerationMode,
     targetTier: targetTierValue,
     setTargetTier,
     draft,
@@ -317,8 +449,11 @@ export function useAiRuleGeneration(
     setDraftEditor,
     generating,
     message,
+    sessionEvents,
+    clearSessionEvents,
     loadModels,
     testConnection,
+    probeGeneration,
     saveProvider,
     preparePreview,
     generate,

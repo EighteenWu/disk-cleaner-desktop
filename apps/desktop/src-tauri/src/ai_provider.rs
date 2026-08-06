@@ -1,5 +1,7 @@
 use crate::credentials::{CredentialStore, SecretString};
-use cleaner_core::{AiGeneratedRuleSet, AiRuleTier, RedactedScanSummary, RuleCompilation};
+use cleaner_core::{
+    AiGeneratedRuleSet, AiGenerationMode, AiRuleTier, RedactedScanSummary, RuleCompilation,
+};
 use reqwest::{header, redirect::Policy, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -7,7 +9,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const PROFILE_FILE: &[&str] = &["config", "ai-provider-profiles.json"];
@@ -79,7 +81,37 @@ struct ProviderProfileDocument {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderGenerationRequest {
     pub summary: RedactedScanSummary,
-    pub target_tier: AiRuleTier,
+    /// Absent on older callers: treat as `singleTier` when `target_tier` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_mode: Option<AiGenerationMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_tier: Option<AiRuleTier>,
+}
+
+impl ProviderGenerationRequest {
+    /// Resolves legacy `{ targetTier }` payloads and the new explicit mode contract.
+    pub fn resolved_mode(&self) -> Result<(AiGenerationMode, Option<AiRuleTier>), String> {
+        match self.generation_mode {
+            Some(AiGenerationMode::AllTiers) => {
+                if self.target_tier.is_some() {
+                    return Err("全部档位模式不得指定单一目标档位。".to_string());
+                }
+                Ok((AiGenerationMode::AllTiers, None))
+            }
+            Some(AiGenerationMode::SingleTier) => {
+                let tier = self
+                    .target_tier
+                    .ok_or_else(|| "单档模式必须指定目标档位。".to_string())?;
+                Ok((AiGenerationMode::SingleTier, Some(tier)))
+            }
+            None => {
+                let tier = self.target_tier.ok_or_else(|| {
+                    "请指定 generationMode，或提供兼容的 targetTier。".to_string()
+                })?;
+                Ok((AiGenerationMode::SingleTier, Some(tier)))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +120,39 @@ pub struct ProviderGenerationResponse {
     pub request_id: Option<String>,
     pub rules: AiGeneratedRuleSet,
     pub compilation: RuleCompilation,
+}
+
+/// Lightweight completion probe — same credential surface as connection test, plus model.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderGenerationProbeQuery {
+    pub kind: ProviderKind,
+    pub base_url: String,
+    pub timeout_ms: u64,
+    pub model: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<SecretString>,
+}
+
+impl ProviderGenerationProbeQuery {
+    pub fn validate(&self) -> Result<Url, String> {
+        if let Some(profile_id) = &self.profile_id {
+            validate_id(profile_id)?;
+        }
+        validate_short_text("模型名", &self.model)?;
+        validate_timeout(self.timeout_ms)?;
+        validate_base_url(&self.base_url)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderGenerationProbeResult {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub request_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -336,6 +401,9 @@ pub async fn generate_rules(
             "脱敏摘要无效，请重新生成发送预览。",
         ));
     }
+    let (generation_mode, target_tier) = request
+        .resolved_mode()
+        .map_err(|message| provider_error(ProviderErrorCategory::Configuration, message))?;
     let secret = credentials
         .read(&profile.id)
         .map_err(|message| provider_error(ProviderErrorCategory::CredentialMissing, message))?
@@ -359,12 +427,7 @@ pub async fn generate_rules(
     let prompt = serde_json::to_string(request).map_err(|_| {
         provider_error(ProviderErrorCategory::Configuration, "序列化脱敏摘要失败。")
     })?;
-    let target_tier = match request.target_tier {
-        AiRuleTier::Light => "light",
-        AiRuleTier::Medium => "medium",
-        AiRuleTier::Heavy => "heavy",
-    };
-    let system = format!("Return JSON only. Generate only {target_tier} cleanup rule drafts. Every rule tier must be {target_tier}. Use only environment-variable path templates. Never infer personal paths. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions.");
+    let system = generation_system_prompt(generation_mode, target_tier);
     let output_schema = provider_output_schema();
 
     let builder = match profile.kind {
@@ -452,15 +515,13 @@ pub async fn generate_rules(
     let normalized = normalize_tier_alias(&structured)?;
     let rules = AiGeneratedRuleSet::parse(&normalized)
         .map_err(|message| provider_error(ProviderErrorCategory::InvalidSchema, message))?;
-    if rules
-        .rules
-        .iter()
-        .any(|rule| rule.tier != request.target_tier)
-    {
-        return Err(provider_error(
-            ProviderErrorCategory::InvalidSchema,
-            "Provider 返回了目标档位之外的规则。",
-        ));
+    if let Some(tier) = target_tier {
+        if rules.rules.iter().any(|rule| rule.tier != tier) {
+            return Err(provider_error(
+                ProviderErrorCategory::InvalidSchema,
+                "Provider 返回了目标档位之外的规则。",
+            ));
+        }
     }
     let compilation = rules
         .compile()
@@ -478,6 +539,22 @@ pub async fn generate_rules(
     })
 }
 
+fn generation_system_prompt(mode: AiGenerationMode, target_tier: Option<AiRuleTier>) -> String {
+    match mode {
+        AiGenerationMode::AllTiers => {
+            "Return JSON only. Generate light, medium, and/or heavy cleanup rule drafts in one response. Each rule must set tier to light, medium, or heavy correctly. Empty tiers are allowed but at least one rule is required. Use only environment-variable path templates. Never infer personal paths. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions.".to_string()
+        }
+        AiGenerationMode::SingleTier => {
+            let tier = match target_tier.expect("singleTier requires target") {
+                AiRuleTier::Light => "light",
+                AiRuleTier::Medium => "medium",
+                AiRuleTier::Heavy => "heavy",
+            };
+            format!("Return JSON only. Generate only {tier} cleanup rule drafts. Every rule tier must be {tier}. Use only environment-variable path templates. Never infer personal paths. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions.")
+        }
+    }
+}
+
 fn provider_output_schema() -> Value {
     json!({
         "type": "object",
@@ -488,7 +565,7 @@ fn provider_output_schema() -> Value {
             "rules": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 32,
+                "maxItems": 96,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -511,6 +588,191 @@ fn provider_output_schema() -> Value {
             }
         }
     })
+}
+
+fn probe_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ok"],
+        "properties": {
+            "ok": {"type": "boolean", "const": true}
+        }
+    })
+}
+
+pub async fn probe_generation(
+    mut query: ProviderGenerationProbeQuery,
+    credentials: &dyn CredentialStore,
+) -> Result<ProviderGenerationProbeResult, ProviderError> {
+    let started = Instant::now();
+    let base_url = query
+        .validate()
+        .map_err(|message| provider_error(ProviderErrorCategory::Configuration, message))?;
+    let secret = resolve_probe_secret(&mut query, credentials)?;
+    let endpoint = endpoint(&base_url, query.kind)?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .timeout(Duration::from_millis(query.timeout_ms))
+        .build()
+        .map_err(|_| {
+            provider_error(
+                ProviderErrorCategory::Configuration,
+                "创建 Provider HTTP 客户端失败。",
+            )
+        })?;
+    let system =
+        "Return JSON only matching {\"ok\":true}. Do not include other fields or explanation.";
+    let schema = probe_output_schema();
+    let builder = match query.kind {
+        ProviderKind::OpenAiCompatible => client
+            .post(endpoint)
+            .bearer_auth(secret.expose().map_err(|message| {
+                provider_error(ProviderErrorCategory::CredentialMissing, message)
+            })?)
+            .json(&json!({
+                "model": query.model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": "ping"}
+                ],
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "generation_probe",
+                        "strict": true,
+                        "schema": schema
+                    }
+                }
+            })),
+        ProviderKind::AnthropicCompatible => client
+            .post(endpoint)
+            .header(
+                "x-api-key",
+                secret.expose().map_err(|message| {
+                    provider_error(ProviderErrorCategory::CredentialMissing, message)
+                })?,
+            )
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": query.model,
+                "max_tokens": 64,
+                "system": system,
+                "messages": [{"role": "user", "content": "ping"}],
+                "tools": [{
+                    "name": "submit_probe",
+                    "description": "Confirm the generation path works.",
+                    "input_schema": schema
+                }],
+                "tool_choice": {"type": "tool", "name": "submit_probe"}
+            })),
+    };
+    let response = builder.send().await.map_err(map_reqwest_error)?;
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(128).collect::<String>());
+    if status.is_redirection() {
+        return Err(provider_error(
+            ProviderErrorCategory::Network,
+            "Provider 返回了被阻止的重定向。",
+        ));
+    }
+    if !status.is_success() {
+        return Err(status_error(
+            status,
+            response.headers().get(header::RETRY_AFTER),
+        ));
+    }
+    if response.content_length().unwrap_or(0) > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(provider_error(
+            ProviderErrorCategory::ResponseTooLarge,
+            "Provider 响应超过 256 KB 上限。",
+        ));
+    }
+    let bytes = response.bytes().await.map_err(map_reqwest_error)?;
+    if bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
+        return Err(provider_error(
+            ProviderErrorCategory::ResponseTooLarge,
+            "Provider 响应超过 256 KB 上限。",
+        ));
+    }
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 探活响应不是有效 JSON。",
+        )
+    })?;
+    let structured = extract_probe_content(query.kind, &value)?;
+    let parsed: Value = serde_json::from_str(&structured).map_err(|_| {
+        provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 探活内容不是有效 JSON。",
+        )
+    })?;
+    if parsed.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 探活未返回 ok:true。",
+        ));
+    }
+    Ok(ProviderGenerationProbeResult {
+        ok: true,
+        latency_ms: started.elapsed().as_millis() as u64,
+        request_id,
+    })
+}
+
+fn extract_probe_content(kind: ProviderKind, value: &Value) -> Result<String, ProviderError> {
+    match kind {
+        ProviderKind::OpenAiCompatible => value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                provider_error(
+                    ProviderErrorCategory::InvalidSchema,
+                    "Provider 探活缺少 message content。",
+                )
+            }),
+        ProviderKind::AnthropicCompatible => {
+            let items = value.get("content").and_then(Value::as_array);
+            let tool = items.and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("tool_use")
+                        && item.get("name").and_then(Value::as_str) == Some("submit_probe")
+                })
+            });
+            if let Some(tool) = tool {
+                if let Some(input) = tool.get("input") {
+                    return serde_json::to_string(input).map_err(|_| {
+                        provider_error(
+                            ProviderErrorCategory::InvalidSchema,
+                            "Provider 探活工具参数无效。",
+                        )
+                    });
+                }
+            }
+            items
+                .and_then(|items| {
+                    items.iter().find_map(|item| {
+                        if item.get("type").and_then(Value::as_str) == Some("text") {
+                            item.get("text").and_then(Value::as_str).map(str::to_string)
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .ok_or_else(|| {
+                    provider_error(
+                        ProviderErrorCategory::InvalidSchema,
+                        "Provider 探活缺少 tool/text 内容。",
+                    )
+                })
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -636,10 +898,33 @@ fn resolve_secret(
     query: &mut ProviderModelQuery,
     credentials: &dyn CredentialStore,
 ) -> Result<SecretString, ProviderError> {
-    if let Some(api_key) = query.api_key.take() {
+    resolve_credential(
+        query.api_key.take(),
+        query.profile_id.as_deref(),
+        credentials,
+    )
+}
+
+fn resolve_probe_secret(
+    query: &mut ProviderGenerationProbeQuery,
+    credentials: &dyn CredentialStore,
+) -> Result<SecretString, ProviderError> {
+    resolve_credential(
+        query.api_key.take(),
+        query.profile_id.as_deref(),
+        credentials,
+    )
+}
+
+fn resolve_credential(
+    api_key: Option<SecretString>,
+    profile_id: Option<&str>,
+    credentials: &dyn CredentialStore,
+) -> Result<SecretString, ProviderError> {
+    if let Some(api_key) = api_key {
         return Ok(api_key);
     }
-    let profile_id = query.profile_id.as_deref().ok_or_else(|| {
+    let profile_id = profile_id.ok_or_else(|| {
         provider_error(
             ProviderErrorCategory::CredentialMissing,
             "请填写 API Key，或先保存该 Provider 配置。",
@@ -1017,6 +1302,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_tiers_generation_accepts_mixed_tier_json() {
+        let response = provider_response(ProviderKind::OpenAiCompatible, &valid_all_tier_rules());
+        let (base_url, captured) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let generated = generate_rules(&provider, &all_tiers_generation_request(), &credentials)
+            .await
+            .unwrap();
+        assert_eq!(generated.rules.rules.len(), 3);
+        let request = captured.recv().unwrap();
+        assert!(request.contains("allTiers") || request.contains("generationMode"));
+        assert!(request.contains("Generate light, medium, and/or heavy"));
+    }
+
+    #[tokio::test]
+    async fn single_tier_mode_still_rejects_cross_tier_when_explicit() {
+        let response = provider_response(ProviderKind::OpenAiCompatible, &valid_all_tier_rules());
+        let (base_url, _) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let mut request = generation_request();
+        request.generation_mode = Some(AiGenerationMode::SingleTier);
+        request.target_tier = Some(AiRuleTier::Light);
+        assert_eq!(
+            generate_rules(&provider, &request, &credentials)
+                .await
+                .unwrap_err()
+                .category,
+            ProviderErrorCategory::InvalidSchema
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_probe_classifies_timeout() {
+        let response = provider_probe_response(ProviderKind::OpenAiCompatible);
+        let (base_url, _) = spawn_server(200, response, Duration::from_millis(5_100));
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let error = probe_generation(
+            ProviderGenerationProbeQuery {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url,
+                timeout_ms: 5_000,
+                model: "fixture-model".into(),
+                profile_id: Some("profile-1".into()),
+                api_key: None,
+            },
+            &credentials,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.category, ProviderErrorCategory::Timeout);
+    }
+
+    #[tokio::test]
+    async fn generation_probe_succeeds_with_ok_payload() {
+        let response = provider_probe_response(ProviderKind::OpenAiCompatible);
+        let (base_url, captured) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let result = probe_generation(
+            ProviderGenerationProbeQuery {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url,
+                timeout_ms: 5_000,
+                model: "fixture-model".into(),
+                profile_id: Some("profile-1".into()),
+                api_key: None,
+            },
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let request = captured.recv().unwrap();
+        assert!(request.contains("generation_probe") || request.contains("\"ok\""));
+        assert!(!request.contains("summaryHash"));
+    }
+
+    #[tokio::test]
     async fn http_failures_timeout_and_oversize_are_normalized() {
         for (status, expected) in [
             (401, ProviderErrorCategory::Authentication),
@@ -1083,8 +1452,16 @@ mod tests {
         let summary = cleaner_core::redacted_scan_summary(&cleaner_core::initial_scan_snapshot());
         ProviderGenerationRequest {
             summary,
-            target_tier: AiRuleTier::Light,
+            generation_mode: None,
+            target_tier: Some(AiRuleTier::Light),
         }
+    }
+
+    fn all_tiers_generation_request() -> ProviderGenerationRequest {
+        let mut request = generation_request();
+        request.generation_mode = Some(AiGenerationMode::AllTiers);
+        request.target_tier = None;
+        request
     }
 
     fn valid_rules() -> String {
@@ -1099,6 +1476,26 @@ mod tests {
         json!({"schema_version": 1, "rules": [rule("fixture.light", "light")]}).to_string()
     }
 
+    fn valid_all_tier_rules() -> String {
+        let rule = |id: &str, tier: &str| {
+            json!({
+                "id": id, "tier": tier, "name": id, "app": "Fixture", "category": "cache",
+                "paths": [format!("%TEMP%\\{id}")], "clean": "contents", "keep_days": 7,
+                "exclude": ["*.lock"], "note": "fixture", "evidence": ["aggregate"],
+                "cautions": ["review"]
+            })
+        };
+        json!({
+            "schema_version": 1,
+            "rules": [
+                rule("fixture.light", "light"),
+                rule("fixture.medium", "medium"),
+                rule("fixture.heavy", "heavy")
+            ]
+        })
+        .to_string()
+    }
+
     fn provider_response(kind: ProviderKind, rules: &str) -> String {
         match kind {
             ProviderKind::OpenAiCompatible => {
@@ -1107,6 +1504,22 @@ mod tests {
             ProviderKind::AnthropicCompatible => {
                 json!({"content": [{"type": "text", "text": rules}]}).to_string()
             }
+        }
+    }
+
+    fn provider_probe_response(kind: ProviderKind) -> String {
+        match kind {
+            ProviderKind::OpenAiCompatible => {
+                json!({"choices": [{"message": {"content": "{\"ok\":true}"}}]}).to_string()
+            }
+            ProviderKind::AnthropicCompatible => json!({
+                "content": [{
+                    "type": "tool_use",
+                    "name": "submit_probe",
+                    "input": {"ok": true}
+                }]
+            })
+            .to_string(),
         }
     }
 

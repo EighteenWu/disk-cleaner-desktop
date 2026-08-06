@@ -946,7 +946,8 @@ mod tests {
         let mut draft = crate::AiRuleDraft::new(
             "draft-fixture".into(),
             SUMMARY_HASH.into(),
-            crate::AiRuleTier::Light,
+            crate::AiGenerationMode::SingleTier,
+            Some(crate::AiRuleTier::Light),
             profile_id.to_string(),
             "fixture-model".into(),
             "2026-03-14T00:00:00Z".into(),

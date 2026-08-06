@@ -16,9 +16,9 @@ pub mod local_rule_library;
 pub mod rules;
 
 pub use ai_rules::{
-    redacted_scan_summary, AiGeneratedRule, AiGeneratedRuleSet, AiRuleCleanMethod, AiRuleDraft,
-    AiRuleTier, ApprovedRuleEnvelope, RedactedScanBucket, RedactedScanSummary,
-    AI_REDACTION_VERSION, AI_SUMMARY_SCHEMA_VERSION,
+    redacted_scan_summary, AiGeneratedRule, AiGeneratedRuleSet, AiGenerationMode,
+    AiRuleCleanMethod, AiRuleDraft, AiRuleTier, ApprovedRuleEnvelope, RedactedScanBucket,
+    RedactedScanSummary, AI_REDACTION_VERSION, AI_SUMMARY_SCHEMA_VERSION,
 };
 
 pub use automation::*;

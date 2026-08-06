@@ -52,3 +52,18 @@ export function describeProviderError(error: unknown, translate: Translate): str
   }
   return translate("rule.aiError.provider");
 }
+
+/**
+ * Prefer an actionable timeout copy when the structured error is `timeout`;
+ * otherwise fall back to the generic provider-error renderer.
+ */
+export function describeProviderErrorOrTimeout(
+  error: unknown,
+  translate: Translate,
+  timeoutMessage: string
+): string {
+  if (isProviderError(error) && error.category === "timeout") {
+    return timeoutMessage;
+  }
+  return describeProviderError(error, translate);
+}

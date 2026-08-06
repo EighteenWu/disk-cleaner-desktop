@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { describeProviderError, isProviderError } from "./providerError";
+import {
+  describeProviderError,
+  describeProviderErrorOrTimeout,
+  isProviderError
+} from "./providerError";
 import type { AiProviderError } from "./types";
 
 const translate = (key: string, values: Record<string, string | number> = {}) =>
@@ -41,5 +45,23 @@ describe("describeProviderError", () => {
     expect(isProviderError(providerError())).toBe(true);
     expect(isProviderError({ category: "unknown", message: "x" })).toBe(false);
     expect(isProviderError(null)).toBe(false);
+  });
+
+  it("uses dedicated timeout copy instead of the generic timeout label", () => {
+    const timeoutCopy = "generation timed out; try probe";
+    expect(
+      describeProviderErrorOrTimeout(
+        providerError({ category: "timeout", message: "deadline" }),
+        translate,
+        timeoutCopy
+      )
+    ).toBe(timeoutCopy);
+    expect(
+      describeProviderErrorOrTimeout(
+        providerError({ category: "network", message: "offline" }),
+        translate,
+        timeoutCopy
+      )
+    ).toBe("rule.aiError.network: offline");
   });
 });

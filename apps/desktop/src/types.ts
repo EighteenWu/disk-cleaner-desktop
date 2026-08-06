@@ -279,8 +279,10 @@ export interface StoredRuleSubscription {
 }
 
 export type AiRuleTier = "light" | "medium" | "heavy";
+export type AiGenerationMode = "allTiers" | "singleTier";
 export type AiRuleCleanMethod = "contents" | "files" | "recycle" | "manual";
 export type AiProviderKind = "openAiCompatible" | "anthropicCompatible";
+export type AiSessionEventKind = "preview" | "probe" | "generate" | "error";
 export type AiProviderErrorCategory =
   | "configuration"
   | "credentialMissing"
@@ -366,12 +368,29 @@ export interface AiGeneratedRuleSet {
 
 export interface AiProviderGenerationRequest {
   summary: RedactedScanSummary;
-  targetTier: AiRuleTier;
+  generationMode: AiGenerationMode;
+  /** Required for `singleTier`; null for `allTiers`. */
+  targetTier: AiRuleTier | null;
 }
 
 export interface AiProviderGenerationResponse {
   requestId: string | null;
   draft: AiRuleDraft;
+}
+
+export interface AiProviderGenerationProbeQuery {
+  kind: AiProviderKind;
+  baseUrl: string;
+  timeoutMs: number;
+  model: string;
+  profileId: string | null;
+  apiKey: string | null;
+}
+
+export interface AiProviderGenerationProbeResult {
+  ok: boolean;
+  latencyMs: number;
+  requestId: string | null;
 }
 
 export interface AiProviderError {
@@ -387,7 +406,8 @@ export interface AiRuleDraft {
   revision: number;
   validationRevision: number | null;
   summaryHash: string;
-  targetTier: AiRuleTier;
+  generationMode: AiGenerationMode;
+  targetTier: AiRuleTier | null;
   providerProfileId: string;
   model: string;
   generatedAt: string;
@@ -401,12 +421,24 @@ export interface ApprovedRuleEnvelope {
   draftId: string;
   revision: number;
   summaryHash: string;
-  targetTier: AiRuleTier;
+  generationMode: AiGenerationMode;
+  targetTier: AiRuleTier | null;
   providerProfileId: string;
   model: string;
   generatedAt: string;
   rules: AiGeneratedRuleSet;
   compilation: RuleCompilation;
+}
+
+export interface AiSessionEvent {
+  at: string;
+  kind: AiSessionEventKind;
+  summaryHash?: string;
+  mode?: AiGenerationMode;
+  model?: string;
+  latencyMs?: number;
+  ruleCount?: number;
+  message: string;
 }
 
 export type RuleOrigin = "manual" | "aiGenerated" | "subscription" | "legacyMigration" | "imported";

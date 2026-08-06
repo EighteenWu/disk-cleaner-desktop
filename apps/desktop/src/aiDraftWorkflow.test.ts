@@ -11,6 +11,7 @@ function draft(overrides: Partial<AiRuleDraft> = {}): AiRuleDraft {
     revision: 2,
     validationRevision: 2,
     summaryHash: "0123456789abcdef".repeat(4),
+    generationMode: "singleTier",
     targetTier: "light",
     providerProfileId: "00000000-0000-4000-8000-000000000001",
     model: "fixture-model",

@@ -1415,6 +1415,18 @@ textarea {
   overflow-wrap: anywhere;
 }
 
+.ruleAiSessionList {
+  margin: var(--space-2) 0 0;
+  padding-left: var(--space-4);
+  display: grid;
+  gap: var(--space-2);
+  color: var(--muted);
+}
+
+.ruleAiSessionList li {
+  list-style: disc;
+}
+
 .ruleAiResults {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

@@ -15,10 +15,24 @@ const summary: RedactedScanSummary = {
 };
 
 describe("AI generation request", () => {
-  it("renders the exact business payload that is sent", () => {
-    const request = aiGenerationRequest(summary, "heavy");
+  it("defaults to allTiers without a target tier", () => {
+    const request = aiGenerationRequest(summary);
 
+    expect(request.generationMode).toBe("allTiers");
+    expect(request.targetTier).toBeNull();
     expect(JSON.parse(aiGenerationRequestPreview(request))).toEqual(request);
+  });
+
+  it("builds a singleTier request with the selected tier", () => {
+    const request = aiGenerationRequest(summary, "singleTier", "heavy");
+
+    expect(request.generationMode).toBe("singleTier");
     expect(request.targetTier).toBe("heavy");
+  });
+
+  it("rejects singleTier without a target tier", () => {
+    expect(() => aiGenerationRequest(summary, "singleTier", null)).toThrow(
+      /singleTier generation requires a target tier/
+    );
   });
 });

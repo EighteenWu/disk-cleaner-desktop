@@ -7,6 +7,7 @@ import { Dialog } from "./Dialog";
 import type { AiRuleGenerationState } from "../useAiRuleGeneration";
 import type { RuleSourcesState } from "../useRuleSources";
 import type {
+  AiGenerationMode,
   AiProviderKind,
   AiRuleTier,
   RuleRecord,
@@ -65,7 +66,10 @@ export function RulesDialog({
     models,
     loadingModels,
     testingConnection,
+    probingGeneration,
     summary: aiSummary,
+    generationMode,
+    setGenerationMode,
     targetTier,
     setTargetTier,
     draft,
@@ -73,18 +77,21 @@ export function RulesDialog({
     draftEditorDirty,
     setDraftEditor,
     generating,
-    message: aiMessage
+    message: aiMessage,
+    sessionEvents,
+    clearSessionEvents
   } = ai;
   const generatedRules = draft?.rules ?? null;
   const generatedReport = draft?.compilation?.report ?? null;
 
   useEffect(
     () => () => {
-      // The hook outlives this dialog, so clear an unsaved test key when the
-      // input lifecycle ends instead of retaining plaintext in app state.
+      // The hook outlives this dialog, so clear plaintext keys and the
+      // in-memory session panel when the dialog closes (design: dialog-scoped).
       setApiKey("");
+      clearSessionEvents();
     },
-    [setApiKey]
+    [setApiKey, clearSessionEvents]
   );
 
   function openRecordEditor(record: RuleRecord) {
@@ -184,16 +191,28 @@ export function RulesDialog({
             </select>
           </label>
           <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiTargetTier")}</span>
+            <span className="ruleFieldLabel">{translate("rule.aiGenerationMode")}</span>
             <select
-              value={targetTier}
-              onChange={(event) => setTargetTier(event.target.value as AiRuleTier)}
+              value={generationMode}
+              onChange={(event) => setGenerationMode(event.target.value as AiGenerationMode)}
             >
-              {AI_RULE_TIERS.map((tier) => (
-                <option value={tier} key={tier}>{translate(`rule.aiTier.${tier}`)}</option>
-              ))}
+              <option value="allTiers">{translate("rule.aiGenerationModeAll")}</option>
+              <option value="singleTier">{translate("rule.aiGenerationModeSingle")}</option>
             </select>
           </label>
+          {generationMode === "singleTier" ? (
+            <label className="ruleField">
+              <span className="ruleFieldLabel">{translate("rule.aiTargetTier")}</span>
+              <select
+                value={targetTier}
+                onChange={(event) => setTargetTier(event.target.value as AiRuleTier)}
+              >
+                {AI_RULE_TIERS.map((tier) => (
+                  <option value={tier} key={tier}>{translate(`rule.aiTier.${tier}`)}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <label className="ruleField">
             <span className="ruleFieldLabel">{translate("rule.aiProtocol")}</span>
             <select
@@ -286,7 +305,17 @@ export function RulesDialog({
                   ? translate("rule.aiConnectionTesting")
                   : translate("rule.aiTestConnection")}
               </button>
+              <button
+                className="button"
+                disabled={probingGeneration || !model.trim()}
+                onClick={() => void ai.probeGeneration()}
+              >
+                {probingGeneration
+                  ? translate("rule.aiProbeTesting")
+                  : translate("rule.aiProbeGeneration")}
+              </button>
             </div>
+            <p className="ruleAdvancedHint">{translate("rule.aiConnectionVsProbeHint")}</p>
           </label>
         </div>
         <div className="ruleActions">
@@ -327,14 +356,57 @@ export function RulesDialog({
               })}
             </p>
             <p>
-              {profiles.find((profile) => profile.id === selectedProfileId)?.displayName} · {profiles.find((profile) => profile.id === selectedProfileId)?.baseUrl} · {profiles.find((profile) => profile.id === selectedProfileId)?.model} · {translate(`rule.aiTier.${targetTier}`)}
+              {profiles.find((profile) => profile.id === selectedProfileId)?.displayName} · {profiles.find((profile) => profile.id === selectedProfileId)?.baseUrl} · {profiles.find((profile) => profile.id === selectedProfileId)?.model} · {translate(
+                generationMode === "allTiers"
+                  ? "rule.aiGenerationModeAll"
+                  : `rule.aiTier.${targetTier}`
+              )}
             </p>
             <code>{aiSummary.summaryHash}</code>
             {aiSummary.riskSignals.length > 0 ? (
               <p>{translate("rule.aiRiskSignals", { signals: aiSummary.riskSignals.join(", ") })}</p>
             ) : null}
             {aiSummary.truncated ? <p>{translate("rule.aiSummaryTruncated")}</p> : null}
-            <pre>{aiGenerationRequestPreview(aiGenerationRequest(aiSummary, targetTier))}</pre>
+            <pre>
+              {aiGenerationRequestPreview(
+                aiGenerationRequest(
+                  aiSummary,
+                  generationMode,
+                  generationMode === "singleTier" ? targetTier : null
+                )
+              )}
+            </pre>
+          </details>
+        ) : null}
+        {sessionEvents.length > 0 ? (
+          <details className="ruleAiSummary">
+            <summary>{translate("rule.aiSessionPanel")}</summary>
+            <p className="ruleAdvancedHint">{translate("rule.aiSessionPanelHint")}</p>
+            <ul className="ruleAiSessionList">
+              {sessionEvents.map((event) => (
+                <li key={`${event.at}-${event.kind}-${event.message}`}>
+                  <strong>{translate(`rule.aiSessionKind.${event.kind}`)}</strong>
+                  {" · "}
+                  {event.at}
+                  {event.summaryHash ? ` · ${event.summaryHash.slice(0, 12)}…` : ""}
+                  {event.mode
+                    ? ` · ${translate(
+                        event.mode === "allTiers"
+                          ? "rule.aiGenerationModeAll"
+                          : "rule.aiGenerationModeSingle"
+                      )}`
+                    : ""}
+                  {event.model ? ` · ${event.model}` : ""}
+                  {event.latencyMs !== undefined
+                    ? ` · ${translate("rule.aiSessionLatency", { ms: event.latencyMs })}`
+                    : ""}
+                  {event.ruleCount !== undefined
+                    ? ` · ${translate("rule.aiSessionRuleCount", { count: event.ruleCount })}`
+                    : ""}
+                  <div>{event.message}</div>
+                </li>
+              ))}
+            </ul>
           </details>
         ) : null}
         {generatedRules ? (
@@ -345,6 +417,9 @@ export function RulesDialog({
               return (
                 <section className={`ruleAiTier ruleAiTier-${tier}`} key={tier}>
                   <h4>{translate(`rule.aiTier.${tier}`)}</h4>
+                  {candidates.length === 0 ? (
+                    <p className="ruleAdvancedHint">{translate("rule.aiTierEmpty")}</p>
+                  ) : null}
                   {candidates.map((rule) => (
                     <div key={rule.id} className="ruleAiCandidate">
                       <strong>{rule.name}</strong>

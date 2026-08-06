@@ -128,6 +128,18 @@ pub enum AiRuleTier {
     Heavy,
 }
 
+/// How a draft was (or should be) generated relative to light/medium/heavy tiers.
+///
+/// `SingleTier` is the serde default so older IPC payloads that only carried
+/// `targetTier` keep deserializing as single-tier drafts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AiGenerationMode {
+    AllTiers,
+    #[default]
+    SingleTier,
+}
+
 impl AiRuleTier {
     pub fn rule_level(self) -> RuleLevel {
         match self {
@@ -201,7 +213,11 @@ pub struct AiRuleDraft {
     pub revision: u32,
     pub validation_revision: Option<u32>,
     pub summary_hash: String,
-    pub target_tier: AiRuleTier,
+    #[serde(default)]
+    pub generation_mode: AiGenerationMode,
+    /// Required for `singleTier`; must be `None` for `allTiers`.
+    #[serde(default)]
+    pub target_tier: Option<AiRuleTier>,
     pub provider_profile_id: String,
     pub model: String,
     pub generated_at: String,
@@ -217,7 +233,10 @@ pub struct ApprovedRuleEnvelope {
     pub draft_id: String,
     pub revision: u32,
     pub summary_hash: String,
-    pub target_tier: AiRuleTier,
+    #[serde(default)]
+    pub generation_mode: AiGenerationMode,
+    #[serde(default)]
+    pub target_tier: Option<AiRuleTier>,
     pub provider_profile_id: String,
     pub model: String,
     pub generated_at: String,
@@ -303,7 +322,8 @@ impl AiRuleDraft {
     pub fn new(
         id: String,
         summary_hash: String,
-        target_tier: AiRuleTier,
+        generation_mode: AiGenerationMode,
+        target_tier: Option<AiRuleTier>,
         provider_profile_id: String,
         model: String,
         generated_at: String,
@@ -316,9 +336,8 @@ impl AiRuleDraft {
         validate_metadata("model", &model)?;
         validate_metadata("generated at", &generated_at)?;
         validate_summary_hash(&summary_hash)?;
-        if rules.rules.iter().any(|rule| rule.tier != target_tier) {
-            return Err("AI 草稿包含目标档位之外的规则。".to_string());
-        }
+        let target_tier = normalize_generation_mode(generation_mode, target_tier)?;
+        validate_rules_for_mode(generation_mode, target_tier, &rules)?;
         Ok(Self {
             schema_version: AI_SUMMARY_SCHEMA_VERSION,
             redaction_version: AI_REDACTION_VERSION,
@@ -326,6 +345,7 @@ impl AiRuleDraft {
             revision: 1,
             validation_revision: None,
             summary_hash,
+            generation_mode,
             target_tier,
             provider_profile_id,
             model,
@@ -337,9 +357,7 @@ impl AiRuleDraft {
 
     pub fn replace_rules(&mut self, rules: AiGeneratedRuleSet) -> Result<(), String> {
         rules.validate()?;
-        if rules.rules.iter().any(|rule| rule.tier != self.target_tier) {
-            return Err("AI 草稿包含目标档位之外的规则。".to_string());
-        }
+        validate_rules_for_mode(self.generation_mode, self.target_tier, &rules)?;
         self.rules = rules;
         self.revision = self.revision.saturating_add(1);
         self.validation_revision = None;
@@ -387,6 +405,7 @@ impl AiRuleDraft {
             draft_id: self.id.clone(),
             revision: self.revision,
             summary_hash: self.summary_hash.clone(),
+            generation_mode: self.generation_mode,
             target_tier: self.target_tier,
             provider_profile_id: self.provider_profile_id.clone(),
             model: self.model.clone(),
@@ -408,14 +427,11 @@ impl AiRuleDraft {
         validate_metadata("model", &self.model)?;
         validate_metadata("generated at", &self.generated_at)?;
         self.rules.validate()?;
-        if self
-            .rules
-            .rules
-            .iter()
-            .any(|rule| rule.tier != self.target_tier)
-        {
-            return Err("AI 草稿包含目标档位之外的规则。".to_string());
+        let target_tier = normalize_generation_mode(self.generation_mode, self.target_tier)?;
+        if target_tier != self.target_tier {
+            return Err("AI 草稿档位模式与目标档位不一致。".to_string());
         }
+        validate_rules_for_mode(self.generation_mode, self.target_tier, &self.rules)?;
         Ok(())
     }
 }
@@ -434,14 +450,11 @@ impl ApprovedRuleEnvelope {
         validate_metadata("model", &self.model)?;
         validate_metadata("generated at", &self.generated_at)?;
         self.rules.validate()?;
-        if self
-            .rules
-            .rules
-            .iter()
-            .any(|rule| rule.tier != self.target_tier)
-        {
-            return Err("AI 批准封装包含目标档位之外的规则。".to_string());
+        let target_tier = normalize_generation_mode(self.generation_mode, self.target_tier)?;
+        if target_tier != self.target_tier {
+            return Err("AI 批准封装档位模式与目标档位不一致。".to_string());
         }
+        validate_rules_for_mode(self.generation_mode, self.target_tier, &self.rules)?;
         let compilation = self.rules.compile()?;
         if !compilation.report.valid || compilation != self.compilation {
             return Err("AI 批准封装的编译结果已失效。".to_string());
@@ -487,6 +500,43 @@ impl From<&AiGeneratedRule> for AiYamlRule {
             keep_days: rule.keep_days,
             exclude: rule.exclude.clone(),
             note: rule.note.clone(),
+        }
+    }
+}
+
+fn normalize_generation_mode(
+    mode: AiGenerationMode,
+    target_tier: Option<AiRuleTier>,
+) -> Result<Option<AiRuleTier>, String> {
+    match mode {
+        AiGenerationMode::AllTiers => {
+            if target_tier.is_some() {
+                return Err("全部档位模式不得指定单一目标档位。".to_string());
+            }
+            Ok(None)
+        }
+        AiGenerationMode::SingleTier => {
+            if target_tier.is_none() {
+                return Err("单档模式必须指定目标档位。".to_string());
+            }
+            Ok(target_tier)
+        }
+    }
+}
+
+fn validate_rules_for_mode(
+    mode: AiGenerationMode,
+    target_tier: Option<AiRuleTier>,
+    rules: &AiGeneratedRuleSet,
+) -> Result<(), String> {
+    match mode {
+        AiGenerationMode::AllTiers => Ok(()),
+        AiGenerationMode::SingleTier => {
+            let tier = target_tier.ok_or_else(|| "单档模式必须指定目标档位。".to_string())?;
+            if rules.rules.iter().any(|rule| rule.tier != tier) {
+                return Err("AI 草稿包含目标档位之外的规则。".to_string());
+            }
+            Ok(())
         }
     }
 }
@@ -1006,7 +1056,8 @@ mod tests {
         let mut draft = AiRuleDraft::new(
             "draft-1".to_string(),
             SUMMARY_HASH.to_string(),
-            AiRuleTier::Light,
+            AiGenerationMode::SingleTier,
+            Some(AiRuleTier::Light),
             "profile-1".to_string(),
             "model-1".to_string(),
             "2026-03-14T00:00:00Z".to_string(),
@@ -1041,6 +1092,84 @@ mod tests {
         assert!(draft.approve(1, SUMMARY_HASH).is_err());
         assert!(draft.approve(2, SUMMARY_HASH).is_err());
         assert!(draft.approve(2, OTHER_SUMMARY_HASH).is_err());
+    }
+
+    #[test]
+    fn all_tiers_draft_accepts_mixed_tiers_and_rejects_target_tier() {
+        let rules = AiGeneratedRuleSet::parse(&valid_json()).unwrap();
+        let mut draft = AiRuleDraft::new(
+            "draft-all".to_string(),
+            SUMMARY_HASH.to_string(),
+            AiGenerationMode::AllTiers,
+            None,
+            "profile-1".to_string(),
+            "model-1".to_string(),
+            "2026-03-14T00:00:00Z".to_string(),
+            rules.clone(),
+        )
+        .unwrap();
+        assert_eq!(draft.generation_mode, AiGenerationMode::AllTiers);
+        assert!(draft.target_tier.is_none());
+        assert!(draft.validate_contract().is_ok());
+        assert!(draft.validate_current_revision().unwrap().report.valid);
+        let envelope = draft.approve(1, SUMMARY_HASH).unwrap();
+        assert_eq!(envelope.generation_mode, AiGenerationMode::AllTiers);
+        assert!(envelope.target_tier.is_none());
+        assert!(envelope.validate().is_ok());
+        assert!(envelope
+            .compilation
+            .rules
+            .iter()
+            .all(|rule| !rule.default_selected));
+
+        assert!(AiRuleDraft::new(
+            "draft-bad".to_string(),
+            SUMMARY_HASH.to_string(),
+            AiGenerationMode::AllTiers,
+            Some(AiRuleTier::Light),
+            "profile-1".to_string(),
+            "model-1".to_string(),
+            "2026-03-14T00:00:00Z".to_string(),
+            rules,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn single_tier_draft_rejects_cross_tier_rules() {
+        let rules = AiGeneratedRuleSet::parse(&valid_json()).unwrap();
+        assert!(AiRuleDraft::new(
+            "draft-cross".to_string(),
+            SUMMARY_HASH.to_string(),
+            AiGenerationMode::SingleTier,
+            Some(AiRuleTier::Light),
+            "profile-1".to_string(),
+            "model-1".to_string(),
+            "2026-03-14T00:00:00Z".to_string(),
+            rules,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn draft_ipc_keeps_camel_case_generation_mode() {
+        let rules = AiGeneratedRuleSet::parse(&valid_json()).unwrap();
+        let draft = AiRuleDraft::new(
+            "draft-ipc".to_string(),
+            SUMMARY_HASH.to_string(),
+            AiGenerationMode::AllTiers,
+            None,
+            "profile-1".to_string(),
+            "model-1".to_string(),
+            "2026-03-14T00:00:00Z".to_string(),
+            rules,
+        )
+        .unwrap();
+        let ipc = serde_json::to_value(&draft).unwrap();
+        assert_eq!(ipc["generationMode"], "allTiers");
+        assert!(ipc["targetTier"].is_null());
+        assert!(ipc.get("generation_mode").is_none());
+        assert_eq!(serde_json::from_value::<AiRuleDraft>(ipc).unwrap(), draft);
     }
 
     #[test]

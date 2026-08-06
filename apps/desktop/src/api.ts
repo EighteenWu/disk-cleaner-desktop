@@ -10,6 +10,8 @@ import type {
   AutomationSchedulerStatus,
   AiProviderGenerationRequest,
   AiProviderGenerationResponse,
+  AiProviderGenerationProbeQuery,
+  AiProviderGenerationProbeResult,
   AiProviderConnectionResult,
   AiProviderModelQuery,
   AiProviderProfile,
@@ -640,6 +642,14 @@ export async function testAiProviderConnection(
   query: AiProviderModelQuery
 ): Promise<AiProviderConnectionResult> {
   return await invoke<AiProviderConnectionResult>("test_ai_provider_connection", { query });
+}
+
+export async function probeAiProviderGeneration(
+  query: AiProviderGenerationProbeQuery
+): Promise<AiProviderGenerationProbeResult> {
+  return await invoke<AiProviderGenerationProbeResult>("test_ai_provider_generation", {
+    query
+  });
 }
 
 export async function generateAiRules(

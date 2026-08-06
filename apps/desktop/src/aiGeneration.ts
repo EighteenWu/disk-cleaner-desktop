@@ -1,10 +1,22 @@
-import type { AiProviderGenerationRequest, AiRuleTier, RedactedScanSummary } from "./types";
+import type {
+  AiGenerationMode,
+  AiProviderGenerationRequest,
+  AiRuleTier,
+  RedactedScanSummary
+} from "./types";
 
 export function aiGenerationRequest(
   summary: RedactedScanSummary,
-  targetTier: AiRuleTier
+  generationMode: AiGenerationMode = "allTiers",
+  targetTier: AiRuleTier | null = null
 ): AiProviderGenerationRequest {
-  return { summary, targetTier };
+  if (generationMode === "allTiers") {
+    return { summary, generationMode, targetTier: null };
+  }
+  if (!targetTier) {
+    throw new Error("singleTier generation requires a target tier");
+  }
+  return { summary, generationMode, targetTier };
 }
 
 export function aiGenerationRequestPreview(request: AiProviderGenerationRequest): string {

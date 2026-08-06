@@ -907,10 +907,17 @@ async fn generate_ai_rules(
     };
     generation_control.finish();
     let response = result?;
+    let (generation_mode, target_tier) =
+        request.resolved_mode().map_err(|message| ProviderError {
+            category: ProviderErrorCategory::Configuration,
+            message,
+            retry_after_seconds: None,
+        })?;
     let draft = cleaner_core::AiRuleDraft::new(
         uuid::Uuid::new_v4().to_string(),
         request.summary.summary_hash,
-        request.target_tier,
+        generation_mode,
+        target_tier,
         profile.id,
         profile.model,
         chrono::Utc::now().to_rfc3339(),
@@ -932,6 +939,13 @@ async fn generate_ai_rules(
 struct AiDraftGenerationResponse {
     request_id: Option<String>,
     draft: cleaner_core::AiRuleDraft,
+}
+
+#[tauri::command]
+async fn test_ai_provider_generation(
+    query: ai_provider::ProviderGenerationProbeQuery,
+) -> Result<ai_provider::ProviderGenerationProbeResult, ProviderError> {
+    ai_provider::probe_generation(query, &credentials::WindowsCredentialStore).await
 }
 
 #[tauri::command]
@@ -1175,6 +1189,7 @@ pub fn run() {
             delete_ai_provider_credential,
             list_ai_provider_models,
             test_ai_provider_connection,
+            test_ai_provider_generation,
             generate_ai_rules,
             cancel_ai_rule_generation,
             revise_ai_rule_draft,
