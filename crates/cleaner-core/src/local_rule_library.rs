@@ -1,6 +1,6 @@
 use crate::{
-    compile_cleanup_rules_yaml, ApprovedRuleEnvelope, CompiledCleanupRule, RuleSourceKind,
-    RuleValidationReport,
+    compile_cleanup_rules_yaml, import_winapp2_ini, ApprovedRuleEnvelope, CompiledCleanupRule,
+    RuleCompilation, RuleSourceKind, RuleValidationReport,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,7 +12,7 @@ pub const RULE_LIBRARY_SCHEMA_VERSION: u32 = 1;
 pub const RULE_COMPILER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_LIBRARY_RECORDS: usize = 512;
 pub const MAX_REVISIONS_PER_RECORD: usize = 128;
-pub const MAX_RULE_CONTENT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_RULE_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -388,6 +388,42 @@ pub fn import_approved_ai_rule(
     )
 }
 
+/// Creates a subscription draft from the original source artifact and approves it
+/// in one in-memory transaction. The caller still persists the final snapshot.
+pub fn import_and_approve_subscription(
+    snapshot: &RuleLibrarySnapshot,
+    display_name: String,
+    content: &str,
+    provenance: RuleProvenance,
+    context: RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    let drafted = create_rule_draft(
+        snapshot,
+        display_name,
+        RuleOrigin::Subscription,
+        content,
+        provenance,
+        context.clone(),
+    )?;
+    let record = drafted.records.last().ok_or(RuleLibraryError::NotFound)?;
+    let record_id = record.id;
+    let revision = pending_revision(record)?;
+    let expected_hash = revision.content_hash.clone();
+    let approve_context = RuleMutationContext {
+        expected_generation: drafted.generation,
+        expected_head_revision_id: Some(revision.id),
+        mutation_id: Uuid::new_v4(),
+        actor_id: context.actor_id,
+        timestamp: context.timestamp.clone(),
+    };
+    let mut approved =
+        approve_pending_revision(&drafted, record_id, &expected_hash, approve_context)?;
+    // One user action is one library generation so the on-disk commit stays contiguous.
+    approved.generation = snapshot.generation + 1;
+    approved.last_mutation_id = context.mutation_id;
+    Ok(approved)
+}
+
 pub fn save_rule_draft(
     snapshot: &RuleLibrarySnapshot,
     record_id: Uuid,
@@ -456,8 +492,7 @@ pub fn validate_pending_revision(
     if rule_content_hash(&revision.content)? != revision.content_hash {
         return Err(RuleLibraryError::InvalidHash);
     }
-    let compilation =
-        compile_cleanup_rules_yaml(&revision.content, compiler_source(&record.origin));
+    let compilation = compile_library_content(&revision.content, &record.origin);
     Ok(RevisionValidation {
         content_hash: revision.content_hash.clone(),
         compiler_schema_version: RULE_COMPILER_SCHEMA_VERSION,
@@ -470,7 +505,6 @@ pub fn approve_pending_revision(
     snapshot: &RuleLibrarySnapshot,
     record_id: Uuid,
     expected_hash: &str,
-    built_in_rules: &[CompiledCleanupRule],
     context: RuleMutationContext,
 ) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
     check_generation(snapshot, &context)?;
@@ -488,14 +522,13 @@ pub fn approve_pending_revision(
         {
             return Err(RuleLibraryError::InvalidHash);
         }
-        let compilation =
-            compile_cleanup_rules_yaml(&revision.content, compiler_source(&record.origin));
+        let compilation = compile_library_content(&revision.content, &record.origin);
         if !compilation.report.valid {
             return Err(RuleLibraryError::ValidationFailed);
         }
         (revision.id, compilation)
     };
-    ensure_no_rule_id_conflict(&next, record_id, &compilation.rules, built_in_rules)?;
+    ensure_no_rule_id_conflict(&next, record_id, &compilation.rules)?;
     let record = find_record_mut(&mut next, record_id)?;
     let from_state = record.state.clone();
     let from_revision = record.active_revision_id;
@@ -615,10 +648,7 @@ pub fn create_rollback_draft(
     Ok(next)
 }
 
-pub fn build_active_rule_snapshot(
-    snapshot: &RuleLibrarySnapshot,
-    built_in_rules: &[CompiledCleanupRule],
-) -> ActiveRuleSnapshot {
+pub fn build_active_rule_snapshot(snapshot: &RuleLibrarySnapshot) -> ActiveRuleSnapshot {
     let mut result = ActiveRuleSnapshot {
         library_generation: snapshot.generation,
         rules: Vec::new(),
@@ -631,7 +661,7 @@ pub fn build_active_rule_snapshot(
             .push(issue(None, None, "invalidLibrary", error.to_string()));
         return result;
     }
-    let mut seen: HashSet<String> = built_in_rules.iter().map(|rule| rule.id.clone()).collect();
+    let mut seen: HashSet<String> = HashSet::new();
     for record in snapshot
         .records
         .iter()
@@ -647,8 +677,7 @@ pub fn build_active_rule_snapshot(
         else {
             continue;
         };
-        let compilation =
-            compile_cleanup_rules_yaml(&revision.content, compiler_source(&record.origin));
+        let compilation = compile_library_content(&revision.content, &record.origin);
         if !compilation.report.valid {
             result.blocking_issues.push(issue(
                 Some(record.id),
@@ -688,14 +717,9 @@ fn ensure_no_rule_id_conflict(
     snapshot: &RuleLibrarySnapshot,
     record_id: Uuid,
     candidate: &[CompiledCleanupRule],
-    built_ins: &[CompiledCleanupRule],
 ) -> Result<(), RuleLibraryError> {
     let candidate_ids: HashSet<&str> = candidate.iter().map(|rule| rule.id.as_str()).collect();
-    if candidate_ids.len() != candidate.len()
-        || built_ins
-            .iter()
-            .any(|rule| candidate_ids.contains(rule.id.as_str()))
-    {
+    if candidate_ids.len() != candidate.len() {
         return Err(RuleLibraryError::RuleIdConflict);
     }
     for record in snapshot
@@ -709,8 +733,7 @@ fn ensure_no_rule_id_conflict(
         else {
             continue;
         };
-        let compilation =
-            compile_cleanup_rules_yaml(&revision.content, compiler_source(&record.origin));
+        let compilation = compile_library_content(&revision.content, &record.origin);
         if compilation
             .rules
             .iter()
@@ -864,6 +887,39 @@ fn compiler_source(origin: &RuleOrigin) -> RuleSourceKind {
     }
 }
 
+pub fn compile_library_content(content: &str, origin: &RuleOrigin) -> RuleCompilation {
+    let source = compiler_source(origin);
+    if *origin == RuleOrigin::Subscription && looks_like_winapp2(content) {
+        import_winapp2_ini(content, source)
+    } else {
+        compile_cleanup_rules_yaml(content, source)
+    }
+}
+
+fn looks_like_winapp2(content: &str) -> bool {
+    let trimmed = content.strip_prefix('\u{feff}').unwrap_or(content);
+    for line in trimmed.lines().take(32) {
+        let text = line.trim();
+        if text.is_empty() || text.starts_with('#') || text.starts_with(';') {
+            continue;
+        }
+        if text.starts_with("version:") || text.starts_with("rules:") {
+            return false;
+        }
+        if text.starts_with('[') && text.ends_with(']') {
+            return true;
+        }
+        if text.to_ascii_lowercase().starts_with("filekey") {
+            return true;
+        }
+    }
+    trimmed.lines().any(|line| {
+        let text = line.trim();
+        (text.starts_with('[') && text.ends_with(']'))
+            || text.to_ascii_lowercase().starts_with("filekey")
+    })
+}
+
 fn issue(
     record_id: Option<Uuid>,
     revision_id: Option<Uuid>,
@@ -912,6 +968,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_library_projects_zero_rules() {
+        let active = build_active_rule_snapshot(&empty());
+        assert!(active.rules.is_empty());
+        assert!(active.entries.is_empty());
+        assert!(active.blocking_issues.is_empty());
+    }
+
+    #[test]
     fn draft_is_not_active_until_approved() {
         let draft = create_rule_draft(
             &empty(),
@@ -922,18 +986,17 @@ mod tests {
             context(0, None),
         )
         .unwrap();
-        assert!(build_active_rule_snapshot(&draft, &[]).rules.is_empty());
+        assert!(build_active_rule_snapshot(&draft).rules.is_empty());
         let record = &draft.records[0];
         let revision = pending_revision(record).unwrap();
         let approved = approve_pending_revision(
             &draft,
             record.id,
             &revision.content_hash,
-            &[],
             context(draft.generation, Some(revision.id)),
         )
         .unwrap();
-        assert_eq!(build_active_rule_snapshot(&approved, &[]).rules.len(), 1);
+        assert_eq!(build_active_rule_snapshot(&approved).rules.len(), 1);
     }
 
     #[test]
@@ -960,7 +1023,7 @@ mod tests {
         let imported =
             import_approved_ai_rule(&empty(), "AI rules".into(), &envelope, context(0, None))
                 .unwrap();
-        assert!(build_active_rule_snapshot(&imported, &[]).rules.is_empty());
+        assert!(build_active_rule_snapshot(&imported).rules.is_empty());
         let record = &imported.records[0];
         assert_eq!(record.state, RuleRecordState::Draft);
         assert!(record.active_revision_id.is_none());
@@ -1003,7 +1066,6 @@ mod tests {
             &draft,
             record.id,
             &revision.content_hash,
-            &[],
             context(1, Some(revision.id)),
         )
         .unwrap();
@@ -1017,7 +1079,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            build_active_rule_snapshot(&edited, &[]).rules[0].id,
+            build_active_rule_snapshot(&edited).rules[0].id,
             "test.cache"
         );
     }
@@ -1038,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_rejects_stale_generation_and_duplicate_builtin_id() {
+    fn approval_rejects_stale_generation_and_duplicate_library_id() {
         let draft = create_rule_draft(
             &empty(),
             "Test".into(),
@@ -1055,22 +1117,69 @@ mod tests {
                 &draft,
                 record.id,
                 &revision.content_hash,
-                &[],
                 context(0, Some(revision.id))
             ),
             Err(RuleLibraryError::StaleGeneration)
         );
-        let built_in = compile_cleanup_rules_yaml(VALID_RULE, RuleSourceKind::BuiltIn).rules;
+        let first = approve_pending_revision(
+            &draft,
+            record.id,
+            &revision.content_hash,
+            context(1, Some(revision.id)),
+        )
+        .unwrap();
+        let second_draft = create_rule_draft(
+            &first,
+            "Duplicate".into(),
+            RuleOrigin::Manual,
+            VALID_RULE,
+            RuleProvenance::manual(),
+            context(first.generation, None),
+        )
+        .unwrap();
+        let second = &second_draft.records[1];
+        let second_revision = pending_revision(second).unwrap();
         assert_eq!(
             approve_pending_revision(
-                &draft,
-                record.id,
-                &revision.content_hash,
-                &built_in,
-                context(1, Some(revision.id))
+                &second_draft,
+                second.id,
+                &second_revision.content_hash,
+                context(second_draft.generation, Some(second_revision.id))
             ),
             Err(RuleLibraryError::RuleIdConflict)
         );
+    }
+
+    #[test]
+    fn subscription_ini_is_compiled_without_yaml_roundtrip() {
+        let ini = "[Example Cache *]\nLangSecRef=3024\nFileKey1=%TEMP%\\Example\\Cache|*|RECURSE\n";
+        let approved = import_and_approve_subscription(
+            &empty(),
+            "Winapp2".into(),
+            ini,
+            RuleProvenance {
+                source_label: "subscription".into(),
+                provider_profile_id: None,
+                model: None,
+                scan_summary_hash: None,
+                source_url: Some("https://example.com/Winapp2.ini".into()),
+                generated_at: None,
+                ai_draft_id: None,
+                ai_draft_revision: None,
+            },
+            context(0, None),
+        )
+        .unwrap();
+        assert_eq!(approved.generation, 1);
+        assert_eq!(approved.records[0].origin, RuleOrigin::Subscription);
+        assert_eq!(approved.records[0].state, RuleRecordState::Approved);
+        assert!(approved.records[0].revisions[0]
+            .content
+            .contains("FileKey1"));
+        let active = build_active_rule_snapshot(&approved);
+        assert_eq!(active.rules.len(), 1);
+        assert_eq!(active.rules[0].id, "winapp2.example.cache");
+        assert_eq!(active.rules[0].source, RuleSourceKind::Subscription);
     }
 
     #[test]
@@ -1090,7 +1199,6 @@ mod tests {
             &draft,
             record.id,
             &record.revisions[0].content_hash,
-            &[],
             context(1, Some(first_id)),
         )
         .unwrap();

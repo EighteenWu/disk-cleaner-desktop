@@ -58,8 +58,8 @@ DiskClean 是一个面向 Windows 的桌面磁盘清理工具，基于 Tauri、R
 
 | 能力 | 说明 |
 | --- | --- |
-| 内置保守规则 | 内置 Windows 临时目录、浏览器缓存、开发依赖缓存等常见规则。 |
-| YAML 自定义规则 | 支持在规则面板直接编写、校验和启用本地 YAML 规则。 |
+| 本地规则库 | 只有用户批准的规则才会进入扫描；空库不会回退到打包 YAML。 |
+| YAML 自定义规则 | 支持在规则面板直接编写、校验，保存并批准后才会启用。 |
 | HTTPS 规则订阅 | 支持加载 `.yaml`、`.yml`、`.ini` 订阅，订阅内容会做大小、编码和 URL 校验。 |
 | Winapp2 导入 | 可导入 Winapp2 `.ini` 的安全子集，`RegKey` 和高风险状态数据不会直接执行。 |
 | 安全降级 | 规则命中系统目录、用户数据、数据库、会话、密钥、依赖安装目录等路径时会降级或取消默认勾选。 |
@@ -92,7 +92,7 @@ apps/desktop/                 Tauri + React 桌面应用
 apps/desktop/src/             React UI、状态管理、IPC API 和测试
 apps/desktop/src-tauri/       Tauri/Rust 桌面壳、系统命令和本地存储
 crates/cleaner-core/          扫描、规则校验、清理计划和执行核心
-rules/default-rules.yaml      内置保守清理规则
+rules/default-rules.yaml      示例规则文档（运行时不再自动加载）
 docs/custom-rules.md          自定义规则编写说明
 docs/design/                  设计说明和界面预览
 ```

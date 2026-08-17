@@ -190,7 +190,7 @@ paths:
 - 文件后缀必须是 `.yaml`、`.yml` 或 `.ini`。
 - 不支持 `.txt`。
 - 内容必须是 UTF-8。
-- 文件大小不能超过 `2 MB`。
+- 文件大小不能超过 `4 MB`。
 
 `.yaml` / `.yml` 会按 DiskClean YAML 规则编译；`.ini` 会按 Winapp2 导入策略转换。订阅规则中的 `default: true` 不会直接生效，必须由用户确认。
 

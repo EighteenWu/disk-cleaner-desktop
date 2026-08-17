@@ -1,10 +1,9 @@
 use crate::{automation_storage, rule_library_repository};
 use cleaner_core::{
-    build_active_rule_snapshot, built_in_rules,
-    execute_cleanup_for_candidates_with_progress_and_control, initial_scan_snapshot,
-    scan_snapshot_with_request_and_progress, select_automation_candidates, ActiveRuleSnapshot,
-    AutomationMode, AutomationOutcome, AutomationTrigger, CleanupControlFlow, CleanupController,
-    CleanupExecutionOptions, RuleOrigin, ScanController, ScanMode, ScanRequest,
+    build_active_rule_snapshot, execute_cleanup_for_candidates_with_progress_and_control,
+    initial_scan_snapshot, scan_snapshot_with_request_and_progress, select_automation_candidates,
+    ActiveRuleSnapshot, AutomationMode, AutomationOutcome, AutomationTrigger, CleanupControlFlow,
+    CleanupController, CleanupExecutionOptions, RuleOrigin, ScanController, ScanMode, ScanRequest,
 };
 use std::{
     collections::HashSet,
@@ -62,7 +61,7 @@ fn execute(
     let library = loaded
         .snapshot
         .ok_or_else(|| "本地规则库为空，自动化运行已停止。".to_string())?;
-    let mut active = build_active_rule_snapshot(&library, built_in_rules());
+    let mut active = build_active_rule_snapshot(&library);
     retain_ai_generated_rules(&library, &mut active);
     if !active.blocking_issues.is_empty() {
         report.outcome = Some(AutomationOutcome::InvalidRuleSnapshot);
@@ -300,7 +299,7 @@ mod tests {
             },
         )
         .expect("draft");
-        let mut active = build_active_rule_snapshot(&library, built_in_rules());
+        let mut active = build_active_rule_snapshot(&library);
         retain_ai_generated_rules(&library, &mut active);
         assert!(active.entries.is_empty());
         assert!(active.rules.is_empty());

@@ -147,8 +147,8 @@ export function RulesDialog({
     >
       <dl className="ruleSummary">
         <div className="ruleSummaryRow">
-          <dt>{translate("rule.builtIn")}</dt>
-          <dd>{translate("rule.enabled")}</dd>
+          <dt>{translate("rule.libraryActiveCount")}</dt>
+          <dd>{String(rules.activeRules.length)}</dd>
         </div>
         <div className="ruleSummaryRow">
           <dt>{translate("rule.custom")}</dt>
@@ -167,6 +167,40 @@ export function RulesDialog({
           </dd>
         </div>
       </dl>
+
+      <section className="ruleCommunity" aria-labelledby="rule-community-title">
+        <div className="ruleLibraryHeader">
+          <div>
+            <h3 id="rule-community-title">{translate("rule.communityTitle")}</h3>
+            <p>
+              {rules.activeRules.length === 0
+                ? translate("rule.libraryEmptyHint")
+                : translate("rule.communityHint")}
+            </p>
+          </div>
+        </div>
+        <div className="ruleActions">
+          <button
+            className="button primary"
+            disabled={rules.libraryMutating}
+            onClick={() => void rules.refreshSubscription("manual")}
+          >
+            {translate("rule.loadSubscription")}
+          </button>
+          <button
+            className="button primary"
+            disabled={
+              rules.libraryMutating ||
+              !rules.subscriptionCompilation?.report.valid ||
+              !rules.subscriptionContent
+            }
+            onClick={() => void rules.enableSubscriptionPack()}
+          >
+            {translate("rule.subscriptionEnable")}
+          </button>
+        </div>
+        <p className="ruleAdvancedHint">{translate("rule.winapp2Attribution")}</p>
+      </section>
 
       <section className="ruleAi" aria-labelledby="rule-ai-title">
         <div className="ruleLibraryHeader">

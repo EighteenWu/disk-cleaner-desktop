@@ -135,6 +135,11 @@ enum RuleLibraryMutationAction {
         record_id: uuid::Uuid,
         revision_id: uuid::Uuid,
     },
+    ImportAndApproveSubscription {
+        display_name: String,
+        content: String,
+        provenance: cleaner_core::RuleProvenance,
+    },
 }
 
 #[derive(Clone)]
@@ -724,11 +729,18 @@ async fn mutate_rule_library(
             RuleLibraryMutationAction::Approve {
                 record_id,
                 expected_hash,
-            } => cleaner_core::approve_pending_revision(
+            } => {
+                cleaner_core::approve_pending_revision(&current, record_id, &expected_hash, context)
+            }
+            RuleLibraryMutationAction::ImportAndApproveSubscription {
+                display_name,
+                content,
+                provenance,
+            } => cleaner_core::import_and_approve_subscription(
                 &current,
-                record_id,
-                &expected_hash,
-                cleaner_core::built_in_rules(),
+                display_name,
+                &content,
+                provenance,
                 context,
             ),
             RuleLibraryMutationAction::Disable { record_id } => {
@@ -764,9 +776,7 @@ async fn get_active_rule_snapshot(
     tauri::async_runtime::spawn_blocking(move || {
         let loaded = rule_library_repository::load_rule_library(&root)?;
         Ok(match loaded.snapshot {
-            Some(snapshot) => {
-                cleaner_core::build_active_rule_snapshot(&snapshot, cleaner_core::built_in_rules())
-            }
+            Some(snapshot) => cleaner_core::build_active_rule_snapshot(&snapshot),
             None => cleaner_core::ActiveRuleSnapshot {
                 library_generation: 0,
                 rules: Vec::new(),

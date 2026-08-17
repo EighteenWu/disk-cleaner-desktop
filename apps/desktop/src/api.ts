@@ -45,7 +45,7 @@ import {
 
 const CLEANUP_PROGRESS_EVENT = "cleanup-progress";
 const SCAN_PROGRESS_EVENT = "scan-progress";
-const MAX_RULE_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
+const MAX_RULE_SUBSCRIPTION_BYTES = 4 * 1024 * 1024;
 
 export interface RuleSubscriptionLoadResult {
   content: string | null;
@@ -543,7 +543,7 @@ function validateRuleSubscriptionContent(content: string): RuleValidationReport 
     return null;
   }
 
-  return invalidRuleReport("content", "订阅规则文件不能超过 2 MB");
+  return invalidRuleReport("content", "订阅规则文件不能超过 4 MB");
 }
 
 export async function validateSubscriptionUrl(url: string): Promise<RuleValidationReport> {

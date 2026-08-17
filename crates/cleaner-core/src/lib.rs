@@ -51,8 +51,6 @@ const MAX_SCAN_WORKERS: usize = 8;
 /// Below this many roots the thread setup costs more than the overlap gains.
 const MIN_PARALLEL_SCAN_ROOTS: usize = 8;
 
-static BUILT_IN_RULES: OnceLock<Vec<CompiledCleanupRule>> = OnceLock::new();
-
 macro_rules! scan_debug_log {
     ($($arg:tt)*) => {
         #[cfg(debug_assertions)]
@@ -2107,23 +2105,11 @@ fn apply_cleanup_support_policy(mut candidate: CleanupCandidate) -> CleanupCandi
     match evaluate_cleanup_target_path(&path) {
         // HARD_DENY 对所有候选项生效，包括内置规则与订阅规则。
         PathGuardLevel::HardDeny(reason) => mark_candidate_unsupported(candidate, reason),
-        PathGuardLevel::NeedsConfirm(reason)
-            if !is_built_in_rule_id(candidate.cleanup_policy.rule_id.as_deref()) =>
-        {
+        PathGuardLevel::NeedsConfirm(reason) => {
             mark_candidate_needs_confirmation(candidate, reason)
         }
-        PathGuardLevel::NeedsConfirm(_) | PathGuardLevel::Allowed => candidate,
+        PathGuardLevel::Allowed => candidate,
     }
-}
-
-fn is_built_in_rule_id(rule_id: Option<&str>) -> bool {
-    let Some(rule_id) = rule_id else {
-        return false;
-    };
-
-    built_in_rules()
-        .iter()
-        .any(|rule| rule.id == rule_id && rule.source == RuleSourceKind::BuiltIn)
 }
 
 fn mark_candidate_needs_confirmation(
@@ -3958,20 +3944,8 @@ fn scan_candidates_with_control<C: ScanController + ?Sized>(
     run
 }
 
-pub fn built_in_rules() -> &'static [CompiledCleanupRule] {
-    BUILT_IN_RULES.get_or_init(|| {
-        compile_cleanup_rules_yaml(
-            include_str!("../../../rules/default-rules.yaml"),
-            RuleSourceKind::BuiltIn,
-        )
-        .rules
-    })
-}
-
 fn scan_rules(request_rules: &[CompiledCleanupRule]) -> Vec<CompiledCleanupRule> {
-    let mut rules = built_in_rules().to_vec();
-    rules.extend(request_rules.iter().cloned());
-    rules
+    request_rules.to_vec()
 }
 
 #[cfg(test)]
@@ -4395,8 +4369,7 @@ fn quick_scan_candidates_with_control<C: ScanController + ?Sized>(
     control: &C,
 ) -> ScanRun {
     let selected_volumes = selected_volume_ids_from_infos(volumes);
-    let mut roots = discover_scan_roots();
-    roots.extend(discover_volume_quick_roots(volumes));
+    let roots = discover_volume_quick_roots(volumes);
 
     let mut candidates = Vec::new();
     let mut stats_cache = ScanStatsCache::default();
@@ -5486,266 +5459,6 @@ fn scan_root_candidate_with_control<C: ScanController + ?Sized>(
     }))
 }
 
-fn discover_scan_roots() -> Vec<ScanRoot> {
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Ok(temp) = env::var("TEMP") {
-        push_scan_root(&mut roots, &mut seen, "用户临时目录", "临时文件", temp);
-    }
-
-    if let Ok(windir) = env::var("WINDIR") {
-        let windir = PathBuf::from(windir);
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Temp",
-            "Windows 临时文件",
-            windir.join("Temp"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Update Download",
-            "Windows 更新缓存",
-            windir.join("SoftwareDistribution\\Download"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Error Reports",
-            "Windows 错误报告",
-            windir.join("System32\\config\\systemprofile\\AppData\\Local\\Microsoft\\Windows\\WER"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows CBS Logs",
-            "Windows 日志文件",
-            windir.join("Logs\\CBS"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows DISM Logs",
-            "Windows 日志文件",
-            windir.join("Logs\\DISM"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Cloud Files Logs",
-            "Windows 日志文件",
-            windir.join("System32\\LogFiles\\CloudFiles"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows HTTPERR Logs",
-            "Windows 日志文件",
-            windir.join("System32\\LogFiles\\HTTPERR"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Minidump",
-            "Windows 崩溃转储",
-            windir.join("Minidump"),
-        );
-    }
-
-    if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
-        let local_app_data = PathBuf::from(local_app_data);
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Chrome Cache",
-            "浏览器缓存",
-            local_app_data.join("Google\\Chrome\\User Data\\Default\\Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Chrome Code Cache",
-            "浏览器缓存",
-            local_app_data.join("Google\\Chrome\\User Data\\Default\\Code Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Edge Cache",
-            "浏览器缓存",
-            local_app_data.join("Microsoft\\Edge\\User Data\\Default\\Cache"),
-        );
-        push_browser_profile_cache_roots(
-            &mut roots,
-            &mut seen,
-            &local_app_data.join("Mozilla\\Firefox\\Profiles"),
-            "Firefox Cache",
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows INetCache",
-            "Windows INetCache",
-            local_app_data.join("Microsoft\\Windows\\INetCache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Delivery Optimization",
-            "Windows 传递优化缓存",
-            local_app_data.join("Microsoft\\Windows\\DeliveryOptimization\\Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Thumbnail Cache",
-            "缩略图缓存",
-            local_app_data.join("Microsoft\\Windows\\Explorer"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "DirectX Shader Cache",
-            "DirectX 着色器缓存",
-            local_app_data.join("D3DSCache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Error Reports",
-            "Windows 错误报告",
-            local_app_data.join("Microsoft\\Windows\\WER"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Crash Dumps",
-            "崩溃日志",
-            local_app_data.join("CrashDumps"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "npm Cache",
-            "开发依赖缓存",
-            local_app_data.join("npm-cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "pnpm Store",
-            "开发依赖缓存",
-            local_app_data.join("pnpm\\store"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Yarn Cache",
-            "开发依赖缓存",
-            local_app_data.join("Yarn\\Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "pip Cache",
-            "开发依赖缓存",
-            local_app_data.join("pip\\Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "NuGet Packages",
-            "开发依赖缓存",
-            local_app_data.join("NuGet\\Cache"),
-        );
-    }
-
-    if let Ok(program_data) = env::var("ProgramData") {
-        let program_data = PathBuf::from(program_data);
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Delivery Optimization",
-            "Windows 传递优化缓存",
-            program_data.join("Microsoft\\Windows\\DeliveryOptimization\\Cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Windows Error Reports",
-            "Windows 错误报告",
-            program_data.join("Microsoft\\Windows\\WER"),
-        );
-    }
-
-    if let Ok(user_profile) = env::var("USERPROFILE") {
-        let user_profile = PathBuf::from(user_profile);
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Gradle Cache",
-            "开发依赖缓存",
-            user_profile.join(".gradle\\caches"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Pub Cache",
-            "开发依赖缓存",
-            user_profile.join(".pub-cache"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "NuGet Packages",
-            "开发依赖缓存",
-            user_profile.join(".nuget\\packages"),
-        );
-        push_scan_root(
-            &mut roots,
-            &mut seen,
-            "Cargo Registry Cache",
-            "开发依赖缓存",
-            user_profile.join(".cargo\\registry\\cache"),
-        );
-    }
-
-    roots
-}
-
-fn push_browser_profile_cache_roots(
-    roots: &mut Vec<ScanRoot>,
-    seen: &mut HashSet<String>,
-    profiles_root: &Path,
-    display_prefix: &str,
-) {
-    let Ok(entries) = fs::read_dir(profiles_root) else {
-        return;
-    };
-
-    for entry in entries.flatten().take(20) {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-
-        let profile_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_else(|| "Profile".to_string());
-
-        push_scan_root(
-            roots,
-            seen,
-            &format!("{display_prefix} {profile_name}"),
-            "浏览器缓存",
-            path.join("cache2"),
-        );
-    }
-}
-
 fn discover_volume_quick_roots(volumes: &[VolumeInfo]) -> Vec<ScanRoot> {
     volumes
         .iter()
@@ -5757,26 +5470,6 @@ fn discover_volume_quick_roots(volumes: &[VolumeInfo]) -> Vec<ScanRoot> {
             rule: None,
         })
         .collect()
-}
-
-fn push_scan_root(
-    roots: &mut Vec<ScanRoot>,
-    seen: &mut HashSet<String>,
-    display_name: &str,
-    category: &str,
-    path: impl Into<PathBuf>,
-) {
-    let path = path.into();
-    let key = normalize_path_for_id(&path);
-
-    if seen.insert(key) {
-        roots.push(ScanRoot {
-            path,
-            display_name: display_name.to_string(),
-            category: category.to_string(),
-            rule: None,
-        });
-    }
 }
 
 fn classify_windows_directory(
@@ -6518,6 +6211,13 @@ mod tests {
             snapshot.candidates.len() as u32
         );
         assert_eq!(snapshot.summary.progress_percent, 100);
+        assert!(snapshot.candidates.iter().all(|candidate| {
+            !candidate
+                .cleanup_policy
+                .rule_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("windows.") || id.starts_with("chrome."))
+        }));
     }
 
     #[test]
@@ -8227,10 +7927,24 @@ rules:
     }
 
     #[test]
-    fn built_in_rules_keep_needs_confirm_exemption() {
-        assert!(is_built_in_rule_id(Some("npm.cache.review")));
-        assert!(!is_built_in_rule_id(Some("subscription.npm")));
-        assert!(!is_built_in_rule_id(None));
+    fn library_rules_do_not_bypass_needs_confirm() {
+        let mut candidate = test_cleanup_candidate(
+            "library-npm",
+            Path::new("C:\\Users\\979\\AppData\\Local\\npm-cache"),
+            ObjectType::Directory,
+        );
+        candidate.cleanup_policy = CleanupPolicy {
+            rule_id: Some("npm.cache.review".to_string()),
+            method: RuleCleanupMethod::Contents,
+            keep_days: 30,
+            exclude_patterns: Vec::new(),
+        };
+
+        let candidate = apply_cleanup_support_policy(candidate);
+
+        assert_eq!(candidate.risk_level, RiskLevel::ReviewRequired);
+        assert!(!candidate.default_selected);
+        assert!(!candidate.selected);
     }
 
     #[test]

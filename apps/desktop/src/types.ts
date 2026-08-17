@@ -580,7 +580,13 @@ export type RuleLibraryMutationAction =
   | { type: "disable"; recordId: string }
   | { type: "delete"; recordId: string }
   | { type: "restore"; recordId: string }
-  | { type: "rollback"; recordId: string; revisionId: string };
+  | { type: "rollback"; recordId: string; revisionId: string }
+  | {
+      type: "importAndApproveSubscription";
+      displayName: string;
+      content: string;
+      provenance: RuleProvenance;
+    };
 
 export interface RuleLibraryMutationRequest {
   expectedGeneration: number;

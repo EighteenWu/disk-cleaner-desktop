@@ -1,7 +1,7 @@
 import type { StoredRuleSubscription } from "./types";
 
 export const RULE_SUBSCRIPTION_STORAGE_KEY = "diskclean.ruleSubscription.v1";
-const MAX_STORED_RULE_SUBSCRIPTION_BYTES = 2 * 1024 * 1024;
+const MAX_STORED_RULE_SUBSCRIPTION_BYTES = 4 * 1024 * 1024;
 
 export type { StoredRuleSubscription } from "./types";
 

@@ -277,7 +277,10 @@ fn storage_error(message: String) -> RuleLibraryRepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cleaner_core::{create_rule_draft, RuleMutationContext, RuleOrigin, RuleProvenance};
+    use cleaner_core::{
+        create_rule_draft, import_and_approve_subscription, RuleMutationContext, RuleOrigin,
+        RuleProvenance,
+    };
     use uuid::Uuid;
 
     fn root(name: &str) -> PathBuf {
@@ -336,6 +339,54 @@ mod tests {
         let recovered = load_rule_library(&root).expect("recover");
         assert_eq!(recovered.status, RuleLibraryLoadStatus::RecoveredFromBackup);
         assert_eq!(recovered.snapshot.expect("snapshot").generation, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn import_and_approve_subscription_commits_as_one_generation() {
+        let root = root("winapp2-enable");
+        let empty = RuleLibrarySnapshot::empty(
+            "2026-03-14T00:00:00Z".into(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        let mutation_id = Uuid::new_v4();
+        let imported = import_and_approve_subscription(
+            &empty,
+            "Winapp2".into(),
+            "[Example Cache *]\nLangSecRef=3024\nFileKey1=%TEMP%\\Example\\Cache|*|RECURSE\n",
+            RuleProvenance {
+                source_label: "subscription".into(),
+                provider_profile_id: None,
+                model: None,
+                scan_summary_hash: None,
+                source_url: Some("https://example.com/Winapp2.ini".into()),
+                generated_at: None,
+                ai_draft_id: None,
+                ai_draft_revision: None,
+            },
+            RuleMutationContext {
+                expected_generation: 0,
+                expected_head_revision_id: None,
+                mutation_id,
+                actor_id: Uuid::new_v4(),
+                timestamp: "2026-03-14T00:00:00Z".into(),
+            },
+        )
+        .expect("import");
+        assert_eq!(imported.generation, 1);
+        let committed = commit_rule_library(&root, 0, &imported).expect("commit");
+        assert_eq!(committed.generation, 1);
+        assert_eq!(committed.last_mutation_id, mutation_id);
+        let loaded = load_rule_library(&root)
+            .expect("load")
+            .snapshot
+            .expect("snapshot");
+        assert_eq!(
+            loaded.records[0].state,
+            cleaner_core::RuleRecordState::Approved
+        );
+        assert!(loaded.records[0].revisions[0].content.contains("FileKey1"));
         let _ = fs::remove_dir_all(root);
     }
 }

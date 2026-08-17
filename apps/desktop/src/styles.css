@@ -1373,7 +1373,8 @@ textarea {
 
 /* --- rules dialog ------------------------------------------------------ */
 
-.ruleAi {
+.ruleAi,
+.ruleCommunity {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);

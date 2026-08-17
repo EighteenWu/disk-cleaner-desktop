@@ -26,10 +26,8 @@ import type {
 } from "./types";
 
 /**
- * Rule sources are a self-contained concern: built-in rules always apply, and
- * users can optionally layer custom YAML plus one subscription URL on top.
- * Keeping the fetch/compile/cache/retry cycle here means the workbench only has
- * to read `activeRules`.
+ * Approved local-library revisions are the only rules that reach a scan.
+ * Custom YAML and subscription fetches stay previews until the user enables them.
  */
 
 export const DEFAULT_RULE_SUBSCRIPTION_URL =
@@ -65,6 +63,7 @@ export interface RuleSourcesState {
   setSubscriptionUrl: (url: string) => void;
   subscriptionReport: RuleValidationReport | null;
   subscriptionCompilation: RuleCompilation | null;
+  subscriptionContent: string | null;
   library: RuleLibraryLoadResult | null;
   activeLibrarySnapshot: ActiveRuleSnapshot | null;
   libraryMutating: boolean;
@@ -78,6 +77,7 @@ export interface RuleSourcesState {
   importApprovedAiDraft: (displayName: string, envelope: ApprovedRuleEnvelope) => Promise<void>;
   validateLibraryDraft: (content: string) => Promise<RuleCompilation>;
   saveSubscriptionDraft: () => Promise<void>;
+  enableSubscriptionPack: () => Promise<void>;
   /** Replaces a record's pending content, creating a new revision to approve. */
   saveLibraryDraft: (
     record: RuleRecord,
@@ -89,7 +89,7 @@ export interface RuleSourcesState {
   deleteLibraryRecord: (record: RuleRecord) => Promise<void>;
   restoreLibraryRecord: (record: RuleRecord) => Promise<void>;
   rollbackLibraryRecord: (record: RuleRecord, revisionId: string) => Promise<void>;
-  /** Built-in rules live in Rust; these are only the user-supplied extras. */
+  /** Approved library revisions only. */
   activeRules: CompiledCleanupRule[];
   validateCustomRules: () => Promise<void>;
   importWinapp2: () => Promise<void>;
@@ -110,6 +110,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
   const [subscriptionUrl, setSubscriptionUrl] = useState(DEFAULT_RULE_SUBSCRIPTION_URL);
   const [subscriptionReport, setSubscriptionReport] = useState<RuleValidationReport | null>(null);
   const [subscriptionCompilation, setSubscriptionCompilation] = useState<RuleCompilation | null>(null);
+  const [subscriptionContent, setSubscriptionContent] = useState<string | null>(null);
   const [library, setLibrary] = useState<RuleLibraryLoadResult | null>(null);
   const [activeLibrarySnapshot, setActiveLibrarySnapshot] = useState<ActiveRuleSnapshot | null>(null);
   const [libraryMutating, setLibraryMutating] = useState(false);
@@ -176,26 +177,58 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     [applyLibraryMutation]
   );
 
+  const subscriptionProvenance = useCallback(
+    (): RuleProvenance => ({
+      sourceLabel: "subscription",
+      providerProfileId: null,
+      model: null,
+      scanSummaryHash: null,
+      sourceUrl: sanitizeSubscriptionUrl(subscriptionUrl),
+      generatedAt: null,
+      aiDraftId: null,
+      aiDraftRevision: null
+    }),
+    [subscriptionUrl]
+  );
+
   const saveSubscriptionDraft = useCallback(async () => {
-    if (!subscriptionCompilation?.report.valid) {
+    if (!subscriptionCompilation?.report.valid || !subscriptionContent) {
       return;
     }
     await createLibraryDraft(
-      "Subscription rules",
-      compiledRulesToYaml(subscriptionCompilation.rules),
-      {
-        sourceLabel: "subscription",
-        providerProfileId: null,
-        model: null,
-        scanSummaryHash: null,
-        sourceUrl: sanitizeSubscriptionUrl(subscriptionUrl),
-        generatedAt: null,
-        aiDraftId: null,
-        aiDraftRevision: null
-      },
+      translate("rule.subscriptionPackName"),
+      subscriptionContent,
+      subscriptionProvenance(),
       "subscription"
     );
-  }, [createLibraryDraft, subscriptionCompilation, subscriptionUrl]);
+  }, [
+    createLibraryDraft,
+    subscriptionCompilation,
+    subscriptionContent,
+    subscriptionProvenance,
+    translate
+  ]);
+
+  const enableSubscriptionPack = useCallback(async () => {
+    if (!subscriptionCompilation?.report.valid || !subscriptionContent) {
+      return;
+    }
+    await applyLibraryMutation(
+      {
+        type: "importAndApproveSubscription",
+        displayName: translate("rule.subscriptionPackName"),
+        content: subscriptionContent,
+        provenance: subscriptionProvenance()
+      },
+      null
+    );
+  }, [
+    applyLibraryMutation,
+    subscriptionCompilation,
+    subscriptionContent,
+    subscriptionProvenance,
+    translate
+  ]);
 
   const importApprovedAiDraft = useCallback(
     async (displayName: string, envelope: ApprovedRuleEnvelope) => {
@@ -207,10 +240,11 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     [applyLibraryMutation]
   );
 
-  const validateLibraryDraft = useCallback(
-    async (content: string) => validateRulesYaml(content, "user"),
-    []
-  );
+  const validateLibraryDraft = useCallback(async (content: string) => {
+    return looksLikeWinapp2(content)
+      ? importWinapp2Rules(content, "subscription")
+      : validateRulesYaml(content, "user");
+  }, []);
 
   const saveLibraryDraft = useCallback(
     async (record: RuleRecord, content: string, provenance?: RuleProvenance) => {
@@ -302,6 +336,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
         if (reason === "manual") {
           await clearRuleSubscriptionCache();
           setSubscriptionCompilation(null);
+          setSubscriptionContent(null);
           setSubscriptionReport(null);
           setLoadedFromCache(false);
           onNotice(translate("rule.subscriptionDisabled"));
@@ -331,6 +366,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
           // A failed scheduled check must not drop rules that already work.
           if (!currentValid) {
             setSubscriptionCompilation(null);
+            setSubscriptionContent(null);
           }
 
           const message = translate(
@@ -360,6 +396,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
           : `${baseMessage} ${translate("rule.subscriptionCacheFailed")}`;
 
         setSubscriptionCompilation(result.compilation);
+        setSubscriptionContent(result.content);
         setLoadedFromCache(false);
         setSubscriptionUrl(trimmedUrl);
 
@@ -373,6 +410,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
 
         if (!currentValid) {
           setSubscriptionCompilation(null);
+          setSubscriptionContent(null);
         }
 
         setSubscriptionReport({
@@ -420,6 +458,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
 
       if (compilation.report.valid) {
         setSubscriptionCompilation(compilation);
+        setSubscriptionContent(cached.content);
         setLoadedFromCache(true);
         onLog(
           translate("rule.subscriptionRestoredLog"),
@@ -431,6 +470,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
 
       await clearRuleSubscriptionCache();
       setSubscriptionCompilation(null);
+      setSubscriptionContent(null);
       setLoadedFromCache(false);
       onLog(
         translate("rule.subscriptionRestoreFailedLog"),
@@ -446,6 +486,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
 
       const message = error instanceof Error ? error.message : String(error);
       setSubscriptionCompilation(null);
+      setSubscriptionContent(null);
       setLoadedFromCache(false);
       setSubscriptionReport({
         valid: false,
@@ -540,6 +581,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     setSubscriptionUrl,
     subscriptionReport,
     subscriptionCompilation,
+    subscriptionContent,
     library,
     activeLibrarySnapshot,
     libraryMutating,
@@ -548,6 +590,7 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     importApprovedAiDraft,
     validateLibraryDraft,
     saveSubscriptionDraft,
+    enableSubscriptionPack,
     saveLibraryDraft,
     approveLibraryRecord,
     disableLibraryRecord,
@@ -560,36 +603,6 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     resetCustomRules,
     refreshSubscription
   };
-}
-
-function compiledRulesToYaml(rules: CompiledCleanupRule[]): string {
-  const lines = ["version: 1", "name: Subscription rules", "publisher: local-subscription", "rules:"];
-  for (const rule of rules) {
-    const level =
-      rule.level === "recommended"
-        ? "推荐清理"
-        : rule.level === "cautious"
-          ? "谨慎清理"
-          : "需要确认";
-    lines.push(
-      `  - id: ${JSON.stringify(rule.id)}`,
-      `    name: ${JSON.stringify(rule.name)}`,
-      `    app: ${JSON.stringify(rule.app)}`,
-      `    category: ${JSON.stringify(rule.category)}`,
-      `    level: ${JSON.stringify(level)}`,
-      `    default: ${rule.defaultSelected ? "true" : "false"}`,
-      "    paths:"
-    );
-    for (const path of rule.paths) {
-      lines.push(`      - ${JSON.stringify(path)}`);
-    }
-    lines.push(`    clean: ${rule.clean}`, `    keep_days: ${rule.keepDays}`, "    exclude:");
-    for (const exclude of rule.exclude) {
-      lines.push(`      - ${JSON.stringify(exclude)}`);
-    }
-    lines.push(`    note: ${JSON.stringify(rule.note)}`);
-  }
-  return `${lines.join("\n")}\n`;
 }
 
 function sanitizeSubscriptionUrl(value: string): string | null {
@@ -642,6 +655,23 @@ function subscriptionLogTitle(
   }
 
   return translate(success ? "rule.subscriptionCheckedLog" : "rule.subscriptionCheckFailedLog");
+}
+
+function looksLikeWinapp2(content: string): boolean {
+  const trimmed = content.replace(/^\uFEFF/, "");
+  for (const rawLine of trimmed.split(/\r?\n/).slice(0, 32)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) {
+      continue;
+    }
+    if (line.startsWith("version:") || line.startsWith("rules:")) {
+      return false;
+    }
+    if ((line.startsWith("[") && line.endsWith("]")) || line.toLowerCase().startsWith("filekey")) {
+      return true;
+    }
+  }
+  return /(?:^|\n)\s*\[.+\]\s*(?:\n|$)/.test(trimmed) || /^filekey/im.test(trimmed);
 }
 
 function compilationChanged(

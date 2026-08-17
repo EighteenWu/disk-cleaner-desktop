@@ -56,7 +56,7 @@ describe("rule subscription storage", () => {
 
   it("rejects oversized cached content", () => {
     const storage = new MemoryStorage();
-    const oversizedContent = "x".repeat(2 * 1024 * 1024 + 1);
+    const oversizedContent = "x".repeat(4 * 1024 * 1024 + 1);
 
     expect(
       storeRuleSubscription(
