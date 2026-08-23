@@ -20,6 +20,12 @@ const MAX_PROVIDER_RESPONSE_BYTES: u64 = 256 * 1024;
 /// a wider ceiling than a rule-generation reply.
 const MAX_MODEL_RESPONSE_BYTES: u64 = 1024 * 1024;
 const MAX_MODELS: usize = 512;
+const MAX_ERROR_BODY_BYTES: usize = 2048;
+const MAX_ERROR_SNIPPET_CHARS: usize = 240;
+const MIN_TIMEOUT_MS: u64 = 5_000;
+const MAX_TIMEOUT_MS: u64 = 600_000;
+const CONNECT_TIMEOUT_MS: u64 = 15_000;
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,6 +161,14 @@ pub struct ProviderGenerationProbeResult {
     pub request_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiGenerationProgress {
+    pub elapsed_ms: u64,
+    pub output_chars: usize,
+    pub bytes_received: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderError {
@@ -207,10 +221,18 @@ impl ProviderModelQuery {
 }
 
 fn validate_timeout(timeout_ms: u64) -> Result<(), String> {
-    if !(5_000..=120_000).contains(&timeout_ms) {
-        return Err("Provider 超时必须介于 5 秒和 120 秒之间。".to_string());
+    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
+        return Err("Provider 超时必须介于 5 秒和 600 秒之间。".to_string());
     }
     Ok(())
+}
+
+fn connect_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.min(CONNECT_TIMEOUT_MS))
+}
+
+fn idle_timeout(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms.min(60_000).max(5_000.min(timeout_ms)))
 }
 
 fn validate_base_url(value: &str) -> Result<Url, String> {
@@ -252,6 +274,9 @@ pub fn read_profiles(
     }
     let mut ids = std::collections::HashSet::new();
     for profile in &mut document.profiles {
+        if profile.timeout_ms == 45_000 {
+            profile.timeout_ms = 180_000;
+        }
         profile.validate()?;
         if !ids.insert(profile.id.clone()) {
             return Err("AI Provider 配置包含重复 ID。".to_string());
@@ -391,6 +416,7 @@ pub async fn generate_rules(
     profile: &ProviderProfile,
     request: &ProviderGenerationRequest,
     credentials: &dyn CredentialStore,
+    mut on_progress: impl FnMut(AiGenerationProgress) + Send,
 ) -> Result<ProviderGenerationResponse, ProviderError> {
     let base_url = profile
         .validate()
@@ -416,6 +442,7 @@ pub async fn generate_rules(
     let endpoint = endpoint(&base_url, profile.kind)?;
     let client = Client::builder()
         .redirect(Policy::none())
+        .connect_timeout(connect_timeout(profile.timeout_ms))
         .timeout(Duration::from_millis(profile.timeout_ms))
         .build()
         .map_err(|_| {
@@ -424,9 +451,10 @@ pub async fn generate_rules(
                 "创建 Provider HTTP 客户端失败。",
             )
         })?;
-    let prompt = serde_json::to_string(request).map_err(|_| {
+    let request_json = serde_json::to_string(request).map_err(|_| {
         provider_error(ProviderErrorCategory::Configuration, "序列化脱敏摘要失败。")
     })?;
+    let prompt = format!("{GENERATION_USER_PREFIX}\n{request_json}");
     let system = generation_system_prompt(generation_mode, target_tier);
     let output_schema = provider_output_schema();
 
@@ -436,21 +464,13 @@ pub async fn generate_rules(
             .bearer_auth(secret.expose().map_err(|message| {
                 provider_error(ProviderErrorCategory::CredentialMissing, message)
             })?)
-            .json(&json!({
-                "model": profile.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt}
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "cleanup_rule_drafts",
-                        "strict": true,
-                        "schema": output_schema
-                    }
-                }
-            })),
+            .json(&openai_chat_payload(
+                &profile.model,
+                &system,
+                &prompt,
+                true,
+                &base_url,
+            )),
         ProviderKind::AnthropicCompatible => client
             .post(endpoint)
             .header(
@@ -463,6 +483,7 @@ pub async fn generate_rules(
             .json(&json!({
                 "model": profile.model,
                 "max_tokens": 8192,
+                "stream": true,
                 "system": system,
                 "messages": [{"role": "user", "content": prompt}],
                 "tools": [{
@@ -474,44 +495,27 @@ pub async fn generate_rules(
             })),
     };
     let response = builder.send().await.map_err(map_reqwest_error)?;
-    let status = response.status();
-    let request_id = response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.chars().take(128).collect::<String>());
-    if status.is_redirection() {
-        return Err(provider_error(
-            ProviderErrorCategory::Network,
-            "Provider 返回了被阻止的重定向。",
-        ));
-    }
-    if !status.is_success() {
-        return Err(status_error(
-            status,
-            response.headers().get(header::RETRY_AFTER),
-        ));
-    }
+    let (request_id, response) = accept_provider_response(
+        response,
+        "generate",
+        Some(profile.model.as_str()),
+        Some(prompt.len()),
+    )
+    .await?;
     if response.content_length().unwrap_or(0) > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(provider_error(
             ProviderErrorCategory::ResponseTooLarge,
             "Provider 响应超过 256 KB 上限。",
         ));
     }
-    let bytes = response.bytes().await.map_err(map_reqwest_error)?;
-    if bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
-        return Err(provider_error(
-            ProviderErrorCategory::ResponseTooLarge,
-            "Provider 响应超过 256 KB 上限。",
-        ));
-    }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        provider_error(
-            ProviderErrorCategory::InvalidSchema,
-            "Provider 响应不是有效 JSON。",
-        )
-    })?;
-    let structured = extract_content(profile.kind, &value)?;
+    let structured = collect_generation_output(
+        response,
+        profile.kind,
+        Duration::from_millis(profile.timeout_ms),
+        idle_timeout(profile.timeout_ms),
+        &mut on_progress,
+    )
+    .await?;
     let normalized = normalize_tier_alias(&structured)?;
     let rules = AiGeneratedRuleSet::parse(&normalized)
         .map_err(|message| provider_error(ProviderErrorCategory::InvalidSchema, message))?;
@@ -539,10 +543,14 @@ pub async fn generate_rules(
     })
 }
 
+const GENERATION_PROMPT_VERSION: &str = "v1";
+const GENERATION_USER_PREFIX: &str = "Draft cleanup rules from this redacted scan summary.";
+const GENERATION_RULE_EXAMPLE: &str = r#"{"schema_version":1,"rules":[{"id":"cache.temp","tier":"light","name":"Temp cache","app":"Windows","category":"cache","paths":["%TEMP%\\AppCache"],"clean":"contents","keep_days":7,"exclude":["*.lock"],"note":"cache","evidence":["aggregate"],"cautions":["review"]}]}"#;
+
 fn generation_system_prompt(mode: AiGenerationMode, target_tier: Option<AiRuleTier>) -> String {
-    match mode {
+    let scope = match mode {
         AiGenerationMode::AllTiers => {
-            "Return JSON only. Generate light, medium, and/or heavy cleanup rule drafts in one response. Each rule must set tier to light, medium, or heavy correctly. Empty tiers are allowed but at least one rule is required. Use only environment-variable path templates. Never infer personal paths. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions.".to_string()
+            "Generate light, medium, and/or heavy cleanup rule drafts in one response. Each rule must set tier to light, medium, or heavy. Empty tiers are allowed; at least one rule is required.".to_string()
         }
         AiGenerationMode::SingleTier => {
             let tier = match target_tier.expect("singleTier requires target") {
@@ -550,9 +558,261 @@ fn generation_system_prompt(mode: AiGenerationMode, target_tier: Option<AiRuleTi
                 AiRuleTier::Medium => "medium",
                 AiRuleTier::Heavy => "heavy",
             };
-            format!("Return JSON only. Generate only {tier} cleanup rule drafts. Every rule tier must be {tier}. Use only environment-variable path templates. Never infer personal paths. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions.")
+            format!("Generate only {tier} cleanup rule drafts. Every rule tier must be {tier}.")
         }
+    };
+    format!(
+        "cleanup-rule json contract {GENERATION_PROMPT_VERSION}. Return one json object only, no markdown, no extra keys. {scope} Paths must use environment-variable templates only (%LOCALAPPDATA%, %TEMP%, %APPDATA%). Never infer personal paths. clean must be contents, files, recycle, or manual — never delete. Prefer contents for cache directories. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions. Example json: {GENERATION_RULE_EXAMPLE}"
+    )
+}
+
+fn thinking_disabled_host(base_url: &Url) -> bool {
+    base_url
+        .host_str()
+        .map(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            host == "api.deepseek.com" || host.ends_with(".api.deepseek.com")
+        })
+        .unwrap_or(false)
+}
+
+/// DeepSeek and typical OpenAI-compatible relays accept `json_object` only.
+/// `json_schema` / structured outputs is OpenAI-specific and returns HTTP 400
+/// on those gateways (e.g. packycode + deepseek-v4-flash). Local compile still
+/// enforces the cleanup-rule schema. `thinking.disabled` is DeepSeek-host only;
+/// OpenAI returns 400 on unknown fields.
+fn openai_chat_payload(
+    model: &str,
+    system: &str,
+    user: &str,
+    stream: bool,
+    base_url: &Url,
+) -> Value {
+    let mut payload = json!({
+        "model": model,
+        "stream": stream,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ],
+        "response_format": { "type": "json_object" }
+    });
+    if thinking_disabled_host(base_url) {
+        payload["thinking"] = json!({ "type": "disabled" });
     }
+    payload
+}
+
+async fn collect_generation_output(
+    mut response: reqwest::Response,
+    kind: ProviderKind,
+    overall: Duration,
+    idle: Duration,
+    on_progress: &mut (impl FnMut(AiGenerationProgress) + Send),
+) -> Result<String, ProviderError> {
+    let started = Instant::now();
+    let mut bytes = Vec::new();
+    let mut last_emit = Instant::now() - PROGRESS_EMIT_INTERVAL;
+    let mut emit = |bytes_len: usize, output_chars: usize, force: bool| {
+        if force || last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
+            last_emit = Instant::now();
+            on_progress(AiGenerationProgress {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                output_chars,
+                bytes_received: bytes_len,
+            });
+        }
+    };
+
+    loop {
+        if started.elapsed() > overall {
+            return Err(provider_error(
+                ProviderErrorCategory::Timeout,
+                "Provider 请求超时。",
+            ));
+        }
+        let wait = idle.min(overall.saturating_sub(started.elapsed()));
+        let wait = if wait.is_zero() {
+            Duration::from_millis(1)
+        } else {
+            wait
+        };
+        let chunk = tokio::time::timeout(wait, response.chunk())
+            .await
+            .map_err(|_| provider_error(ProviderErrorCategory::Timeout, "Provider 请求超时。"))?
+            .map_err(map_reqwest_error)?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
+            return Err(provider_error(
+                ProviderErrorCategory::ResponseTooLarge,
+                "Provider 响应超过 256 KB 上限。",
+            ));
+        }
+        let parsed = parse_generation_buffer(kind, &bytes)?;
+        emit(bytes.len(), parsed.chars().count(), false);
+    }
+
+    let structured = finalize_generation_buffer(kind, &bytes)?;
+    emit(bytes.len(), structured.chars().count(), true);
+    Ok(structured)
+}
+
+fn parse_generation_buffer(kind: ProviderKind, bytes: &[u8]) -> Result<String, ProviderError> {
+    let text = String::from_utf8_lossy(bytes);
+    if looks_like_sse(&text) {
+        parse_sse_output(kind, &text, false)
+    } else {
+        Ok(String::new())
+    }
+}
+
+fn finalize_generation_buffer(kind: ProviderKind, bytes: &[u8]) -> Result<String, ProviderError> {
+    if bytes.is_empty() {
+        return Err(provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 响应为空。",
+        ));
+    }
+    let text = String::from_utf8_lossy(bytes);
+    if looks_like_sse(&text) {
+        return parse_sse_output(kind, &text, true);
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| {
+        provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 响应不是有效 JSON。",
+        )
+    })?;
+    extract_content(kind, &value)
+}
+
+fn looks_like_sse(text: &str) -> bool {
+    let trimmed = text.strip_prefix('\u{feff}').unwrap_or(text).trim_start();
+    trimmed.starts_with("data:") || trimmed.starts_with("event:")
+}
+
+fn parse_sse_output(
+    kind: ProviderKind,
+    text: &str,
+    include_tail: bool,
+) -> Result<String, ProviderError> {
+    let mut output = String::new();
+    let mut rest = text;
+    loop {
+        let Some((event, remaining)) = split_sse_event(rest) else {
+            if include_tail {
+                apply_sse_event(kind, rest, &mut output)?;
+            }
+            break;
+        };
+        rest = remaining;
+        apply_sse_event(kind, event, &mut output)?;
+    }
+    Ok(output)
+}
+
+fn split_sse_event(text: &str) -> Option<(&str, &str)> {
+    if let Some(index) = text.find("\r\n\r\n") {
+        return Some((&text[..index], &text[index + 4..]));
+    }
+    if let Some(index) = text.find("\n\n") {
+        return Some((&text[..index], &text[index + 2..]));
+    }
+    None
+}
+
+fn apply_sse_event(
+    kind: ProviderKind,
+    event: &str,
+    output: &mut String,
+) -> Result<(), ProviderError> {
+    for line in event.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        apply_sse_json(kind, data, output)?;
+    }
+    Ok(())
+}
+
+fn apply_sse_json(
+    kind: ProviderKind,
+    data: &str,
+    output: &mut String,
+) -> Result<(), ProviderError> {
+    let value: Value = serde_json::from_str(data).map_err(|_| {
+        provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 流式响应不是有效 JSON。",
+        )
+    })?;
+    if value.get("error").is_some() {
+        let snippet = extract_provider_error_text(data);
+        return Err(provider_error(
+            ProviderErrorCategory::Provider,
+            snippet.unwrap_or_else(|| "Provider 流式响应返回错误。".to_string()),
+        ));
+    }
+    match kind {
+        ProviderKind::OpenAiCompatible => {
+            if let Some(content) = value
+                .pointer("/choices/0/delta/content")
+                .and_then(Value::as_str)
+            {
+                output.push_str(content);
+            } else if output.is_empty() {
+                if let Some(content) = value
+                    .pointer("/choices/0/message/content")
+                    .and_then(Value::as_str)
+                {
+                    output.push_str(content);
+                }
+            }
+        }
+        ProviderKind::AnthropicCompatible => match value.get("type").and_then(Value::as_str) {
+            Some("content_block_delta") => {
+                let delta = value.get("delta");
+                let delta_type = delta
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str);
+                if delta_type == Some("text_delta") {
+                    if let Some(text) = delta
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                    {
+                        output.push_str(text);
+                    }
+                } else if delta_type == Some("input_json_delta") {
+                    if let Some(partial) = delta
+                        .and_then(|item| item.get("partial_json"))
+                        .and_then(Value::as_str)
+                    {
+                        output.push_str(partial);
+                    }
+                }
+            }
+            Some("content_block_start") => {
+                if let Some(input) = value.pointer("/content_block/input") {
+                    if !input.is_null() && input != &json!({}) {
+                        if let Ok(text) = serde_json::to_string(input) {
+                            if output.is_empty() {
+                                output.push_str(&text);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+    }
+    Ok(())
 }
 
 fn provider_output_schema() -> Value {
@@ -613,6 +873,7 @@ pub async fn probe_generation(
     let endpoint = endpoint(&base_url, query.kind)?;
     let client = Client::builder()
         .redirect(Policy::none())
+        .connect_timeout(connect_timeout(query.timeout_ms))
         .timeout(Duration::from_millis(query.timeout_ms))
         .build()
         .map_err(|_| {
@@ -630,21 +891,13 @@ pub async fn probe_generation(
             .bearer_auth(secret.expose().map_err(|message| {
                 provider_error(ProviderErrorCategory::CredentialMissing, message)
             })?)
-            .json(&json!({
-                "model": query.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": "ping"}
-                ],
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "generation_probe",
-                        "strict": true,
-                        "schema": schema
-                    }
-                }
-            })),
+            .json(&openai_chat_payload(
+                &query.model,
+                system,
+                "ping",
+                true,
+                &base_url,
+            )),
         ProviderKind::AnthropicCompatible => client
             .post(endpoint)
             .header(
@@ -657,6 +910,7 @@ pub async fn probe_generation(
             .json(&json!({
                 "model": query.model,
                 "max_tokens": 64,
+                "stream": true,
                 "system": system,
                 "messages": [{"role": "user", "content": "ping"}],
                 "tools": [{
@@ -668,44 +922,22 @@ pub async fn probe_generation(
             })),
     };
     let response = builder.send().await.map_err(map_reqwest_error)?;
-    let status = response.status();
-    let request_id = response
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.chars().take(128).collect::<String>());
-    if status.is_redirection() {
-        return Err(provider_error(
-            ProviderErrorCategory::Network,
-            "Provider 返回了被阻止的重定向。",
-        ));
-    }
-    if !status.is_success() {
-        return Err(status_error(
-            status,
-            response.headers().get(header::RETRY_AFTER),
-        ));
-    }
+    let (request_id, response) =
+        accept_provider_response(response, "probe", Some(query.model.as_str()), None).await?;
     if response.content_length().unwrap_or(0) > MAX_PROVIDER_RESPONSE_BYTES {
         return Err(provider_error(
             ProviderErrorCategory::ResponseTooLarge,
             "Provider 响应超过 256 KB 上限。",
         ));
     }
-    let bytes = response.bytes().await.map_err(map_reqwest_error)?;
-    if bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
-        return Err(provider_error(
-            ProviderErrorCategory::ResponseTooLarge,
-            "Provider 响应超过 256 KB 上限。",
-        ));
-    }
-    let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        provider_error(
-            ProviderErrorCategory::InvalidSchema,
-            "Provider 探活响应不是有效 JSON。",
-        )
-    })?;
-    let structured = extract_probe_content(query.kind, &value)?;
+    let structured = collect_generation_output(
+        response,
+        query.kind,
+        Duration::from_millis(query.timeout_ms),
+        idle_timeout(query.timeout_ms),
+        &mut |_| {},
+    )
+    .await?;
     let parsed: Value = serde_json::from_str(&structured).map_err(|_| {
         provider_error(
             ProviderErrorCategory::InvalidSchema,
@@ -723,56 +955,6 @@ pub async fn probe_generation(
         latency_ms: started.elapsed().as_millis() as u64,
         request_id,
     })
-}
-
-fn extract_probe_content(kind: ProviderKind, value: &Value) -> Result<String, ProviderError> {
-    match kind {
-        ProviderKind::OpenAiCompatible => value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| {
-                provider_error(
-                    ProviderErrorCategory::InvalidSchema,
-                    "Provider 探活缺少 message content。",
-                )
-            }),
-        ProviderKind::AnthropicCompatible => {
-            let items = value.get("content").and_then(Value::as_array);
-            let tool = items.and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("tool_use")
-                        && item.get("name").and_then(Value::as_str) == Some("submit_probe")
-                })
-            });
-            if let Some(tool) = tool {
-                if let Some(input) = tool.get("input") {
-                    return serde_json::to_string(input).map_err(|_| {
-                        provider_error(
-                            ProviderErrorCategory::InvalidSchema,
-                            "Provider 探活工具参数无效。",
-                        )
-                    });
-                }
-            }
-            items
-                .and_then(|items| {
-                    items.iter().find_map(|item| {
-                        if item.get("type").and_then(Value::as_str) == Some("text") {
-                            item.get("text").and_then(Value::as_str).map(str::to_string)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .ok_or_else(|| {
-                    provider_error(
-                        ProviderErrorCategory::InvalidSchema,
-                        "Provider 探活缺少 tool/text 内容。",
-                    )
-                })
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -823,6 +1005,7 @@ pub async fn list_models(
     let endpoint = route_endpoint(&base_url, query.kind, ProviderRoute::Models)?;
     let client = Client::builder()
         .redirect(Policy::none())
+        .connect_timeout(connect_timeout(query.timeout_ms))
         .timeout(Duration::from_millis(query.timeout_ms))
         .build()
         .map_err(|_| {
@@ -842,19 +1025,7 @@ pub async fn list_models(
             .header("anthropic-version", "2023-06-01"),
     };
     let response = builder.send().await.map_err(map_reqwest_error)?;
-    let status = response.status();
-    if status.is_redirection() {
-        return Err(provider_error(
-            ProviderErrorCategory::Network,
-            "Provider 返回了被禁止的重定向。",
-        ));
-    }
-    if !status.is_success() {
-        return Err(status_error(
-            status,
-            response.headers().get(header::RETRY_AFTER),
-        ));
-    }
+    let (_request_id, response) = accept_provider_response(response, "models", None, None).await?;
     if response.content_length().unwrap_or(0) > MAX_MODEL_RESPONSE_BYTES {
         return Err(provider_error(
             ProviderErrorCategory::ResponseTooLarge,
@@ -1001,8 +1172,10 @@ fn extract_content(kind: ProviderKind, value: &Value) -> Result<String, Provider
                 .and_then(|items| {
                     items.iter().find(|item| {
                         item.get("type").and_then(Value::as_str) == Some("tool_use")
-                            && item.get("name").and_then(Value::as_str)
-                                == Some("submit_cleanup_rules")
+                            && matches!(
+                                item.get("name").and_then(Value::as_str),
+                                Some("submit_cleanup_rules" | "submit_probe")
+                            )
                     })
                 })
                 .and_then(|item| item.get("input"))
@@ -1020,12 +1193,32 @@ fn extract_content(kind: ProviderKind, value: &Value) -> Result<String, Provider
                 })
         }
     };
-    content.ok_or_else(|| {
-        provider_error(
-            ProviderErrorCategory::InvalidSchema,
-            "Provider 响应缺少结构化规则内容。",
-        )
-    })
+    content
+        .map(|value| unwrap_json_content(&value))
+        .ok_or_else(|| {
+            provider_error(
+                ProviderErrorCategory::InvalidSchema,
+                "Provider 响应缺少结构化内容。",
+            )
+        })
+}
+
+fn unwrap_json_content(content: &str) -> String {
+    let trimmed = content.trim();
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return trimmed.to_string();
+    }
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    unfenced
+        .strip_suffix("```")
+        .unwrap_or(unfenced)
+        .trim()
+        .to_string()
 }
 
 fn normalize_tier_alias(content: &str) -> Result<String, ProviderError> {
@@ -1050,15 +1243,179 @@ fn normalize_tier_alias(content: &str) -> Result<String, ProviderError> {
     })
 }
 
-fn status_error(status: StatusCode, retry_after: Option<&header::HeaderValue>) -> ProviderError {
+async fn accept_provider_response(
+    response: reqwest::Response,
+    operation: &str,
+    model: Option<&str>,
+    request_bytes: Option<usize>,
+) -> Result<(Option<String>, reqwest::Response), ProviderError> {
+    let status = response.status();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(128).collect::<String>());
+    if status.is_redirection() {
+        log_provider_http(
+            operation,
+            model,
+            status,
+            request_bytes,
+            request_id.as_deref(),
+            Some("redirect"),
+        );
+        return Err(provider_error(
+            ProviderErrorCategory::Network,
+            "Provider 返回了被阻止的重定向。",
+        ));
+    }
+    if !status.is_success() {
+        let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+        let snippet = read_error_snippet(response).await;
+        log_provider_http(
+            operation,
+            model,
+            status,
+            request_bytes,
+            request_id.as_deref(),
+            snippet.as_deref(),
+        );
+        return Err(status_error(
+            status,
+            retry_after.as_ref(),
+            snippet.as_deref(),
+        ));
+    }
+    log_provider_http(
+        operation,
+        model,
+        status,
+        request_bytes,
+        request_id.as_deref(),
+        None,
+    );
+    Ok((request_id, response))
+}
+
+async fn read_error_snippet(response: reqwest::Response) -> Option<String> {
+    if response.content_length().unwrap_or(0) > 64 * 1024 {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let truncated = &bytes[..bytes.len().min(MAX_ERROR_BODY_BYTES)];
+    extract_provider_error_text(&String::from_utf8_lossy(truncated))
+}
+
+fn extract_provider_error_text(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+        let raw = parsed
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| parsed.get("message").and_then(Value::as_str))
+            .or_else(|| parsed.get("error").and_then(Value::as_str))
+            .or_else(|| parsed.pointer("/error/code").and_then(Value::as_str));
+        return raw.and_then(sanitize_error_text);
+    }
+    sanitize_error_text(trimmed)
+}
+
+fn sanitize_error_text(raw: &str) -> Option<String> {
+    let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = collapsed.split_whitespace().collect();
+    let mut redacted = Vec::with_capacity(words.len());
+    let mut skip_next = false;
+    for word in words {
+        if skip_next {
+            redacted.push("[redacted]");
+            skip_next = false;
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if lower == "bearer" || lower.ends_with("authorization:") {
+            redacted.push("[redacted]");
+            skip_next = true;
+            continue;
+        }
+        if lower.starts_with("sk-")
+            || (word.len() >= 48
+                && word
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')))
+        {
+            redacted.push("[redacted]");
+            continue;
+        }
+        redacted.push(word);
+    }
+    let mut text = redacted.join(" ");
+    if text.chars().count() > MAX_ERROR_SNIPPET_CHARS {
+        text = text
+            .chars()
+            .take(MAX_ERROR_SNIPPET_CHARS.saturating_sub(3))
+            .collect::<String>()
+            + "...";
+    }
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn log_provider_http(
+    operation: &str,
+    model: Option<&str>,
+    status: StatusCode,
+    request_bytes: Option<usize>,
+    request_id: Option<&str>,
+    error: Option<&str>,
+) {
+    #[cfg(debug_assertions)]
+    {
+        eprintln!(
+            "ai-provider {operation} model={} status={} request_bytes={} request_id={} error={}",
+            model.unwrap_or("-"),
+            status.as_u16(),
+            request_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into()),
+            request_id.unwrap_or("-"),
+            error.unwrap_or("-"),
+        );
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (operation, model, status, request_bytes, request_id, error);
+    }
+}
+
+fn status_error(
+    status: StatusCode,
+    retry_after: Option<&header::HeaderValue>,
+    snippet: Option<&str>,
+) -> ProviderError {
     let category = match status.as_u16() {
         401 | 403 => ProviderErrorCategory::Authentication,
         429 => ProviderErrorCategory::RateLimited,
         _ => ProviderErrorCategory::Provider,
     };
+    let message = match snippet.filter(|text| !text.is_empty()) {
+        Some(text) => format!("Provider 请求失败（HTTP {}）：{text}", status.as_u16()),
+        None => format!("Provider 请求失败（HTTP {}）。", status.as_u16()),
+    };
     ProviderError {
         category,
-        message: format!("Provider 请求失败（HTTP {}）。", status.as_u16()),
+        message,
         retry_after_seconds: retry_after
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse().ok()),
@@ -1186,16 +1543,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_45s_timeout_is_lifted_on_read() {
+        let root = test_root();
+        let store = FakeCredentials::default();
+        let mut stored = profile();
+        stored.timeout_ms = 45_000;
+        save_profile(&root, stored, &store).unwrap();
+        let profiles = read_profiles(&root, &store).unwrap();
+        assert_eq!(profiles[0].timeout_ms, 180_000);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn profile_validation_requires_secure_bounded_configuration() {
         assert!(profile().validate().is_ok());
         let mut bounded = profile();
         bounded.timeout_ms = 5_000;
         assert!(bounded.validate().is_ok());
-        bounded.timeout_ms = 120_000;
+        bounded.timeout_ms = 600_000;
         assert!(bounded.validate().is_ok());
         bounded.timeout_ms = 4_999;
         assert!(bounded.validate().is_err());
-        bounded.timeout_ms = 120_001;
+        bounded.timeout_ms = 600_001;
         assert!(bounded.validate().is_err());
         let mut invalid = profile();
         invalid.base_url = "http://example.com".into();
@@ -1230,19 +1599,114 @@ mod tests {
                 ProviderErrorCategory::Provider,
             ),
         ] {
-            let error = status_error(status, None);
+            let error = status_error(status, None, None);
             assert_eq!(error.category, expected);
             assert!(!error.message.contains("fixture-secret-token"));
         }
         let retry = header::HeaderValue::from_static("7");
         assert_eq!(
-            status_error(StatusCode::TOO_MANY_REQUESTS, Some(&retry)).retry_after_seconds,
+            status_error(StatusCode::TOO_MANY_REQUESTS, Some(&retry), None).retry_after_seconds,
             Some(7)
         );
     }
 
+    #[test]
+    fn json_content_strips_markdown_fences() {
+        assert_eq!(
+            unwrap_json_content("```json\n{\"ok\":true}\n```"),
+            "{\"ok\":true}"
+        );
+        assert_eq!(unwrap_json_content("{\"ok\":true}"), "{\"ok\":true}");
+    }
+
+    #[test]
+    fn openai_payload_disables_thinking_only_for_deepseek_host() {
+        let deepseek = Url::parse("https://api.deepseek.com").unwrap();
+        let deepseek_v1 = Url::parse("https://api.deepseek.com/v1").unwrap();
+        let deepseek_sub = Url::parse("https://region.api.deepseek.com").unwrap();
+        let openai = Url::parse("https://api.openai.com").unwrap();
+        let fixture = Url::parse("http://127.0.0.1:9").unwrap();
+        let lookalike = Url::parse("https://notapi.deepseek.com").unwrap();
+
+        for url in [deepseek, deepseek_v1, deepseek_sub] {
+            let payload = openai_chat_payload("m", "s", "ping", true, &url);
+            assert_eq!(payload["thinking"]["type"], "disabled");
+            assert_eq!(payload["stream"], true);
+            assert_eq!(payload["response_format"]["type"], "json_object");
+            assert!(payload.get("json_schema").is_none());
+        }
+        for url in [openai, fixture, lookalike] {
+            let payload = openai_chat_payload("m", "s", "ping", true, &url);
+            assert!(payload.get("thinking").is_none());
+            assert_eq!(payload["stream"], true);
+        }
+    }
+
+    #[test]
+    fn generation_prompt_is_short_json_contract() {
+        let prompt = generation_system_prompt(AiGenerationMode::AllTiers, None);
+        let lowered = prompt.to_ascii_lowercase();
+        assert!(lowered.contains("json"));
+        assert!(prompt.contains(GENERATION_PROMPT_VERSION));
+        assert!(prompt.contains(GENERATION_RULE_EXAMPLE));
+        assert!(prompt.contains("%TEMP%") || prompt.contains("%LOCALAPPDATA%"));
+        assert!(prompt.contains("contents"));
+        assert!(prompt.contains("never delete"));
+        assert!(!prompt.contains("json_schema"));
+        let single = generation_system_prompt(AiGenerationMode::SingleTier, Some(AiRuleTier::Light));
+        assert!(single.contains("light"));
+        assert!(single.to_ascii_lowercase().contains("json"));
+        assert!(!single.contains("json_schema"));
+        let parsed = AiGeneratedRuleSet::parse(GENERATION_RULE_EXAMPLE).expect("example json");
+        let compilation = parsed.compile().expect("example compile");
+        assert!(compilation.report.valid, "{:?}", compilation.report.errors);
+        assert!(compilation.rules.iter().all(|rule| !rule.default_selected));
+    }
+
+    #[test]
+    fn provider_error_snippets_are_extracted_and_redacted() {
+        assert_eq!(
+            extract_provider_error_text(
+                r#"{"error":{"message":"This response_format type is unavailable now"}}"#
+            )
+            .as_deref(),
+            Some("This response_format type is unavailable now")
+        );
+        assert_eq!(extract_provider_error_text("{}"), None);
+        let redacted = extract_provider_error_text(
+            r#"{"error":{"message":"invalid Bearer sk-secret-token-value-here"}}"#,
+        )
+        .expect("snippet");
+        assert!(redacted.contains("invalid"));
+        assert!(!redacted.contains("sk-secret"));
+        assert!(!redacted.to_ascii_lowercase().contains("bearer sk-"));
+    }
+
+    #[test]
+    fn sse_chunks_are_concatenated_for_openai_and_anthropic() {
+        let openai = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\"\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(
+            parse_sse_output(ProviderKind::OpenAiCompatible, openai, true).unwrap(),
+            "{\"ok\":true}"
+        );
+
+        let anthropic = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"ok\\\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\":true}\"}}\n\n",
+        );
+        assert_eq!(
+            parse_sse_output(ProviderKind::AnthropicCompatible, anthropic, true).unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+
     #[tokio::test]
-    async fn both_provider_protocols_send_only_redacted_payload() {
+    async fn both_provider_protocols_send_hybrid_summary_with_samples() {
         for kind in [
             ProviderKind::OpenAiCompatible,
             ProviderKind::AnthropicCompatible,
@@ -1255,23 +1719,29 @@ mod tests {
             provider.kind = kind;
             provider.base_url = base_url;
 
-            let generated = generate_rules(&provider, &generation_request(), &credentials)
+            let generated = generate_rules(&provider, &generation_request(), &credentials, |_| {})
                 .await
                 .unwrap();
             assert_eq!(generated.rules.rules.len(), 1);
             let request = captured.recv().unwrap();
             assert!(request.contains("summaryHash"));
             assert!(request.contains("targetTier"));
-            assert!(!request.contains("C:\\Users"));
-            assert!(!request.contains("secret-file"));
+            assert!(request.contains("samples"));
+            assert!(request.contains("AppData"));
+            assert!(request.contains("alice"));
+            assert!(request.contains("schemaVersion"));
+            assert!(request.contains("token=[redacted]"));
+            assert!(!request.contains("API_KEY"));
             match kind {
                 ProviderKind::OpenAiCompatible => {
                     assert!(request.starts_with("POST /v1/chat/completions"));
                     assert!(request
                         .to_ascii_lowercase()
                         .contains("authorization: bearer fixture-secret-token"));
-                    assert!(request.contains("json_schema"));
-                    assert!(request.contains("\"strict\":true"));
+                    assert!(request.contains("json_object"));
+                    assert!(!request.contains("json_schema"));
+                    assert!(request.contains("\"stream\":true"));
+                    assert!(!request.contains("thinking"));
                 }
                 ProviderKind::AnthropicCompatible => {
                     assert!(request.starts_with("POST /v1/messages"));
@@ -1283,9 +1753,40 @@ mod tests {
                         .contains("anthropic-version: 2023-06-01"));
                     assert!(request.contains("input_schema"));
                     assert!(request.contains("submit_cleanup_rules"));
+                    assert!(request.contains("\"stream\":true"));
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn generation_reads_openai_sse_and_emits_progress() {
+        let rules = valid_rules();
+        let body = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({"choices": [{"delta": {"content": rules}}]})
+        );
+        let (base_url, captured) = spawn_server(200, body, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let generated = generate_rules(
+            &provider,
+            &generation_request(),
+            &credentials,
+            move |progress| {
+                let _ = progress_tx.send(progress);
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(generated.rules.rules.len(), 1);
+        let progress: Vec<_> = progress_rx.try_iter().collect();
+        assert!(progress.iter().any(|item| item.bytes_received > 0));
+        let request = captured.recv().unwrap();
+        assert!(request.contains("\"stream\":true"));
     }
 
     #[tokio::test]
@@ -1309,9 +1810,14 @@ mod tests {
         save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
         let mut provider = profile();
         provider.base_url = base_url;
-        let generated = generate_rules(&provider, &all_tiers_generation_request(), &credentials)
-            .await
-            .unwrap();
+        let generated = generate_rules(
+            &provider,
+            &all_tiers_generation_request(),
+            &credentials,
+            |_| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(generated.rules.rules.len(), 3);
         let request = captured.recv().unwrap();
         assert!(request.contains("allTiers") || request.contains("generationMode"));
@@ -1330,7 +1836,7 @@ mod tests {
         request.generation_mode = Some(AiGenerationMode::SingleTier);
         request.target_tier = Some(AiRuleTier::Light);
         assert_eq!(
-            generate_rules(&provider, &request, &credentials)
+            generate_rules(&provider, &request, &credentials, |_| {})
                 .await
                 .unwrap_err()
                 .category,
@@ -1381,8 +1887,84 @@ mod tests {
         .unwrap();
         assert!(result.ok);
         let request = captured.recv().unwrap();
-        assert!(request.contains("generation_probe") || request.contains("\"ok\""));
+        assert!(request.contains("json_object") || request.contains("\"ok\""));
+        assert!(!request.contains("json_schema"));
         assert!(!request.contains("summaryHash"));
+        assert!(request.contains("\"stream\":true"));
+        assert!(!request.contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn generation_probe_reads_openai_sse() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":true}\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, captured) = spawn_server(200, body.into(), Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let result = probe_generation(
+            ProviderGenerationProbeQuery {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url,
+                timeout_ms: 5_000,
+                model: "fixture-model".into(),
+                profile_id: Some("profile-1".into()),
+                api_key: None,
+            },
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let request = captured.recv().unwrap();
+        assert!(request.contains("\"stream\":true"));
+        assert!(!request.contains("thinking"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_probe_sends_stream_true() {
+        let response = provider_probe_response(ProviderKind::AnthropicCompatible);
+        let (base_url, captured) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let result = probe_generation(
+            ProviderGenerationProbeQuery {
+                kind: ProviderKind::AnthropicCompatible,
+                base_url,
+                timeout_ms: 5_000,
+                model: "fixture-model".into(),
+                profile_id: Some("profile-1".into()),
+                api_key: None,
+            },
+            &credentials,
+        )
+        .await
+        .unwrap();
+        assert!(result.ok);
+        let request = captured.recv().unwrap();
+        assert!(request.contains("\"stream\":true"));
+        assert!(!request.contains("thinking"));
+        assert!(request.contains("submit_probe"));
+    }
+
+    #[tokio::test]
+    async fn http_400_includes_sanitized_provider_message() {
+        let body = json!({
+            "error": {
+                "message": "This response_format type is unavailable now Bearer sk-secret-token-value",
+                "type": "invalid_request_error"
+            }
+        })
+        .to_string();
+        let (base_url, _) = spawn_server(400, body, Duration::ZERO);
+        let error = call_fixture(base_url, 5_000).await.unwrap_err();
+        assert_eq!(error.category, ProviderErrorCategory::Provider);
+        assert!(error.message.contains("HTTP 400"));
+        assert!(error
+            .message
+            .contains("This response_format type is unavailable now"));
+        assert!(!error.message.contains("sk-secret"));
     }
 
     #[tokio::test]
@@ -1445,16 +2027,58 @@ mod tests {
         let mut provider = profile();
         provider.base_url = base_url;
         provider.timeout_ms = timeout_ms;
-        generate_rules(&provider, &generation_request(), &credentials).await
+        generate_rules(&provider, &generation_request(), &credentials, |_| {}).await
     }
 
     fn generation_request() -> ProviderGenerationRequest {
-        let summary = cleaner_core::redacted_scan_summary(&cleaner_core::initial_scan_snapshot());
+        let summary = cleaner_core::redacted_scan_summary(&sample_scan_snapshot());
+        assert!(summary.validate_for_provider().is_ok());
+        assert!(summary
+            .buckets
+            .iter()
+            .any(|bucket| !bucket.samples.is_empty()));
         ProviderGenerationRequest {
             summary,
             generation_mode: None,
             target_tier: Some(AiRuleTier::Light),
         }
+    }
+
+    fn sample_scan_snapshot() -> cleaner_core::ScanSnapshot {
+        let mut snapshot = cleaner_core::initial_scan_snapshot();
+        snapshot.scan_backend = "mft".into();
+        snapshot.candidates.push(cleaner_core::CleanupCandidate {
+            id: "candidate-1".into(),
+            parent_id: None,
+            display_name: "cache".into(),
+            path: r"C:\Users\alice\AppData\Local\Temp\cache".into(),
+            volume_id: "C:".into(),
+            object_type: cleaner_core::ObjectType::Directory,
+            category: "cache".into(),
+            size_bytes: 12_000_000,
+            children_count: 0,
+            risk_level: cleaner_core::RiskLevel::SafeRecommended,
+            default_selected: true,
+            selected: false,
+            delete_strategy: cleaner_core::DeleteStrategy::MoveToRecycleBin,
+            reason: "browser cache token=API_KEY".into(),
+            confidence: 100,
+            source: cleaner_core::SourceInfo {
+                label: "Browser".into(),
+                kind: cleaner_core::SourceKind::Browser,
+                confidence: 100,
+                evidence: r"Temp\cache".into(),
+            },
+            cleanup_policy: cleaner_core::CleanupPolicy::default(),
+        });
+        snapshot.coverage.status = cleaner_core::ScanCoverageStatus::Partial;
+        snapshot.coverage.gaps.push(cleaner_core::CoverageGap {
+            volume_id: "C:".into(),
+            reason: cleaner_core::CoverageGapReason::ReparseNotFollowed,
+            path_hint: Some(r"C:\Users\alice\Link".into()),
+            count: 1,
+        });
+        snapshot
     }
 
     fn all_tiers_generation_request() -> ProviderGenerationRequest {

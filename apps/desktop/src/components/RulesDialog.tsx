@@ -4,7 +4,12 @@ import { AI_RULE_TIERS, tierRules } from "../aiRuleYaml";
 import { aiGenerationRequest, aiGenerationRequestPreview } from "../aiGeneration";
 import { aiDraftApprovalReady } from "../aiDraftWorkflow";
 import { Dialog } from "./Dialog";
-import type { AiRuleGenerationState } from "../useAiRuleGeneration";
+import { PROVIDER_VENDOR_PRESETS } from "../providerPresets";
+import {
+  MAX_PROVIDER_TIMEOUT_SECONDS,
+  MIN_PROVIDER_TIMEOUT_SECONDS,
+  type AiRuleGenerationState
+} from "../useAiRuleGeneration";
 import type { RuleSourcesState } from "../useRuleSources";
 import type {
   AiGenerationMode,
@@ -31,6 +36,7 @@ export interface RulesDialogProps {
    * of known roots, so its summary is too thin to draft rules from.
    */
   aiGenerationReady: boolean;
+  onImportStarterRules?: () => void;
   onClose: () => void;
   translate: (key: string, values?: Record<string, string | number>) => string;
 }
@@ -40,10 +46,12 @@ export function RulesDialog({
   ai,
   snapshot,
   aiGenerationReady,
+  onImportStarterRules,
   onClose,
   translate
 }: RulesDialogProps) {
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [providerAdvancedOpen, setProviderAdvancedOpen] = useState(false);
   const [editingRecordId, setEditingRecordId] = useState<string | null>(null);
   const [editorContent, setEditorContent] = useState("");
   const [editorReport, setEditorReport] = useState<RuleValidationReport | null>(null);
@@ -51,6 +59,8 @@ export function RulesDialog({
     profiles,
     selectedProfileId,
     setSelectedProfileId,
+    vendorId,
+    setVendorId,
     providerKind,
     setProviderKind,
     providerName,
@@ -65,7 +75,6 @@ export function RulesDialog({
     setApiKey,
     models,
     loadingModels,
-    testingConnection,
     probingGeneration,
     summary: aiSummary,
     generationMode,
@@ -168,6 +177,26 @@ export function RulesDialog({
         </div>
       </dl>
 
+      {rules.activeRules.length === 0 && onImportStarterRules ? (
+        <section className="ruleCommunity" aria-labelledby="rule-starter-title">
+          <div className="ruleLibraryHeader">
+            <div>
+              <h3 id="rule-starter-title">{translate("rule.starterTitle")}</h3>
+              <p>{translate("scan.emptyLibraryHint")}</p>
+            </div>
+          </div>
+          <div className="ruleActions">
+            <button
+              className="button primary"
+              disabled={rules.libraryMutating}
+              onClick={onImportStarterRules}
+            >
+              {translate("rule.useStarter")}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
       <section className="ruleCommunity" aria-labelledby="rule-community-title">
         <div className="ruleLibraryHeader">
           <div>
@@ -225,62 +254,41 @@ export function RulesDialog({
             </select>
           </label>
           <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiGenerationMode")}</span>
+            <span className="ruleFieldLabel">{translate("rule.aiVendor")}</span>
             <select
-              value={generationMode}
-              onChange={(event) => setGenerationMode(event.target.value as AiGenerationMode)}
+              value={vendorId}
+              onChange={(event) => setVendorId(event.target.value as typeof vendorId)}
             >
-              <option value="allTiers">{translate("rule.aiGenerationModeAll")}</option>
-              <option value="singleTier">{translate("rule.aiGenerationModeSingle")}</option>
+              {PROVIDER_VENDOR_PRESETS.map((preset) => (
+                <option value={preset.id} key={preset.id}>
+                  {translate(preset.labelKey)}
+                </option>
+              ))}
             </select>
           </label>
-          {generationMode === "singleTier" ? (
-            <label className="ruleField">
-              <span className="ruleFieldLabel">{translate("rule.aiTargetTier")}</span>
-              <select
-                value={targetTier}
-                onChange={(event) => setTargetTier(event.target.value as AiRuleTier)}
+          <label className="ruleField ruleFieldWide">
+            <span className="ruleFieldLabel">{translate("rule.aiApiKey")}</span>
+            <div className="ruleUrlRow">
+              <input
+                type="password"
+                value={apiKey}
+                autoComplete="off"
+                onChange={(event) => setApiKey(event.target.value)}
+                onBlur={() => ai.onApiKeyBlur()}
+                placeholder={translate("rule.aiKeyPlaceholder")}
+              />
+              <button
+                className="button"
+                disabled={loadingModels || probingGeneration}
+                onClick={() => void ai.probeGeneration()}
               >
-                {AI_RULE_TIERS.map((tier) => (
-                  <option value={tier} key={tier}>{translate(`rule.aiTier.${tier}`)}</option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-          <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiProtocol")}</span>
-            <select
-              value={providerKind}
-              onChange={(event) => setProviderKind(event.target.value as AiProviderKind)}
-            >
-              <option value="openAiCompatible">{translate("rule.aiProtocolOpenAi")}</option>
-              <option value="anthropicCompatible">{translate("rule.aiProtocolAnthropic")}</option>
-            </select>
+                {loadingModels || probingGeneration
+                  ? translate("rule.aiDetecting")
+                  : translate("rule.aiDetect")}
+              </button>
+            </div>
           </label>
-          <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiProfileName")}</span>
-            <input value={providerName} onChange={(event) => setProviderName(event.target.value)} />
-          </label>
-          <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiBaseUrl")}</span>
-            <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
-          </label>
-          <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiTimeoutSeconds")}</span>
-            <input
-              type="number"
-              min={5}
-              max={120}
-              step={1}
-              value={timeoutMs / 1000}
-              onChange={(event) => {
-                if (Number.isFinite(event.target.valueAsNumber)) {
-                  setTimeoutMs(Math.round(event.target.valueAsNumber * 1000));
-                }
-              }}
-            />
-          </label>
-          <label className="ruleField">
+          <label className="ruleField ruleFieldWide">
             <span className="ruleFieldLabel">{translate("rule.aiModel")}</span>
             <div className="ruleUrlRow">
               {/* The dropdown is a convenience over the text field, not a
@@ -321,36 +329,80 @@ export function RulesDialog({
             />
           </label>
           <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiApiKey")}</span>
-            <div className="ruleUrlRow">
-              <input
-                type="password"
-                value={apiKey}
-                autoComplete="off"
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={translate("rule.aiKeyPlaceholder")}
-              />
-              <button
-                className="button"
-                disabled={testingConnection}
-                onClick={() => void ai.testConnection()}
-              >
-                {testingConnection
-                  ? translate("rule.aiConnectionTesting")
-                  : translate("rule.aiTestConnection")}
-              </button>
-              <button
-                className="button"
-                disabled={probingGeneration || !model.trim()}
-                onClick={() => void ai.probeGeneration()}
-              >
-                {probingGeneration
-                  ? translate("rule.aiProbeTesting")
-                  : translate("rule.aiProbeGeneration")}
-              </button>
-            </div>
-            <p className="ruleAdvancedHint">{translate("rule.aiConnectionVsProbeHint")}</p>
+            <span className="ruleFieldLabel">{translate("rule.aiGenerationMode")}</span>
+            <select
+              value={generationMode}
+              onChange={(event) => setGenerationMode(event.target.value as AiGenerationMode)}
+            >
+              <option value="allTiers">{translate("rule.aiGenerationModeAll")}</option>
+              <option value="singleTier">{translate("rule.aiGenerationModeSingle")}</option>
+            </select>
           </label>
+          {generationMode === "singleTier" ? (
+            <label className="ruleField">
+              <span className="ruleFieldLabel">{translate("rule.aiTargetTier")}</span>
+              <select
+                value={targetTier}
+                onChange={(event) => setTargetTier(event.target.value as AiRuleTier)}
+              >
+                {AI_RULE_TIERS.map((tier) => (
+                  <option value={tier} key={tier}>{translate(`rule.aiTier.${tier}`)}</option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+        </div>
+        <div className="ruleAiProviderAdvanced">
+          <button
+            className="ruleAdvancedToggle"
+            onClick={() => setProviderAdvancedOpen((open) => !open)}
+            aria-expanded={providerAdvancedOpen}
+          >
+            {providerAdvancedOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+            <span>{translate("rule.aiProviderAdvanced")}</span>
+          </button>
+          {providerAdvancedOpen ? (
+            <div className="ruleAiGrid">
+              <label className="ruleField">
+                <span className="ruleFieldLabel">{translate("rule.aiProtocol")}</span>
+                <select
+                  value={providerKind}
+                  onChange={(event) => setProviderKind(event.target.value as AiProviderKind)}
+                >
+                  <option value="openAiCompatible">{translate("rule.aiProtocolOpenAi")}</option>
+                  <option value="anthropicCompatible">{translate("rule.aiProtocolAnthropic")}</option>
+                </select>
+              </label>
+              <label className="ruleField">
+                <span className="ruleFieldLabel">{translate("rule.aiProfileName")}</span>
+                <input value={providerName} onChange={(event) => setProviderName(event.target.value)} />
+              </label>
+              <label className="ruleField">
+                <span className="ruleFieldLabel">{translate("rule.aiBaseUrl")}</span>
+                <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
+              </label>
+              <label className="ruleField">
+                <span className="ruleFieldLabel">{translate("rule.aiTimeoutSeconds")}</span>
+                <input
+                  type="number"
+                  min={MIN_PROVIDER_TIMEOUT_SECONDS}
+                  max={MAX_PROVIDER_TIMEOUT_SECONDS}
+                  step={1}
+                  value={timeoutMs / 1000}
+                  onChange={(event) => {
+                    if (Number.isFinite(event.target.valueAsNumber)) {
+                      const seconds = Math.min(
+                        MAX_PROVIDER_TIMEOUT_SECONDS,
+                        Math.max(MIN_PROVIDER_TIMEOUT_SECONDS, Math.round(event.target.valueAsNumber))
+                      );
+                      setTimeoutMs(seconds * 1000);
+                    }
+                  }}
+                />
+                <p className="ruleAdvancedHint">{translate("rule.aiTimeoutHint")}</p>
+              </label>
+            </div>
+          ) : null}
         </div>
         <div className="ruleActions">
           <button className="button" onClick={() => void ai.saveProvider()}>
@@ -413,7 +465,11 @@ export function RulesDialog({
           </details>
         ) : null}
         {sessionEvents.length > 0 ? (
-          <details className="ruleAiSummary">
+          <details
+            className="ruleAiSummary"
+            key={sessionEvents[0]?.at}
+            open={sessionEvents[0]?.kind === "error"}
+          >
             <summary>{translate("rule.aiSessionPanel")}</summary>
             <p className="ruleAdvancedHint">{translate("rule.aiSessionPanelHint")}</p>
             <ul className="ruleAiSessionList">

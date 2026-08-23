@@ -378,6 +378,12 @@ export interface AiProviderGenerationResponse {
   draft: AiRuleDraft;
 }
 
+export interface AiGenerationProgress {
+  elapsedMs: number;
+  outputChars: number;
+  bytesReceived: number;
+}
+
 export interface AiProviderGenerationProbeQuery {
   kind: AiProviderKind;
   baseUrl: string;

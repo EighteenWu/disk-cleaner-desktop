@@ -221,6 +221,10 @@ textarea {
   background: var(--border);
 }
 
+.workbench.noDetail {
+  grid-template-columns: 248px minmax(0, 1fr);
+}
+
 .pane {
   display: flex;
   flex-direction: column;
@@ -310,6 +314,11 @@ textarea {
 .button.large {
   height: 34px;
   padding: 0 var(--space-4);
+}
+
+.button.wide {
+  width: 100%;
+  justify-content: center;
 }
 
 .iconButton {
@@ -586,6 +595,17 @@ textarea {
   gap: var(--space-2);
 }
 
+.modeList.threeCol {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.sectionHint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .modeCard {
   height: 30px;
   border: 1px solid var(--border);
@@ -717,107 +737,187 @@ textarea {
   text-overflow: ellipsis;
 }
 
-.spaceAnalysis {
+.workbenchTabs {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-4) 0;
   border-bottom: 1px solid var(--border);
 }
 
-.spaceAnalysisHeader,
-.volumeSummaryRow,
-.inventoryToolbar,
-.inventoryRow,
-.inventoryResultsTitle {
+.spaceWorkbench {
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
 }
 
-.spaceAnalysisHeader {
+.spaceBanner {
+  display: flex;
+  align-items: flex-start;
   justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted-surface);
 }
 
-.spaceAnalysisHeader h3 {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+.spaceBanner.incomplete {
+  border-color: var(--warn-border);
+  background: var(--warn-bg);
+}
+
+.spaceBanner h3 {
   margin: 0;
   font-size: 13px;
 }
 
-.spaceAnalysisHeader p,
-.inventoryEmpty,
-.inventoryError {
+.spaceBanner p {
   margin: var(--space-1) 0 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.volumeSummaryList,
-.coverageGaps {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
+.spaceGaps {
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--warning-text);
+  font-size: 12px;
 }
 
-.volumeSummaryRow {
-  color: var(--muted);
-  font-size: 12px;
+.spaceVolumes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.spaceVolumeTop,
+.spaceToolbar,
+.spaceCrumbs,
+.spaceResultsHead,
+.spaceRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.spaceVolumeTop {
+  justify-content: space-between;
+  color: var(--foreground);
+  font-size: 13px;
   font-variant-numeric: tabular-nums;
 }
 
-.volumeSummaryRow strong {
-  color: var(--foreground);
-}
-
-.coverageGaps {
-  padding-left: var(--space-2);
-  border-left: 2px solid var(--warning);
+.spaceVolumeMeta {
+  margin: var(--space-1) 0 0;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 12px;
 }
 
-.inventoryToolbar .searchField {
+.spaceToolbar .searchField {
   flex: 1;
 }
 
-.inventoryResults {
-  max-height: 168px;
-  overflow-y: auto;
-  border-top: 1px solid var(--border);
+.spaceCrumbs {
+  flex-wrap: wrap;
+  min-height: 24px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
-.inventoryResultsTitle {
-  min-height: 28px;
+.spaceCrumbs button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+.spaceCrumbs button:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.spaceResults {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.spaceResultsHead,
+.spaceRow {
+  min-height: var(--row-height);
+  padding: 0 var(--space-3);
+}
+
+.spaceResultsHead {
+  position: sticky;
+  top: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
   color: var(--muted);
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
-.inventoryRow {
+.spaceResultsHead span:last-child,
+.spaceRowSize {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+
+.spaceRow {
   width: 100%;
-  min-height: var(--row-height);
-  padding: 0 var(--space-2);
   border: 0;
   border-top: 1px solid var(--border);
+  background: transparent;
+}
+
+.spaceRowMain {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  padding: 0;
   background: transparent;
   color: var(--foreground);
   text-align: left;
   cursor: pointer;
 }
 
-.inventoryRow:hover {
-  background: var(--muted-surface);
+.spaceRow:hover {
+  background: var(--table-hover);
+}
+
+.spaceReveal {
+  flex-shrink: 0;
 }
 
 .inventoryName {
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.inventoryEmpty,
+.inventoryError {
+  margin: var(--space-3);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.inventoryError {
+  color: var(--danger);
 }
 
 .inventoryMore {
@@ -825,13 +925,10 @@ textarea {
   justify-content: center;
 }
 
-.inventoryError {
-  color: var(--danger);
-}
-
 .filterBar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-4);
   border-bottom: 1px solid var(--border);
@@ -846,7 +943,8 @@ textarea {
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   color: var(--muted);
-  min-width: 200px;
+  min-width: 160px;
+  flex: 1 1 180px;
 }
 
 .searchField input {
@@ -1399,6 +1497,16 @@ textarea {
   color: var(--foreground);
 }
 
+.ruleFieldWide {
+  grid-column: 1 / -1;
+}
+
+.ruleAiProviderAdvanced {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
 .ruleAiSummary {
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
@@ -1796,7 +1904,8 @@ textarea {
 /* --- narrow windows ---------------------------------------------------- */
 
 @media (max-width: 1180px) {
-  .workbench {
+  .workbench,
+  .workbench.noDetail {
     grid-template-columns: 220px minmax(0, 1fr);
   }
 

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   approveAiRuleDraft,
   buildAiScanSummary,
   cancelAiRuleGeneration,
   generateAiRules,
+  listenAiGenerationProgress,
   listAiProviderModels,
   listAiProviderProfiles,
   probeAiProviderGeneration,
@@ -16,6 +17,16 @@ import {
 import { aiGenerationRequest } from "./aiGeneration";
 import { aiDraftApprovalReady, aiDraftValidationReady } from "./aiDraftWorkflow";
 import { describeProviderError, describeProviderErrorOrTimeout } from "./providerError";
+import {
+  DEFAULT_PROVIDER_TIMEOUT_MS,
+  inferVendorId,
+  pickChatModel,
+  providerDetectSavePlan,
+  shouldAutoDetectProvider,
+  shouldCreateProfileForVendor,
+  vendorPreset,
+  type ProviderVendorId
+} from "./providerPresets";
 import type { RuleSourcesState } from "./useRuleSources";
 import type {
   AiGeneratedRuleSet,
@@ -30,7 +41,17 @@ import type {
   ScanSnapshot
 } from "./types";
 
-const DEFAULT_PROVIDER_TIMEOUT_MS = 45_000;
+export { DEFAULT_PROVIDER_TIMEOUT_MS, shouldAutoDetectProvider, providerDetectSavePlan };
+export type { ProviderVendorId };
+
+const PROVIDER_DETECT_DEBOUNCE_MS = 800;
+export const MIN_PROVIDER_TIMEOUT_SECONDS = 15;
+export const MAX_PROVIDER_TIMEOUT_SECONDS = 600;
+const LEGACY_DEFAULT_TIMEOUT_MS = 45_000;
+
+function displayTimeoutMs(value: number): number {
+  return value === LEGACY_DEFAULT_TIMEOUT_MS ? DEFAULT_PROVIDER_TIMEOUT_MS : value;
+}
 export const MAX_AI_SESSION_EVENTS = 10;
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
@@ -39,6 +60,8 @@ export interface AiRuleGenerationState {
   profiles: AiProviderProfile[];
   selectedProfileId: string;
   setSelectedProfileId: (value: string) => void;
+  vendorId: ProviderVendorId;
+  setVendorId: (value: ProviderVendorId) => void;
   providerKind: AiProviderKind;
   setProviderKind: (value: AiProviderKind) => void;
   providerName: string;
@@ -71,6 +94,7 @@ export interface AiRuleGenerationState {
   loadModels: () => Promise<void>;
   testConnection: () => Promise<void>;
   probeGeneration: () => Promise<void>;
+  onApiKeyBlur: () => void;
   saveProvider: () => Promise<void>;
   preparePreview: (snapshot: ScanSnapshot | null, ready: boolean) => Promise<void>;
   generate: () => Promise<void>;
@@ -99,20 +123,24 @@ export function pushSessionEvent(
 
 export function useAiRuleGeneration(
   rules: RuleSourcesState,
-  translate: Translate
+  translate: Translate,
+  onLog?: (title: string, message: string, detail?: string) => void
 ): AiRuleGenerationState {
   const [profiles, setProfiles] = useState<AiProviderProfile[]>([]);
   const [selectedProfileIdValue, setSelectedProfileIdValue] = useState("");
-  const [providerKind, setProviderKind] = useState<AiProviderKind>("openAiCompatible");
-  const [providerName, setProviderName] = useState("OpenAI compatible");
-  const [baseUrl, setBaseUrl] = useState("https://api.openai.com");
-  const [timeoutMs, setTimeoutMs] = useState(DEFAULT_PROVIDER_TIMEOUT_MS);
+  const [vendorId, setVendorIdValue] = useState<ProviderVendorId>("custom");
+  const [providerKind, setProviderKindValue] = useState<AiProviderKind>("openAiCompatible");
+  const [providerName, setProviderName] = useState("");
+  const [baseUrl, setBaseUrlValue] = useState("");
+  const [timeoutMs, setTimeoutMsValue] = useState(DEFAULT_PROVIDER_TIMEOUT_MS);
   const [model, setModel] = useState("");
-  const [apiKey, setApiKey] = useState("");
+  const [apiKey, setApiKeyValue] = useState("");
   const [models, setModels] = useState<AiProviderModel[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   const [testingConnection, setTestingConnection] = useState(false);
   const [probingGeneration, setProbingGeneration] = useState(false);
+  const detectGeneration = useRef(0);
+  const lastAutoDetectKey = useRef("");
   const [summary, setSummary] = useState<RedactedScanSummary | null>(null);
   const [generationMode, setGenerationModeValue] = useState<AiGenerationMode>("allTiers");
   const [targetTierValue, setTargetTierValue] = useState<AiRuleTier>("light");
@@ -130,7 +158,11 @@ export function useAiRuleGeneration(
       .then((items) => {
         if (disposed) return;
         setProfiles(items);
-        if (items.length > 0) setSelectedProfileIdValue((current) => current || items[0].id);
+        if (items.length > 0) {
+          const profile = items[0];
+          setSelectedProfileIdValue((current) => current || profile.id);
+          applyProfileFields(profile);
+        }
       })
       .catch((error) => {
         if (!disposed) setMessage(describeProviderError(error, translate));
@@ -140,8 +172,46 @@ export function useAiRuleGeneration(
     };
   }, [translate]);
 
+  function bumpDetect() {
+    detectGeneration.current += 1;
+    lastAutoDetectKey.current = "";
+  }
+
+  function setApiKey(value: string) {
+    bumpDetect();
+    setApiKeyValue(value);
+  }
+
+  function setBaseUrl(value: string) {
+    bumpDetect();
+    setBaseUrlValue(value);
+  }
+
+  function setProviderKind(value: AiProviderKind) {
+    bumpDetect();
+    setProviderKindValue(value);
+  }
+
+  function setTimeoutMs(value: number) {
+    bumpDetect();
+    setTimeoutMsValue(value);
+  }
+
+  // Auto-detect on typed key + endpoint only. Model is chosen inside detectReady.
+  useEffect(() => {
+    if (!shouldAutoDetectProvider(apiKey) || !baseUrl.trim()) return;
+    const timer = window.setTimeout(() => {
+      void detectReady("auto");
+    }, PROVIDER_DETECT_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [apiKey, baseUrl, providerKind, vendorId, selectedProfileIdValue, timeoutMs]);
+
   function recordSession(event: Omit<AiSessionEvent, "at"> & { at?: string }) {
     setSessionEvents((current) => pushSessionEvent(current, event));
+  }
+
+  function logOperation(title: string, message: string, detail?: string) {
+    onLog?.(title, message, detail);
   }
 
   function clearPreparedDraft() {
@@ -151,17 +221,41 @@ export function useAiRuleGeneration(
     setDraftEditorDirty(false);
   }
 
+  function applyProfileFields(profile: AiProviderProfile) {
+    setProviderKindValue(profile.kind);
+    setProviderName(profile.displayName);
+    setBaseUrlValue(profile.baseUrl);
+    setTimeoutMsValue(displayTimeoutMs(profile.timeoutMs));
+    setModel(profile.model);
+    setVendorIdValue(inferVendorId(profile.kind, profile.baseUrl));
+  }
+
   function setSelectedProfileId(value: string) {
+    bumpDetect();
     setSelectedProfileIdValue(value);
     clearPreparedDraft();
     const profile = profiles.find((item) => item.id === value);
-    if (profile) {
-      setProviderKind(profile.kind);
-      setProviderName(profile.displayName);
-      setBaseUrl(profile.baseUrl);
-      setTimeoutMs(profile.timeoutMs);
-      setModel(profile.model);
+    if (profile) applyProfileFields(profile);
+  }
+
+  function setVendorId(value: ProviderVendorId) {
+    bumpDetect();
+    setVendorIdValue(value);
+    const selected = profiles.find((item) => item.id === selectedProfileIdValue);
+    if (shouldCreateProfileForVendor(value, selected)) {
+      setSelectedProfileIdValue("");
     }
+    const preset = vendorPreset(value);
+    if (value === "custom") {
+      return;
+    }
+    setProviderKindValue(preset.kind);
+    setProviderName(translate(preset.labelKey));
+    setBaseUrlValue(preset.baseUrl);
+    setTimeoutMsValue(preset.timeoutMs);
+    setModel(preset.recommendedModel ?? "");
+    setModels([]);
+    clearPreparedDraft();
   }
 
   function setGenerationMode(value: AiGenerationMode) {
@@ -186,7 +280,9 @@ export function useAiRuleGeneration(
       });
       setModels(items);
       setMessage(translate("rule.aiModelsLoaded", { count: items.length }));
-      if (!model && items.length > 0) setModel(items[0].id);
+      if (!model && items.length > 0) {
+        setModel(pickChatModel(items, vendorPreset(vendorId).recommendedModel));
+      }
     } catch (error) {
       setModels([]);
       setMessage(describeProviderError(error, translate));
@@ -215,32 +311,128 @@ export function useAiRuleGeneration(
     }
   }
 
-  async function probeGeneration() {
-    if (!model.trim()) {
-      setMessage(translate("rule.aiProbeNeedsModel"));
+  async function persistProvider(nextModel: string, typedKey: string, saveCredential: boolean) {
+    const id = selectedProfileIdValue || crypto.randomUUID();
+    const preset = vendorPreset(vendorId);
+    const displayName = providerName.trim() || translate(preset.labelKey);
+    if (!providerName.trim()) setProviderName(displayName);
+    await saveAiProviderProfile({
+      id,
+      kind: providerKind,
+      displayName,
+      baseUrl,
+      model: nextModel,
+      timeoutMs,
+      credentialPresent: false
+    });
+    if (saveCredential && typedKey) {
+      await saveAiProviderCredential(id, typedKey);
+      setApiKeyValue("");
+    }
+    const next = await listAiProviderProfiles();
+    setProfiles(next);
+    setSelectedProfileIdValue(id);
+    clearPreparedDraft();
+    return id;
+  }
+
+  async function detectReady(reason: "auto" | "explicit") {
+    const typedKey = apiKey.trim();
+    if (reason === "auto" && !shouldAutoDetectProvider(typedKey)) {
       return;
     }
+    if (!typedKey && !selectedProfileIdValue) {
+      if (reason === "explicit") setMessage(translate("rule.aiDetectNeedsKey"));
+      return;
+    }
+    if (!baseUrl.trim()) {
+      if (reason === "explicit") setMessage(translate("rule.aiDetectNeedsUrl"));
+      return;
+    }
+    if (reason === "auto") {
+      const autoFingerprint = `${typedKey}|${providerKind}|${baseUrl}|${selectedProfileIdValue}|${timeoutMs}`;
+      if (lastAutoDetectKey.current === autoFingerprint) {
+        return;
+      }
+      lastAutoDetectKey.current = autoFingerprint;
+    }
+
+    const generation = ++detectGeneration.current;
+    setLoadingModels(true);
     setProbingGeneration(true);
+    setMessage(translate("rule.aiDetecting"));
     const started = performance.now();
+    const preset = vendorPreset(vendorId);
     try {
+      let items: AiProviderModel[] = [];
+      try {
+        items = await listAiProviderModels({
+          kind: providerKind,
+          baseUrl,
+          timeoutMs,
+          profileId: selectedProfileIdValue || null,
+          apiKey: typedKey || null
+        });
+      } catch (error) {
+        if (generation !== detectGeneration.current) return;
+        setModels([]);
+        const text = translate("rule.aiModelsFailed", {
+          detail: describeProviderError(error, translate)
+        });
+        setMessage(text);
+        recordSession({
+          kind: "error",
+          model: model.trim() || undefined,
+          message: text
+        });
+        logOperation(translate("rule.aiProbeFailedLog"), text, undefined);
+        return;
+      }
+      if (generation !== detectGeneration.current) return;
+      setModels(items);
+
+      const recommended = preset.recommendedModel;
+      const chosen =
+        reason === "explicit" && model.trim()
+          ? model.trim()
+          : pickChatModel(items, recommended);
+      if (chosen) setModel(chosen);
+      if (!chosen) {
+        setMessage(translate("rule.aiProbeNeedsModel"));
+        return;
+      }
+
       const result = await probeAiProviderGeneration({
         kind: providerKind,
         baseUrl,
         timeoutMs,
-        model: model.trim(),
+        model: chosen,
         profileId: selectedProfileIdValue || null,
-        apiKey: apiKey.trim() || null
+        apiKey: typedKey || null
       });
-      const latencyMs = result.latencyMs;
-      const text = translate("rule.aiProbeSucceeded", { ms: latencyMs });
+      if (generation !== detectGeneration.current) return;
+      if (!result.ok) {
+        throw {
+          category: "invalidSchema",
+          message: translate("rule.aiError.invalidSchema"),
+          retryAfterSeconds: null
+        };
+      }
+      const plan = providerDetectSavePlan(result.ok, typedKey);
+      if (plan.saveProfile) {
+        await persistProvider(chosen, typedKey, plan.saveCredential);
+      }
+      const text = translate("rule.aiReady", { id: chosen, ms: result.latencyMs });
       setMessage(text);
       recordSession({
         kind: "probe",
-        model: model.trim(),
-        latencyMs,
+        model: chosen,
+        latencyMs: result.latencyMs,
         message: text
       });
+      logOperation(translate("rule.aiProbeLog"), text, chosen);
     } catch (error) {
+      if (generation !== detectGeneration.current) return;
       const elapsed = Math.round(performance.now() - started);
       const text = describeProviderErrorOrTimeout(
         error,
@@ -253,35 +445,32 @@ export function useAiRuleGeneration(
       setMessage(text);
       recordSession({
         kind: "error",
-        model: model.trim(),
+        model: model.trim() || undefined,
         latencyMs: elapsed,
         message: text
       });
+      logOperation(translate("rule.aiProbeFailedLog"), text, model.trim() || undefined);
     } finally {
-      setProbingGeneration(false);
+      if (generation === detectGeneration.current) {
+        setLoadingModels(false);
+        setProbingGeneration(false);
+      }
+    }
+  }
+
+  async function probeGeneration() {
+    await detectReady("explicit");
+  }
+
+  function onApiKeyBlur() {
+    if (shouldAutoDetectProvider(apiKey)) {
+      void detectReady("auto");
     }
   }
 
   async function saveProvider() {
-    const id = selectedProfileIdValue || crypto.randomUUID();
     try {
-      await saveAiProviderProfile({
-        id,
-        kind: providerKind,
-        displayName: providerName,
-        baseUrl,
-        model,
-        timeoutMs,
-        credentialPresent: false
-      });
-      if (apiKey.trim()) {
-        await saveAiProviderCredential(id, apiKey.trim());
-        setApiKey("");
-      }
-      const next = await listAiProviderProfiles();
-      setProfiles(next);
-      setSelectedProfileIdValue(id);
-      clearPreparedDraft();
+      await persistProvider(model, apiKey.trim(), Boolean(apiKey.trim()));
       setMessage(translate("rule.aiProviderSaved"));
     } catch (error) {
       setMessage(describeProviderError(error, translate));
@@ -323,7 +512,16 @@ export function useAiRuleGeneration(
     setGenerating(true);
     setDraft(null);
     const started = performance.now();
+    let unlistenProgress: (() => void) | undefined;
     try {
+      unlistenProgress = await listenAiGenerationProgress((progress) => {
+        setMessage(
+          translate("rule.aiGeneratingProgress", {
+            chars: progress.outputChars,
+            seconds: Math.max(1, Math.round(progress.elapsedMs / 1000))
+          })
+        );
+      });
       const request = aiGenerationRequest(
         summary,
         generationMode,
@@ -345,6 +543,11 @@ export function useAiRuleGeneration(
         ruleCount: response.draft.rules.rules.length,
         message: text
       });
+      logOperation(
+        translate("rule.aiGeneratedLog"),
+        text,
+        [response.draft.model, `${elapsed} ms`].filter(Boolean).join(" · ")
+      );
     } catch (error) {
       const elapsed = Math.round(performance.now() - started);
       const text = describeProviderErrorOrTimeout(
@@ -364,7 +567,13 @@ export function useAiRuleGeneration(
         latencyMs: elapsed,
         message: text
       });
+      logOperation(
+        translate("rule.aiGenerateFailedLog"),
+        text,
+        [model.trim(), `${elapsed} ms`].filter(Boolean).join(" · ") || undefined
+      );
     } finally {
+      unlistenProgress?.();
       setGenerating(false);
     }
   }
@@ -422,6 +631,8 @@ export function useAiRuleGeneration(
     profiles,
     selectedProfileId: selectedProfileIdValue,
     setSelectedProfileId,
+    vendorId,
+    setVendorId,
     providerKind,
     setProviderKind,
     providerName,
@@ -454,6 +665,7 @@ export function useAiRuleGeneration(
     loadModels,
     testConnection,
     probeGeneration,
+    onApiKeyBlur,
     saveProvider,
     preparePreview,
     generate,

@@ -34,6 +34,7 @@ use inventory_repository::InventoryRepository;
 
 const CLEANUP_PROGRESS_EVENT: &str = "cleanup-progress";
 const SCAN_PROGRESS_EVENT: &str = "scan-progress";
+const AI_GENERATION_PROGRESS_EVENT: &str = "ai-generation-progress";
 
 #[derive(Default)]
 struct RuleLibraryWriteControl(tokio::sync::Mutex<()>);
@@ -903,11 +904,15 @@ async fn generate_ai_rules(
             message,
             retry_after_seconds: None,
         })?;
+    let app_for_progress = app.clone();
     let result = tokio::select! {
         result = ai_provider::generate_rules(
             &profile,
             &request,
             &credentials::WindowsCredentialStore,
+            |progress| {
+                let _ = app_for_progress.emit(AI_GENERATION_PROGRESS_EVENT, &progress);
+            },
         ) => result,
         _ = token.cancelled() => Err(ProviderError {
             category: ProviderErrorCategory::Cancelled,

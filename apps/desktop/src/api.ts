@@ -12,6 +12,7 @@ import type {
   AiProviderGenerationResponse,
   AiProviderGenerationProbeQuery,
   AiProviderGenerationProbeResult,
+  AiGenerationProgress,
   AiProviderConnectionResult,
   AiProviderModelQuery,
   AiProviderProfile,
@@ -45,6 +46,7 @@ import {
 
 const CLEANUP_PROGRESS_EVENT = "cleanup-progress";
 const SCAN_PROGRESS_EVENT = "scan-progress";
+const AI_GENERATION_PROGRESS_EVENT = "ai-generation-progress";
 const MAX_RULE_SUBSCRIPTION_BYTES = 4 * 1024 * 1024;
 
 export interface RuleSubscriptionLoadResult {
@@ -337,6 +339,18 @@ export async function listenScanProgress(
   }
 
   return await listen<ScanProgress>(SCAN_PROGRESS_EVENT, (event) => handler(event.payload));
+}
+
+export async function listenAiGenerationProgress(
+  handler: (progress: AiGenerationProgress) => void
+): Promise<() => void> {
+  if (!hasTauriRuntime()) {
+    return () => {};
+  }
+
+  return await listen<AiGenerationProgress>(AI_GENERATION_PROGRESS_EVENT, (event) =>
+    handler(event.payload)
+  );
 }
 
 function hasTauriRuntime(): boolean {
