@@ -7,8 +7,10 @@ import {
   MIN_PROVIDER_TIMEOUT_SECONDS,
   providerDetectSavePlan,
   pushSessionEvent,
-  shouldAutoDetectProvider
+  shouldAutoDetectProvider,
+  shouldQueueProviderDetect
 } from "./useAiRuleGeneration";
+import { nextInputValueFromPaste } from "./providerPresets";
 import type { AiSessionEvent } from "./types";
 
 describe("provider timeout defaults", () => {
@@ -24,6 +26,19 @@ describe("provider auto-detect guards", () => {
     expect(shouldAutoDetectProvider("")).toBe(false);
     expect(shouldAutoDetectProvider("  ")).toBe(false);
     expect(shouldAutoDetectProvider("sk-live")).toBe(true);
+  });
+
+  it("does not queue detect on each keystroke; paste is deferred until after commit", () => {
+    expect(shouldQueueProviderDetect("change", "sk-live")).toBe(false);
+    expect(shouldQueueProviderDetect("paste", "")).toBe(false);
+    expect(shouldQueueProviderDetect("paste", "sk-live")).toBe(true);
+    expect(shouldQueueProviderDetect("blur", "sk-live")).toBe(true);
+    expect(shouldQueueProviderDetect("explicit", "")).toBe(true);
+  });
+
+  it("computes the field value after a paste into a selection", () => {
+    expect(nextInputValueFromPaste("", null, null, "sk-live")).toBe("sk-live");
+    expect(nextInputValueFromPaste("sk-old", 3, 6, "new")).toBe("sk-new");
   });
 
   it("does not save a new profile or credential after a failed probe", () => {

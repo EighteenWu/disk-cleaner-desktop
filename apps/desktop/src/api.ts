@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
-import { mockChildren, mockCleanupPlan, mockCleanupReport, mockSnapshot } from "./mockData";
+import { mockChildren, mockCleanupPlan, mockCleanupReport, mockInventoryItems, mockSnapshot } from "./mockData";
 import type {
   AdminStatus,
   ActiveRuleSnapshot,
@@ -12,6 +12,8 @@ import type {
   AiProviderGenerationResponse,
   AiProviderGenerationProbeQuery,
   AiProviderGenerationProbeResult,
+  AiProviderPlanRequest,
+  AiProviderPlanResponse,
   AiGenerationProgress,
   AiProviderConnectionResult,
   AiProviderModelQuery,
@@ -24,9 +26,9 @@ import type {
   CleanupProgress,
   CleanupReport,
   DeleteStrategy,
-  AppLogEntry,
   InventoryPage,
   InventorySort,
+  AppLogEntry,
   RuleCompilation,
   RuleLibraryLoadResult,
   RuleLibraryMutationRequest,
@@ -95,13 +97,59 @@ export async function runScan(request: ScanRequest): Promise<ScanSnapshot> {
   try {
     return await invoke<ScanSnapshot>("run_scan", { request });
   } catch {
+    const volumes = mockSnapshot.volumes.map((volume) => ({
+      ...volume,
+      selected: request.volumeIds.length === 0 || request.volumeIds.includes(volume.id)
+    }));
+    const selected = volumes.filter((volume) => volume.selected);
     return {
       ...mockSnapshot,
-      volumes: mockSnapshot.volumes.map((volume) => ({
-        ...volume,
-        selected: request.volumeIds.length === 0 || request.volumeIds.includes(volume.id)
-      })),
-      scanBackend: request.mode === "full" ? "mock-full" : "mock-quick"
+      volumes,
+      scanBackend: request.mode === "full" ? "mock-full" : "mock-quick",
+      scanSessionId: request.mode === "full" ? "mock-full-session" : null,
+      coverage:
+        request.mode === "full"
+          ? {
+              status: "partial",
+              visitedEntries: 184320,
+              indexedEntries: 183901,
+              logicalBytes: 286 * 1024 * 1024 * 1024,
+              allocatedBytes: 312 * 1024 * 1024 * 1024,
+              volumes: selected.map((volume) => ({
+                volumeId: volume.id,
+                backend: "mock-full",
+                status: "partial" as const,
+                visitedEntries: 92160,
+                indexedEntries: 91950,
+                logicalBytes: 143 * 1024 * 1024 * 1024,
+                allocatedBytes: 156 * 1024 * 1024 * 1024,
+                gaps: [
+                  {
+                    volumeId: volume.id,
+                    reason: "accessDenied" as const,
+                    count: 12
+                  }
+                ]
+              })),
+              gaps: selected.map((volume) => ({
+                volumeId: volume.id,
+                reason: "accessDenied" as const,
+                count: 12
+              }))
+            }
+          : mockSnapshot.coverage,
+      spaceSummary:
+        request.mode === "full"
+          ? selected.map((volume) => ({
+              volumeId: volume.id,
+              logicalBytes: 143 * 1024 * 1024 * 1024,
+              allocatedBytes: 156 * 1024 * 1024 * 1024,
+              fileCount: 80000,
+              directoryCount: 12000,
+              analysisOnlyCount: 400,
+              blockedCount: 80
+            }))
+          : []
     };
   }
 }
@@ -120,6 +168,72 @@ export async function resumeScan(): Promise<void> {
   }
 
   await invoke("resume_scan");
+}
+
+export async function listInventoryChildren(
+  scanSessionId: string,
+  parentEntryId: string | null,
+  cursor: string | null = null,
+  limit = 100,
+  sort: InventorySort = "allocatedBytes"
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    return { items: mockInventoryItems, nextCursor: null };
+  }
+
+  return await invoke<InventoryPage>("list_inventory_children", {
+    scanSessionId,
+    parentEntryId,
+    cursor,
+    limit,
+    sort
+  });
+}
+
+export async function searchInventory(
+  scanSessionId: string,
+  query: string,
+  cursor: string | null = null,
+  limit = 100
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    const needle = query.trim().toLowerCase();
+    return {
+      items: mockInventoryItems.filter((item) => item.name.toLowerCase().includes(needle)),
+      nextCursor: null
+    };
+  }
+
+  return await invoke<InventoryPage>("search_inventory", {
+    scanSessionId,
+    query,
+    cursor,
+    limit
+  });
+}
+
+export async function listInventoryLargest(
+  scanSessionId: string,
+  cursor: string | null = null,
+  limit = 100
+): Promise<InventoryPage> {
+  if (!hasTauriRuntime()) {
+    return { items: mockInventoryItems, nextCursor: null };
+  }
+
+  return await invoke<InventoryPage>("list_inventory_largest", {
+    scanSessionId,
+    cursor,
+    limit
+  });
+}
+
+export async function closeInventorySession(scanSessionId: string): Promise<void> {
+  if (!hasTauriRuntime()) {
+    return;
+  }
+
+  await invoke("close_inventory_session", { scanSessionId });
 }
 
 export async function notifyScanComplete(title: string, body: string): Promise<boolean> {
@@ -151,64 +265,6 @@ export async function listCandidateChildren(candidate: CleanupCandidate): Promis
   } catch {
     return candidate.id === "chrome-cache" ? mockChildren : [];
   }
-}
-
-export async function listInventoryChildren(
-  scanSessionId: string,
-  parentEntryId: string | null,
-  cursor: string | null = null,
-  limit = 100,
-  sort: InventorySort = "name"
-): Promise<InventoryPage> {
-  if (!hasTauriRuntime()) {
-    return { items: [], nextCursor: null };
-  }
-  return await invoke<InventoryPage>("list_inventory_children", {
-    scanSessionId,
-    parentEntryId,
-    cursor,
-    limit,
-    sort
-  });
-}
-
-export async function searchInventory(
-  scanSessionId: string,
-  query: string,
-  cursor: string | null = null,
-  limit = 100
-): Promise<InventoryPage> {
-  if (!hasTauriRuntime()) {
-    return { items: [], nextCursor: null };
-  }
-  return await invoke<InventoryPage>("search_inventory", {
-    scanSessionId,
-    query,
-    cursor,
-    limit
-  });
-}
-
-export async function listInventoryLargest(
-  scanSessionId: string,
-  cursor: string | null = null,
-  limit = 100
-): Promise<InventoryPage> {
-  if (!hasTauriRuntime()) {
-    return { items: [], nextCursor: null };
-  }
-  return await invoke<InventoryPage>("list_inventory_largest", {
-    scanSessionId,
-    cursor,
-    limit
-  });
-}
-
-export async function closeInventorySession(scanSessionId: string): Promise<void> {
-  if (!hasTauriRuntime()) {
-    return;
-  }
-  await invoke("close_inventory_session", { scanSessionId });
 }
 
 export async function previewCleanupPlan(candidates: CleanupCandidate[], selectedIds: string[]): Promise<CleanupPlan> {
@@ -671,6 +727,13 @@ export async function generateAiRules(
   request: AiProviderGenerationRequest
 ): Promise<AiProviderGenerationResponse> {
   return await invoke<AiProviderGenerationResponse>("generate_ai_rules", { profileId, request });
+}
+
+export async function generateAiRulePlan(
+  profileId: string,
+  request: AiProviderPlanRequest
+): Promise<AiProviderPlanResponse> {
+  return await invoke<AiProviderPlanResponse>("generate_ai_rule_plan", { profileId, request });
 }
 
 export async function cancelAiRuleGeneration(): Promise<void> {

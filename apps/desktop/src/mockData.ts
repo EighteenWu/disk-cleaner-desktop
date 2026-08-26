@@ -1,4 +1,11 @@
-import type { CleanupCandidate, CleanupPlan, CleanupReport, ScanSnapshot, SourceInfo } from "./types";
+import type {
+  CleanupCandidate,
+  CleanupPlan,
+  CleanupReport,
+  InventoryQueryItem,
+  ScanSnapshot,
+  SourceInfo
+} from "./types";
 
 const MiB = 1024 * 1024;
 const GiB = 1024 * MiB;
@@ -169,6 +176,48 @@ export const mockSnapshot: ScanSnapshot = {
   },
   spaceSummary: []
 };
+
+export const mockInventoryItems: InventoryQueryItem[] = [
+  {
+    entryId: "users",
+    parentEntryId: null,
+    volumeId: "C",
+    name: "Users",
+    path: "C:\\Users",
+    objectType: "directory",
+    logicalBytes: 86 * GiB,
+    allocatedBytes: 88 * GiB,
+    disposition: "analysisOnly",
+    allocationOwner: true,
+    hasChildren: true
+  },
+  {
+    entryId: "windows",
+    parentEntryId: null,
+    volumeId: "C",
+    name: "Windows",
+    path: "C:\\Windows",
+    objectType: "directory",
+    logicalBytes: 42 * GiB,
+    allocatedBytes: 48 * GiB,
+    disposition: "blocked",
+    allocationOwner: true,
+    hasChildren: true
+  },
+  {
+    entryId: "temp-file",
+    parentEntryId: null,
+    volumeId: "C",
+    name: "setup.tmp",
+    path: "C:\\Windows\\Temp\\setup.tmp",
+    objectType: "file",
+    logicalBytes: 512 * MiB,
+    allocatedBytes: 512 * MiB,
+    disposition: "normal",
+    allocationOwner: true,
+    hasChildren: false
+  }
+];
 
 export const mockChildren: CleanupCandidate[] = [
   {

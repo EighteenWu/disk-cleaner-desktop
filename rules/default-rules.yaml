@@ -1,7 +1,8 @@
 version: 1
 name: DiskClean built-in rule library
 publisher: DiskClean
-updated_at: 2026-07-26
+updated_at: 2026-08-23
+# 简单=推荐清理；中度=谨慎清理；深度=需要确认。回收站在简单档列出但不默认勾选。
 rules:
   # ---------------------------------------------------------------- 临时文件
   - id: windows.user.temp
@@ -40,13 +41,46 @@ rules:
     keep_days: 3
     note: 系统内嵌网页组件（帮助页、部分软件的登录窗口）下载的网页图片和脚本缓存。删除后这些页面下次打开会重新联网加载，不会丢登录状态。
 
-  # ---------------------------------------------------------------- Windows 更新
+  - id: windows.recycle.bin
+    name: 回收站
+    app: Windows
+    category: 回收站
+    level: 推荐清理
+    default: false
+    paths:
+      - "%SYSTEMDRIVE%\\$Recycle.Bin"
+    clean: contents
+    keep_days: 7
+    note: 清空回收站是永久删除，无法再从回收站还原。本规则只清理进站超过 7 天的项目。简单档会列出这一项，但不会默认勾选，需要你确认后再清。
+
+  - id: user.downloads.installers
+    name: 下载目录中的旧安装包
+    app: Windows
+    category: 未安装包
+    level: 推荐清理
+    default: true
+    paths:
+      - "%USERPROFILE%\\Downloads\\*.exe"
+      - "%USERPROFILE%\\Downloads\\*.msi"
+      - "%USERPROFILE%\\Downloads\\*.iso"
+      - "%USERPROFILE%\\Downloads\\*.apk"
+      - "%USERPROFILE%\\Downloads\\*.msix"
+      - "%USERPROFILE%\\下载\\*.exe"
+      - "%USERPROFILE%\\下载\\*.msi"
+      - "%USERPROFILE%\\下载\\*.iso"
+      - "%USERPROFILE%\\下载\\*.apk"
+      - "%USERPROFILE%\\下载\\*.msix"
+    clean: files
+    keep_days: 14
+    note: 只删除下载目录里超过 14 天未改动的安装包和镜像，不动照片、文档、压缩包和普通文件。若你还打算安装这些程序，请先取消勾选。
+
+  # ---------------------------------------------------------------- Windows 更新残留（深度）
   - id: windows.update.download
     name: Windows 更新安装包
     app: Windows Update
     category: Windows 更新缓存
-    level: 推荐清理
-    default: true
+    level: 需要确认
+    default: false
     paths:
       - "%WINDIR%\\SoftwareDistribution\\Download"
     clean: contents
@@ -57,8 +91,8 @@ rules:
     name: Windows 更新分发缓存
     app: Windows Update
     category: Windows 更新缓存
-    level: 推荐清理
-    default: true
+    level: 需要确认
+    default: false
     paths:
       - "%WINDIR%\\ServiceProfiles\\NetworkService\\AppData\\Local\\Microsoft\\Windows\\DeliveryOptimization"
     clean: contents
@@ -82,13 +116,15 @@ rules:
     name: 缩略图与图标缓存
     app: Windows 资源管理器
     category: Windows 缓存
-    level: 谨慎清理
-    default: false
+    level: 推荐清理
+    default: true
     paths:
-      - "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer"
-    clean: contents
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\thumbcache_*.db"
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\iconcache_*.db"
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer\\iconcache.db"
+    clean: files
     keep_days: 0
-    note: 图片、视频的预览小图和程序图标缓存，损坏时会出现图标变白、缩略图错乱。删除后系统会自动重建，代价是打开图片多的文件夹时第一次会慢一点，图标可能要重启资源管理器才恢复正常。
+    note: 图片、视频的预览小图和程序图标缓存文件，损坏时会出现图标变白、缩略图错乱。删除后系统会自动重建，代价是打开图片多的文件夹时第一次会慢一点，图标可能要重启资源管理器才恢复正常。
 
   - id: windows.font.cache
     name: 字体缓存
@@ -106,8 +142,8 @@ rules:
     name: DirectX 着色器缓存
     app: DirectX
     category: Windows 缓存
-    level: 推荐清理
-    default: true
+    level: 谨慎清理
+    default: false
     paths:
       - "%LOCALAPPDATA%\\D3DSCache"
     clean: contents
@@ -118,8 +154,8 @@ rules:
     name: 显卡驱动着色器缓存
     app: NVIDIA / AMD
     category: Windows 缓存
-    level: 推荐清理
-    default: true
+    level: 谨慎清理
+    default: false
     paths:
       - "%LOCALAPPDATA%\\NVIDIA\\DXCache"
       - "%LOCALAPPDATA%\\NVIDIA\\GLCache"
@@ -138,9 +174,10 @@ rules:
     default: true
     paths:
       - "%LOCALAPPDATA%\\CrashDumps"
+      - "%WINDIR%\\Minidump"
     clean: contents
     keep_days: 7
-    note: 程序崩溃时保存的内存快照，单个文件常有几百 MB。这些只给开发者排查崩溃用，普通使用完全不需要，删除不影响任何程序。
+    note: 程序崩溃时保存的内存快照，单个文件常有几百 MB。这些只给开发者排查崩溃用，普通使用完全不需要，删除不影响任何程序。系统 Minidump 需要管理员权限，没有权限的项会自动跳过。
 
   - id: windows.error.reporting
     name: Windows 错误报告队列
@@ -159,13 +196,15 @@ rules:
     name: 系统组件安装日志
     app: Windows
     category: Windows 日志文件
-    level: 谨慎清理
+    level: 需要确认
     default: false
     paths:
       - "%WINDIR%\\Logs\\CBS"
+      - "%WINDIR%\\Logs\\DISM"
+      - "%WINDIR%\\Panther"
     clean: contents
     keep_days: 30
-    note: 系统更新和组件修复的过程日志，长期使用会累积到几百 MB。删除不影响系统运行，但如果近期出现过更新失败、正在排查问题，建议先留着。需要管理员权限。
+    note: 系统更新、组件修复和安装过程日志。删除不影响系统运行；如果最近更新失败、正在排查问题，建议先留着。需要管理员权限。
 
   - id: windows.prefetch.review
     name: 预读取（Prefetch）数据
@@ -578,8 +617,8 @@ rules:
     name: Discord 缓存
     app: Discord
     category: 应用缓存
-    level: 推荐清理
-    default: true
+    level: 谨慎清理
+    default: false
     paths:
       - "%APPDATA%\\discord\\Cache"
       - "%APPDATA%\\discord\\Code Cache"
@@ -650,18 +689,317 @@ rules:
     close:
       - steam.exe
 
+  - id: office.file.cache
+    name: Microsoft Office 文档缓存
+    app: Microsoft Office
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Microsoft\\Office\\*\\OfficeFileCache"
+      - "%LOCALAPPDATA%\\Microsoft\\Windows\\INetCache\\Content.MSO"
+    clean: contents
+    keep_days: 7
+    note: Office 文档缓存和嵌入预览，正在编辑的文档不受影响，但云文档离线副本和下次打开大文档会重新下载或重新生成预览。请先关闭 Word、Excel、PowerPoint。
+    close:
+      - WINWORD.EXE
+      - EXCEL.EXE
+      - POWERPNT.EXE
+
+  - id: wps.office.cache
+    name: WPS 缓存
+    app: WPS Office
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Kingsoft\\office6\\cache"
+      - "%LOCALAPPDATA%\\Kingsoft\\WPS Cloud Files\\userdata\\qing\\filecache"
+    clean: contents
+    keep_days: 7
+    note: WPS 明确缓存目录，删除不影响已保存的文档，但模板预览和云文档缓存需要重新加载。请先关闭 WPS。
+    close:
+      - wps.exe
+
   - id: wechat.file.cache.review
-    name: 微信文件缓存
+    name: 微信图片与视频缓存
     app: 微信
     category: 应用缓存
-    level: 需要确认
+    level: 谨慎清理
     default: false
     paths:
       - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Cache"
       - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Video"
       - "%DOCUMENTS%\\WeChat Files\\*\\FileStorage\\Image"
     clean: contents
-    keep_days: 60
-    note: 微信自动下载的图片、视频和临时文件，长期使用常有几十 GB。注意：聊天里收到的图片和视频删掉后，如果对方已过期或撤回就再也点不开了，只有服务器还留着的才能重新下载。文档和收到的文件不在清理范围内。请先退出微信。
+    keep_days: 30
+    note: 微信自动下载的图片、视频和临时文件，长期使用常有几十 GB。只清 30 天前的缓存，不含聊天记录和接收的文件。过期或已撤回的媒体删后可能无法再打开。请先退出微信。
     close:
       - WeChat.exe
+
+  - id: qq.media.cache.review
+    name: QQ 图片视频缓存
+    app: QQ
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%DOCUMENTS%\\Tencent Files\\*\\Image"
+      - "%DOCUMENTS%\\Tencent Files\\*\\Video"
+      - "%DOCUMENTS%\\Tencent Files\\*\\Cache"
+      - "%DOCUMENTS%\\Tencent Files\\*\\nt_qq\\nt_data\\Pic"
+      - "%DOCUMENTS%\\Tencent Files\\*\\nt_qq\\nt_data\\Video"
+      - "%DOCUMENTS%\\Tencent Files\\*\\nt_qq\\nt_data\\Emoji"
+    clean: contents
+    keep_days: 30
+    note: QQ 自动下载的图片、视频和缓存，不含文件接收目录。只清 30 天前的项目；过期媒体删后可能无法再打开。请先退出 QQ。
+    close:
+      - QQ.exe
+      - QQNT.exe
+
+  - id: dingtalk.cache.review
+    name: 钉钉缓存
+    app: 钉钉
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\DingTalk\\Cache"
+      - "%APPDATA%\\DingTalk\\Code Cache"
+      - "%APPDATA%\\DingTalk\\GPUCache"
+    clean: contents
+    keep_days: 14
+    note: 钉钉界面和媒体缓存。删除不会丢云端聊天记录，但已缓存的图片要重新下载，偶发需要重新登录。请先退出钉钉。
+    close:
+      - DingTalk.exe
+
+  - id: feishu.cache.review
+    name: 飞书缓存
+    app: 飞书
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\LarkShell\\Cache"
+      - "%APPDATA%\\LarkShell\\Code Cache"
+      - "%APPDATA%\\LarkShell\\GPUCache"
+      - "%APPDATA%\\Lark\\Cache"
+      - "%APPDATA%\\Feishu\\Cache"
+    clean: contents
+    keep_days: 14
+    note: 飞书/Lark 缓存的界面资源和图片。删除不影响云端文档和聊天，只是下次打开要重新加载。请先退出飞书。
+    close:
+      - Feishu.exe
+      - Lark.exe
+
+  - id: netease.cloudmusic.cache.review
+    name: 网易云音乐缓存
+    app: 网易云音乐
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Netease\\CloudMusic\\Cache"
+      - "%LOCALAPPDATA%\\Netease\\CloudMusic\\Temp"
+      - "%LOCALAPPDATA%\\Netease\\CloudMusic\\webdata\\cache"
+    clean: contents
+    keep_days: 14
+    note: 网易云音乐缓存的试听和歌曲数据，不含已下载歌单目录。删除后已缓存歌曲需重新联网，离线听歌会失效。请先退出网易云音乐。
+    close:
+      - cloudmusic.exe
+
+  - id: qq.music.cache.review
+    name: QQ 音乐缓存
+    app: QQ 音乐
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Tencent\\QQMusic\\Cache"
+      - "%APPDATA%\\Tencent\\QQMusic\\QQMusicCache"
+    clean: contents
+    keep_days: 14
+    note: QQ 音乐缓存的音频和封面，不含已下载歌曲目录。删除不影响账号和歌单，已缓存歌曲需要重新下载。请先退出 QQ 音乐。
+    close:
+      - QQMusic.exe
+
+  - id: explorer.recent.records
+    name: 最近使用记录
+    app: Windows 资源管理器
+    category: 工具记录
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Microsoft\\Windows\\Recent"
+    clean: contents
+    keep_days: 7
+    exclude:
+      - "**\\AutomaticDestinations\\**"
+      - "**\\CustomDestinations\\**"
+    note: 资源管理器「最近使用的文件」快捷方式。删除不影响原文件，只是开始菜单和跳转列表里最近项会少一些。已固定到快速访问的项尽量避开。
+
+  - id: baidunetdisk.cache
+    name: 百度网盘缓存
+    app: 百度网盘
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Baidu\\BaiduNetdisk\\Cache"
+      - "%LOCALAPPDATA%\\Baidu\\BaiduNetdisk\\temp"
+    clean: contents
+    keep_days: 7
+    note: 百度网盘客户端缓存，不含你指定的下载保存目录。删除后传输列表里的未完成任务可能要重新下。请先退出百度网盘。
+    close:
+      - BaiduNetdisk.exe
+
+  - id: aliyundrive.cache
+    name: 阿里云盘缓存
+    app: 阿里云盘
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\aDrive\\Cache"
+      - "%APPDATA%\\aDrive\\Code Cache"
+      - "%APPDATA%\\aDrive\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: 阿里云盘界面和预览缓存，不含已下载文件。请先退出阿里云盘。
+    close:
+      - aDrive.exe
+
+  - id: quark.drive.cache
+    name: 夸克网盘缓存
+    app: 夸克
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\Quark\\User Data\\Default\\Cache"
+      - "%LOCALAPPDATA%\\Quark\\User Data\\Default\\Code Cache"
+      - "%LOCALAPPDATA%\\Quark\\User Data\\Default\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: 夸克浏览器/网盘网页缓存。删除不影响云端文件，只是预览要重新加载。
+    close:
+      - quark.exe
+
+  - id: thunder.cache
+    name: 迅雷缓存
+    app: 迅雷
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Thunder\\Profiles\\*\\Cache"
+      - "%LOCALAPPDATA%\\Thunder\\Profiles\\*\\Cache"
+    clean: contents
+    keep_days: 7
+    note: 迅雷界面和下载器缓存，不含已完成下载文件。未下完的任务可能丢失进度。请先退出迅雷。
+    close:
+      - Thunder.exe
+      - ThunderPlatform.exe
+
+  - id: wegame.cache
+    name: WeGame 缓存
+    app: WeGame
+    category: 游戏缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\WeGame\\Cache"
+      - "%LOCALAPPDATA%\\WeGame\\Download"
+      - "%LOCALAPPDATA%\\WeGame\\Log"
+    clean: contents
+    keep_days: 7
+    note: WeGame 网页缓存、下载分片和日志。删除不影响已安装游戏和存档，未下完的游戏可能要从头下。请先退出 WeGame。
+    close:
+      - WeGame.exe
+      - wegame.exe
+
+  - id: epic.launcher.cache
+    name: Epic 启动器缓存
+    app: Epic Games
+    category: 游戏缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\EpicGamesLauncher\\Saved\\webcache"
+      - "%LOCALAPPDATA%\\EpicGamesLauncher\\Saved\\webcache_4430"
+      - "%LOCALAPPDATA%\\EpicGamesLauncher\\Saved\\Logs"
+    clean: contents
+    keep_days: 7
+    note: Epic 启动器商店页面缓存和日志。删除不影响游戏安装和存档。请先退出 Epic Games Launcher。
+    close:
+      - EpicGamesLauncher.exe
+
+  - id: jianying.capcut.cache
+    name: 剪映与 CapCut 缓存
+    app: 剪映
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%LOCALAPPDATA%\\JianyingPro\\User Data\\Cache"
+      - "%LOCALAPPDATA%\\JianyingPro\\User Data\\Code Cache"
+      - "%LOCALAPPDATA%\\JianyingPro\\User Data\\GPUCache"
+      - "%LOCALAPPDATA%\\CapCut\\User Data\\Cache"
+      - "%LOCALAPPDATA%\\CapCut\\User Data\\Code Cache"
+      - "%LOCALAPPDATA%\\CapCut\\User Data\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: 剪映/CapCut 界面缓存，不含工程、素材库和导出文件。删除后素材预览要重新生成。请先退出剪映。
+    close:
+      - JianyingPro.exe
+      - CapCut.exe
+
+  - id: tencent.meeting.cache
+    name: 腾讯会议缓存
+    app: 腾讯会议
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Tencent\\WeMeet\\Global\\Cache"
+      - "%APPDATA%\\Tencent\\WeMeet\\Temp"
+    clean: contents
+    keep_days: 7
+    note: 腾讯会议界面缓存和临时文件，不含云录制。请先完全退出腾讯会议。
+    close:
+      - WeMeetApp.exe
+      - wemeetapp.exe
+
+  - id: zoom.cache
+    name: Zoom 缓存
+    app: Zoom
+    category: 应用缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Zoom\\data\\WebviewV8\\Cache"
+      - "%APPDATA%\\Zoom\\data\\WebviewV8\\Code Cache"
+      - "%APPDATA%\\Zoom\\data\\WebviewV8\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: Zoom 内嵌网页缓存。删除不影响会议历史和云录制。请先退出 Zoom。
+    close:
+      - Zoom.exe
+
+  - id: cursor.cache
+    name: Cursor 缓存
+    app: Cursor
+    category: 开发工具缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%APPDATA%\\Cursor\\Cache"
+      - "%APPDATA%\\Cursor\\CachedData"
+      - "%APPDATA%\\Cursor\\Code Cache"
+      - "%APPDATA%\\Cursor\\GPUCache"
+    clean: contents
+    keep_days: 7
+    note: Cursor 界面与旧版本编译缓存。删除不影响设置、插件和项目，只是下次启动稍慢。请先关闭 Cursor。
+    close:
+      - Cursor.exe
+

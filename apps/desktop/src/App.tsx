@@ -11,6 +11,7 @@ import {
   Search,
   Settings,
   Shield,
+  Sparkles,
   Sun,
   Trash2
 } from "lucide-react";
@@ -23,6 +24,7 @@ import {
   getAdminStatus,
   getScanSnapshot,
   listCandidateChildren,
+  listInventoryChildren,
   listInventoryLargest,
   listenCleanupProgress,
   listenScanProgress,
@@ -46,8 +48,9 @@ import { GroupList } from "./components/GroupList";
 import { LogsDialog } from "./components/LogsDialog";
 import { RulesDialog } from "./components/RulesDialog";
 import { ScanPanel } from "./components/ScanPanel";
-import { SpaceAnalysisPanel } from "./components/SpaceAnalysisPanel";
+import { SpaceAnalysisPanel, type SpaceCrumb } from "./components/SpaceAnalysisPanel";
 import { StatusBar } from "./components/StatusBar";
+import { mergeInventoryItems } from "./inventory";
 import {
   applyRecommendedSelection,
   buildCandidateGroups,
@@ -63,7 +66,6 @@ import {
   storeLanguage,
   type LanguageCode
 } from "./i18n";
-import { mergeInventoryItems } from "./inventory";
 import {
   aiRuleGenerationReady,
   formatDuration,
@@ -90,6 +92,13 @@ import {
   toggleCandidate,
   toggleVolume
 } from "./state";
+import {
+  applyCleanupIntensity,
+  filterRulesForIntensity,
+  readStoredRuleIntensity,
+  RULE_INTENSITIES,
+  storeRuleIntensity
+} from "./ruleIntensity";
 import { useAppLogs } from "./useAppLogs";
 import { useAiRuleGeneration } from "./useAiRuleGeneration";
 import { useRuleSources } from "./useRuleSources";
@@ -98,6 +107,7 @@ import type {
   InventoryQueryItem,
   LogFilter,
   RiskFilter,
+  RuleIntensity,
   ScanMode,
   SourceKind
 } from "./types";
@@ -107,16 +117,20 @@ const CLEANUP_BATCH_SIZE = 40;
 
 type ThemeMode = "system" | "light" | "dark";
 type DialogKind = "drive" | "rules" | "automation" | "logs" | "cleanup";
+type WorkbenchView = "space" | "cleanup";
+type InventoryMode = "largest" | "children" | "search";
 
 const THEME_SEQUENCE: ThemeMode[] = ["system", "light", "dark"];
 
 export function App() {
   const [language, setLanguage] = useState<LanguageCode>(() => readStoredLanguage());
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readStoredThemeMode());
+  const [intensity, setIntensity] = useState<RuleIntensity>(() => readStoredRuleIntensity());
   const t = useMemo(() => createTranslator(language), [language]);
 
   const [session, dispatch] = useReducer(sessionReducer, INITIAL_SESSION);
   const [candidates, setCandidates] = useState<CleanupCandidate[]>([]);
+  const [scannedCandidates, setScannedCandidates] = useState<CleanupCandidate[]>([]);
   const [expandedKinds, setExpandedKinds] = useState<ReadonlySet<SourceKind>>(new Set());
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [children, setChildren] = useState<CleanupCandidate[]>([]);
@@ -130,15 +144,17 @@ export function App() {
   const [adminStatus, setAdminStatus] = useState<{ isAdmin: boolean; canRestartElevated: boolean } | null>(null);
   const [volumesRefreshing, setVolumesRefreshing] = useState(false);
   const [notice, setNotice] = useState(() => t("app.ready"));
+  const [workbenchView, setWorkbenchView] = useState<WorkbenchView>("cleanup");
   const [inventoryItems, setInventoryItems] = useState<InventoryQueryItem[]>([]);
   const [inventoryQuery, setInventoryQuery] = useState("");
-  const [inventoryMode, setInventoryMode] = useState<"largest" | "search">("largest");
+  const [inventoryMode, setInventoryMode] = useState<InventoryMode>("largest");
+  const [inventoryCrumbs, setInventoryCrumbs] = useState<SpaceCrumb[]>([]);
   const [inventoryCursor, setInventoryCursor] = useState<string | null>(null);
   const [inventoryLoading, setInventoryLoading] = useState(false);
   const [inventoryError, setInventoryError] = useState<string | null>(null);
+  const inventoryRequestId = useRef(0);
 
   const snapshotLoaded = useRef(false);
-  const inventoryRequestId = useRef(0);
   const { logs, appendLog, replaceLogs } = useAppLogs();
 
   const logOperation = useCallback(
@@ -147,7 +163,7 @@ export function App() {
   );
 
   const rules = useRuleSources({ onNotice: setNotice, onLog: logOperation, translate: t });
-  const aiRules = useAiRuleGeneration(rules, t);
+  const aiRules = useAiRuleGeneration(rules, t, logOperation);
 
   const clearLogs = useCallback(() => {
     replaceLogs([]);
@@ -192,52 +208,78 @@ export function App() {
     (value: number) => new Intl.NumberFormat(language).format(value),
     [language]
   );
+  const scanSessionId = session.snapshot?.scanSessionId ?? null;
+  const showSpaceWorkbench = session.mode === "full" && scanSessionId !== null;
 
-  useEffect(() => {
-    const sessionId = session.snapshot?.scanSessionId;
-    if (!sessionId) {
-      setInventoryItems([]);
-      setInventoryCursor(null);
-      setInventoryError(null);
-      return;
-    }
-    void loadInventoryPage("largest", null, false, "");
-  }, [session.snapshot?.scanSessionId]);
-
-  async function loadInventoryPage(
-    mode: "largest" | "search",
-    cursor: string | null,
-    append: boolean,
-    searchQuery: string
-  ) {
-    const sessionId = session.snapshot?.scanSessionId;
-    if (!sessionId) {
-      return;
-    }
-    const requestId = ++inventoryRequestId.current;
-    setInventoryLoading(true);
+  const resetInventory = useCallback(() => {
+    inventoryRequestId.current += 1;
+    setInventoryItems([]);
+    setInventoryQuery("");
+    setInventoryMode("largest");
+    setInventoryCrumbs([]);
+    setInventoryCursor(null);
     setInventoryError(null);
-    try {
-      const page =
-        mode === "largest"
-          ? await listInventoryLargest(sessionId, cursor, 50)
-          : await searchInventory(sessionId, searchQuery, cursor, 50);
-      if (requestId !== inventoryRequestId.current) {
+    setInventoryLoading(false);
+  }, []);
+
+  const loadInventoryPage = useCallback(
+    async (
+      mode: InventoryMode,
+      cursor: string | null,
+      append: boolean,
+      searchQuery: string,
+      parentEntryId: string | null
+    ) => {
+      if (!scanSessionId) {
         return;
       }
-      setInventoryMode(mode);
-      setInventoryItems((current) => mergeInventoryItems(current, page.items, append));
-      setInventoryCursor(page.nextCursor);
-    } catch (error) {
-      if (requestId === inventoryRequestId.current) {
+
+      const requestId = ++inventoryRequestId.current;
+      setInventoryLoading(true);
+      setInventoryError(null);
+
+      try {
+        const page =
+          mode === "search"
+            ? await searchInventory(scanSessionId, searchQuery, cursor, 50)
+            : mode === "children"
+              ? await listInventoryChildren(scanSessionId, parentEntryId, cursor, 50, "allocatedBytes")
+              : await listInventoryLargest(scanSessionId, cursor, 50);
+
+        if (requestId !== inventoryRequestId.current) {
+          return;
+        }
+
+        setInventoryMode(mode);
+        setInventoryItems((current) => mergeInventoryItems(current, page.items, append));
+        setInventoryCursor(page.nextCursor);
+      } catch (error) {
+        if (requestId !== inventoryRequestId.current) {
+          return;
+        }
         setInventoryError(t("inventory.queryFailed", { message: errorMessage(error) }));
+      } finally {
+        if (requestId === inventoryRequestId.current) {
+          setInventoryLoading(false);
+        }
       }
-    } finally {
-      if (requestId === inventoryRequestId.current) {
-        setInventoryLoading(false);
-      }
+    },
+    [scanSessionId, t]
+  );
+
+  useEffect(() => {
+    if (!scanSessionId) {
+      resetInventory();
+      return;
     }
-  }
+
+    setInventoryItems([]);
+    setInventoryCrumbs([]);
+    setInventoryCursor(null);
+    setInventoryError(null);
+    setWorkbenchView("space");
+    void loadInventoryPage("largest", null, false, "", null);
+  }, [loadInventoryPage, resetInventory, scanSessionId]);
 
   useEffect(() => {
     storeLanguage(language);
@@ -250,6 +292,10 @@ export function App() {
     document.documentElement.dataset.theme = themeMode;
     void syncNativeWindowTheme(themeMode);
   }, [themeMode]);
+
+  useEffect(() => {
+    storeRuleIntensity(intensity);
+  }, [intensity]);
 
   useEffect(() => {
     if (snapshotLoaded.current) {
@@ -377,6 +423,12 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [appendLog, focusedIsDirectory, focusedPath, t]);
 
+  function revealCandidate(candidate: CleanupCandidate) {
+    void revealPath(candidate.path).catch((error) =>
+      appendLog("operation", t("candidate.revealFailedLog"), errorMessage(error))
+    );
+  }
+
   async function startScan() {
     if (scanBusy) {
       setNotice(t("scan.alreadyRunning"));
@@ -385,21 +437,27 @@ export function App() {
 
     const volumeIds = Array.from(selectedVolumeSet);
     const modeLabel = localizedScanModeLabel(language, session.mode);
+    const intensityLabel = t(`scan.intensity.${intensity}`);
+    const scanRules = filterRulesForIntensity(rules.activeRules, intensity);
     const startedAt = Date.now();
 
     setChildren([]);
-    setInventoryItems([]);
-    setInventoryCursor(null);
-    setInventoryError(null);
     setFocusedId(null);
     setExpandedKinds(new Set());
     dispatch({ type: "scanStarted", at: startedAt });
-    setNotice(t("scan.running", { mode: modeLabel }));
+    setNotice(
+      scanRules.length === 0
+        ? t(rules.activeRules.length === 0 ? "scan.emptyLibraryHint" : "scan.intensityEmptyHint")
+        : session.mode === "full"
+          ? t("scan.runningFull", { intensity: intensityLabel })
+          : t("scan.runningQuick", { intensity: intensityLabel })
+    );
     appendLog(
       "scan",
       t("scan.startedLog", { mode: modeLabel }),
       t("scan.startedDetail", {
         volumes: volumeIds.length > 0 ? volumeIds.join(", ") : t("scan.defaultVolumes"),
+        intensity: intensityLabel,
         rules: rules.activeRules.length
       })
     );
@@ -412,10 +470,12 @@ export function App() {
       });
 
       dispatch({ type: "scanSucceeded", snapshot, at: Date.now() });
-      // Default to the safe subset so the one-click path is ready immediately.
-      setCandidates(applyRecommendedSelection(snapshot.candidates));
+      setScannedCandidates(snapshot.candidates);
+      setCandidates(applyCleanupIntensity(snapshot.candidates, intensity));
+      const incomplete = session.mode === "full" && snapshot.coverage.status !== "complete";
+      setWorkbenchView(session.mode === "full" ? "space" : "cleanup");
       setNotice(
-        session.mode === "full" && snapshot.coverage.status !== "complete"
+        incomplete
           ? t("scan.incompleteNotice", {
               status: t(`inventory.status.${snapshot.coverage.status}`)
             })
@@ -429,7 +489,7 @@ export function App() {
       );
       appendLog(
         "scan",
-        t("scan.doneLog"),
+        incomplete ? t("scan.incompleteLog") : t("scan.doneLog"),
         t("scan.doneDetail", {
           count: snapshot.summary.candidateCount,
           size: formatBytes(snapshot.summary.estimatedReclaimBytes)
@@ -553,7 +613,11 @@ export function App() {
   }
 
   function selectRecommended() {
-    setCandidates(applyRecommendedSelection);
+    setCandidates(
+      scannedCandidates.length > 0
+        ? applyCleanupIntensity(scannedCandidates, intensity)
+        : applyRecommendedSelection
+    );
     setNotice(t("select.recommendedHint"));
   }
 
@@ -602,14 +666,16 @@ export function App() {
       }
 
       const report = mergeCleanupReports(reports);
-      const remaining = removeCandidates(candidates, report.cleanedIds);
-      setCandidates(remaining);
+      const remainingVisible = removeCandidates(candidates, report.cleanedIds);
+      const remainingScanned = removeCandidates(scannedCandidates, report.cleanedIds);
+      setCandidates(remainingVisible);
+      setScannedCandidates(remainingScanned);
 
       if (session.snapshot) {
         dispatch({
           type: "cleanupSettled",
           report,
-          snapshot: { ...session.snapshot, candidates: remaining },
+          snapshot: { ...session.snapshot, candidates: remainingScanned },
           at: Date.now()
         });
       }
@@ -700,7 +766,6 @@ export function App() {
   const ThemeIcon = themeMode === "dark" ? Moon : themeMode === "light" ? Sun : Monitor;
   const PrimaryIcon =
     action === "pause" ? Pause : action === "resume" ? Play : action === "rescan" ? RefreshCw : Search;
-
   return (
     <div className="window">
       <header className="commandbar">
@@ -762,7 +827,11 @@ export function App() {
         </div>
       </header>
 
-      <main className="workbench">
+      <main
+        className={`workbench ${
+          focusedCandidate && (!showSpaceWorkbench || workbenchView === "cleanup") ? "" : "noDetail"
+        }`}
+      >
         <aside className="pane leftPane">
           <div className="paneHeader">
             <h2>{t("nav.drives")}</h2>
@@ -823,6 +892,7 @@ export function App() {
                     disabled={scanBusy}
                     onClick={() => {
                       dispatch({ type: "modeChanged", mode });
+                      setWorkbenchView(mode === "full" && scanSessionId ? "space" : "cleanup");
                       const label = localizedScanModeLabel(language, mode);
                       setNotice(t("scan.modeSwitched", { mode: label }));
                       appendLog("operation", t("scan.modeSwitchedLog"), label);
@@ -832,6 +902,51 @@ export function App() {
                   </button>
                 ))}
               </div>
+              <p className="sectionHint">{t(`scan.modeHint.${session.mode}`)}</p>
+            </section>
+
+            <section className="section">
+              <h3 className="sectionTitle">{t("scan.intensity")}</h3>
+              <div className="modeList threeCol" role="radiogroup" aria-label={t("scan.intensity")}>
+                {RULE_INTENSITIES.map((value) => (
+                  <button
+                    key={value}
+                    role="radio"
+                    aria-checked={intensity === value}
+                    className={`modeCard ${intensity === value ? "selected" : ""}`}
+                    disabled={scanBusy}
+                    onClick={() => {
+                      setIntensity(value);
+                      const label = t(`scan.intensity.${value}`);
+                      if (scannedCandidates.length > 0) {
+                        setCandidates(applyCleanupIntensity(scannedCandidates, value));
+                        setNotice(t("scan.intensityListUpdated", { intensity: label }));
+                      } else {
+                        setNotice(t("scan.intensitySwitched", { intensity: label }));
+                      }
+                      appendLog("operation", t("scan.intensitySwitchedLog"), label);
+                    }}
+                  >
+                    {t(`scan.intensity.${value}`)}
+                  </button>
+                ))}
+              </div>
+              <p className="sectionHint">{t(`scan.intensityHint.${intensity}`)}</p>
+              {rules.activeRules.length === 0 ? (
+                <>
+                  <p className="sectionHint">{t("scan.emptyLibraryHint")}</p>
+                  <button
+                    className="button primary wide"
+                    disabled={scanBusy || rules.libraryMutating}
+                    onClick={() => void rules.importStarterRules()}
+                  >
+                    <Sparkles size={14} />
+                    {t("rule.useStarter")}
+                  </button>
+                </>
+              ) : filterRulesForIntensity(rules.activeRules, intensity).length === 0 ? (
+                <p className="sectionHint">{t("scan.intensityEmptyHint")}</p>
+              ) : null}
             </section>
 
             <button className="ghostButton wide" onClick={() => setOpenDialog("drive")}>
@@ -872,39 +987,94 @@ export function App() {
             translate={t}
           />
 
-          {session.snapshot ? (
+          {showSpaceWorkbench ? (
+            <div className="workbenchTabs" role="tablist" aria-label={t("scan.full")}>
+              <button
+                role="tab"
+                aria-selected={workbenchView === "space"}
+                className={`tab ${workbenchView === "space" ? "active" : ""}`}
+                onClick={() => setWorkbenchView("space")}
+              >
+                {t("workbench.space")}
+              </button>
+              <button
+                role="tab"
+                aria-selected={workbenchView === "cleanup"}
+                className={`tab ${workbenchView === "cleanup" ? "active" : ""}`}
+                onClick={() => setWorkbenchView("cleanup")}
+              >
+                {t("workbench.cleanup")}
+              </button>
+            </div>
+          ) : null}
+
+          {showSpaceWorkbench && workbenchView === "space" && session.snapshot ? (
             <SpaceAnalysisPanel
               snapshot={session.snapshot}
               items={inventoryItems}
+              crumbs={inventoryCrumbs}
               query={inventoryQuery}
               mode={inventoryMode}
               loading={inventoryLoading}
               error={inventoryError}
               hasMore={inventoryCursor !== null}
               onQueryChange={setInventoryQuery}
-              onSearch={() =>
-                void loadInventoryPage("search", null, false, inventoryQuery.trim())
-              }
-              onShowLargest={() => void loadInventoryPage("largest", null, false, "")}
-              onLoadMore={() =>
+              onSearch={() => {
+                setInventoryCrumbs([]);
+                setInventoryItems([]);
+                setInventoryCursor(null);
+                void loadInventoryPage("search", null, false, inventoryQuery.trim(), null);
+              }}
+              onShowLargest={() => {
+                setInventoryCrumbs([]);
+                setInventoryItems([]);
+                setInventoryCursor(null);
+                void loadInventoryPage("largest", null, false, "", null);
+              }}
+              onOpenRoot={() => {
+                setInventoryCrumbs([]);
+                setInventoryItems([]);
+                setInventoryCursor(null);
+                void loadInventoryPage("largest", null, false, "", null);
+              }}
+              onOpenCrumb={(index) => {
+                const nextCrumbs = inventoryCrumbs.slice(0, index + 1);
+                const parent = nextCrumbs[nextCrumbs.length - 1];
+                setInventoryCrumbs(nextCrumbs);
+                setInventoryItems([]);
+                setInventoryCursor(null);
+                void loadInventoryPage("children", null, false, "", parent.entryId);
+              }}
+              onOpenDirectory={(item) => {
+                setInventoryCrumbs((current) => [
+                  ...current,
+                  { entryId: item.entryId, name: item.name }
+                ]);
+                setInventoryItems([]);
+                setInventoryCursor(null);
+                void loadInventoryPage("children", null, false, "", item.entryId);
+              }}
+              onLoadMore={() => {
+                const parent = inventoryCrumbs[inventoryCrumbs.length - 1];
                 void loadInventoryPage(
                   inventoryMode,
                   inventoryCursor,
                   true,
-                  inventoryQuery.trim()
-                )
-              }
+                  inventoryQuery.trim(),
+                  parent?.entryId ?? null
+                );
+              }}
               onReveal={(path) => {
                 void revealPath(path).catch((error) =>
-                  setInventoryError(
-                    t("inventory.revealFailed", { message: errorMessage(error) })
-                  )
+                  setInventoryError(t("inventory.revealFailed", { message: errorMessage(error) }))
                 );
               }}
               translate={t}
             />
           ) : null}
 
+          {(!showSpaceWorkbench || workbenchView === "cleanup") ? (
+          <>
           <div className="filterBar">
             <label className="searchField">
               <Search size={14} />
@@ -958,37 +1128,38 @@ export function App() {
               selectedCandidateId={focusedId ?? ""}
               language={language}
               busy={busy}
-              emptyLabel={t("group.empty")}
+              emptyLabel={scanBusy ? t("group.emptyScanning") : t("group.empty")}
               onToggleExpanded={toggleGroupExpanded}
               onToggleGroup={toggleGroup}
               onToggleCandidate={(candidateId) =>
                 setCandidates((current) => toggleCandidate(current, candidateId))
               }
               onFocusCandidate={(candidate) => setFocusedId(candidate.id)}
+              onRevealCandidate={revealCandidate}
               translate={t}
             />
           </div>
+          </>
+          ) : null}
         </section>
 
-        <aside className="pane rightPane">
-          <div className="paneHeader">
-            <h2>{t("detail.current")}</h2>
-          </div>
-          <div className="paneContent">
-            <DetailPanel
-              candidate={focusedCandidate}
-              children={children}
-              childrenLoading={childrenLoading}
-              language={language}
-              onReveal={(candidate) => {
-                void revealPath(candidate.path).catch((error) =>
-                  appendLog("operation", t("candidate.revealFailedLog"), errorMessage(error))
-                );
-              }}
-              translate={t}
-            />
-          </div>
-        </aside>
+        {focusedCandidate && (!showSpaceWorkbench || workbenchView === "cleanup") ? (
+          <aside className="pane rightPane">
+            <div className="paneHeader">
+              <h2>{t("detail.current")}</h2>
+            </div>
+            <div className="paneContent">
+              <DetailPanel
+                candidate={focusedCandidate}
+                children={children}
+                childrenLoading={childrenLoading}
+                language={language}
+                onReveal={revealCandidate}
+                translate={t}
+              />
+            </div>
+          </aside>
+        ) : null}
       </main>
 
       <StatusBar
@@ -1016,6 +1187,7 @@ export function App() {
           ai={aiRules}
           snapshot={session.snapshot}
           aiGenerationReady={aiRuleGenerationReady(session)}
+          onImportStarterRules={() => void rules.importStarterRules()}
           onClose={() => setOpenDialog(null)}
           translate={t}
         />

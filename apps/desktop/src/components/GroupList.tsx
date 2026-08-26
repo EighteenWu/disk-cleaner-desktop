@@ -24,6 +24,7 @@ export interface GroupListProps {
   onToggleGroup: (kind: SourceKind, selected: boolean) => void;
   onToggleCandidate: (candidateId: string) => void;
   onFocusCandidate: (candidate: CleanupCandidate) => void;
+  onRevealCandidate: (candidate: CleanupCandidate) => void;
   translate: (key: string, values?: Record<string, string | number>) => string;
 }
 
@@ -41,6 +42,7 @@ function ExpandedCandidates({
   busy,
   onToggleCandidate,
   onFocusCandidate,
+  onRevealCandidate,
   translate
 }: {
   group: CandidateGroup;
@@ -49,6 +51,7 @@ function ExpandedCandidates({
   busy: boolean;
   onToggleCandidate: (candidateId: string) => void;
   onFocusCandidate: (candidate: CleanupCandidate) => void;
+  onRevealCandidate: (candidate: CleanupCandidate) => void;
   translate: (key: string, values?: Record<string, string | number>) => string;
 }) {
   const [scrollTop, setScrollTop] = useState(0);
@@ -87,7 +90,16 @@ function ExpandedCandidates({
                 disabled={busy || !selectable}
                 onChange={() => onToggleCandidate(candidate.id)}
               />
-              <button className="candidateMain" onClick={() => onFocusCandidate(candidate)}>
+              <button
+                className="candidateMain"
+                onClick={() => onFocusCandidate(candidate)}
+                onDoubleClick={(event) => {
+                  // Single click focuses the row so the full path can wrap;
+                  // double-click opens the item in Explorer.
+                  event.preventDefault();
+                  onRevealCandidate(candidate);
+                }}
+              >
                 <span className="candidateName">{candidate.displayName}</span>
                 <span className="candidatePath" title={candidate.path}>
                   {candidate.path}
@@ -120,6 +132,7 @@ export function GroupList({
   onToggleGroup,
   onToggleCandidate,
   onFocusCandidate,
+  onRevealCandidate,
   translate
 }: GroupListProps) {
   if (groups.length === 0) {
@@ -180,6 +193,7 @@ export function GroupList({
                 busy={busy}
                 onToggleCandidate={onToggleCandidate}
                 onFocusCandidate={onFocusCandidate}
+                onRevealCandidate={onRevealCandidate}
                 translate={translate}
               />
             ) : null}

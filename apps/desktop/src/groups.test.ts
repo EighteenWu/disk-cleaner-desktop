@@ -185,6 +185,37 @@ describe("applyRecommendedSelection", () => {
 
     expect(applyRecommendedSelection(candidates)[0].selected).toBe(false);
   });
+
+  it("still only checks safeRecommended after a heavy-intensity mix", () => {
+    const candidates = [
+      candidate("safe", "browser", { riskLevel: "safeRecommended" }),
+      candidate("caution", "browser", { riskLevel: "cautiousRecommended", selected: true }),
+      candidate("review", "windows", { riskLevel: "reviewRequired", selected: true }),
+      candidate("recycle", "windows", {
+        riskLevel: "reviewRequired",
+        selected: true,
+        cleanupPolicy: { ruleId: null, method: "recycle", keepDays: 0, excludePatterns: [] }
+      })
+    ];
+    const next = applyRecommendedSelection(candidates);
+
+    expect(next.filter((item) => item.selected).map((item) => item.id)).toEqual(["safe"]);
+  });
+
+  it("does not check recommended items that opt out of default selection", () => {
+    const candidates = [
+      candidate("temp", "windows", { riskLevel: "safeRecommended", defaultSelected: true }),
+      candidate("recycle", "windows", {
+        riskLevel: "safeRecommended",
+        defaultSelected: false,
+        selected: true,
+        category: "回收站"
+      })
+    ];
+    const next = applyRecommendedSelection(candidates);
+
+    expect(next.filter((item) => item.selected).map((item) => item.id)).toEqual(["temp"]);
+  });
 });
 
 describe("groupsSelectedSummary", () => {

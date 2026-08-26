@@ -1,6 +1,7 @@
 use crate::{
-    compile_cleanup_rules_yaml, import_winapp2_ini, ApprovedRuleEnvelope, CompiledCleanupRule,
-    RuleCompilation, RuleSourceKind, RuleValidationReport,
+    bundled_starter_rules_yaml, compile_cleanup_rules_yaml, import_winapp2_ini,
+    ApprovedRuleEnvelope, CompiledCleanupRule, RuleCompilation, RuleSourceKind,
+    RuleValidationReport,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,6 +14,7 @@ pub const RULE_COMPILER_SCHEMA_VERSION: u32 = 1;
 pub const MAX_LIBRARY_RECORDS: usize = 512;
 pub const MAX_REVISIONS_PER_RECORD: usize = 128;
 pub const MAX_RULE_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+pub const BUNDLED_STARTER_SOURCE_LABEL: &str = "bundledStarter";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -157,6 +159,7 @@ pub enum RuleLibraryEventKind {
     SaveDraft,
     Approve,
     Disable,
+    Enable,
     Delete,
     Restore,
     RollbackRequested,
@@ -220,6 +223,10 @@ pub enum RuleLibraryError {
     InvalidAiEnvelope(String),
     #[error("rule identifier conflicts with an active rule")]
     RuleIdConflict,
+    #[error("starterRulesDisabled")]
+    StarterRulesDisabled,
+    #[error("starterRulesEdited")]
+    StarterRulesEdited,
     #[error("rule library invariant failed: {0}")]
     InvalidInvariant(String),
 }
@@ -350,12 +357,7 @@ pub fn import_approved_ai_rule(
     context: RuleMutationContext,
 ) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
     check_generation(snapshot, &context)?;
-    envelope
-        .validate()
-        .map_err(RuleLibraryError::InvalidAiEnvelope)?;
-    let profile_id = envelope.provider_profile_id.parse::<Uuid>().map_err(|_| {
-        RuleLibraryError::InvalidAiEnvelope("provider profile ID is invalid".into())
-    })?;
+    let (content, provenance) = prepared_ai_import(envelope)?;
     if snapshot.records.iter().any(|record| {
         record.origin == RuleOrigin::AiGenerated
             && record.revisions.iter().any(|revision| {
@@ -365,15 +367,82 @@ pub fn import_approved_ai_rule(
     }) {
         return Ok(snapshot.clone());
     }
-    let content = envelope
-        .rules
-        .to_cleanup_rules_yaml()
-        .map_err(RuleLibraryError::InvalidAiEnvelope)?;
     create_rule_draft(
         snapshot,
         display_name,
         RuleOrigin::AiGenerated,
         &content,
+        provenance,
+        context,
+    )
+}
+
+/// Upserts the live `origin=aiGenerated` record and approves it in one generation.
+/// Deleted records are ignored; extra historical AI records are left in place.
+pub fn import_and_approve_ai_rule(
+    snapshot: &RuleLibrarySnapshot,
+    display_name: String,
+    envelope: &ApprovedRuleEnvelope,
+    context: RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    let (content, provenance) = prepared_ai_import(envelope)?;
+    check_generation(snapshot, &context)?;
+    if let Some(record) = latest_live_ai_record(snapshot) {
+        if record.state == RuleRecordState::Approved
+            && record.pending_revision_id.is_none()
+            && record_has_ai_envelope(record, envelope)
+        {
+            return Ok(snapshot.clone());
+        }
+        let record_id = record.id;
+        let head_id = record.pending_revision_id.or(record.active_revision_id);
+        let drafted = save_rule_draft(
+            snapshot,
+            record_id,
+            &content,
+            provenance,
+            RuleMutationContext {
+                expected_generation: snapshot.generation,
+                expected_head_revision_id: head_id,
+                mutation_id: context.mutation_id,
+                actor_id: context.actor_id,
+                timestamp: context.timestamp.clone(),
+            },
+        )?;
+        return approve_ai_draft_as_one_generation(snapshot, &drafted, record_id, &context);
+    }
+
+    let drafted = create_rule_draft(
+        snapshot,
+        display_name,
+        RuleOrigin::AiGenerated,
+        &content,
+        provenance,
+        context.clone(),
+    )?;
+    let record_id = drafted.records.last().ok_or(RuleLibraryError::NotFound)?.id;
+    approve_ai_draft_as_one_generation(snapshot, &drafted, record_id, &context)
+}
+
+fn prepared_ai_import(
+    envelope: &ApprovedRuleEnvelope,
+) -> Result<(String, RuleProvenance), RuleLibraryError> {
+    envelope
+        .validate()
+        .map_err(RuleLibraryError::InvalidAiEnvelope)?;
+    let profile_id = envelope.provider_profile_id.parse::<Uuid>().map_err(|_| {
+        RuleLibraryError::InvalidAiEnvelope("provider profile ID is invalid".into())
+    })?;
+    let content = envelope
+        .rules
+        .to_cleanup_rules_yaml()
+        .map_err(RuleLibraryError::InvalidAiEnvelope)?;
+    let compilation = compile_library_content(&content, &RuleOrigin::AiGenerated);
+    if !compilation.report.valid {
+        return Err(RuleLibraryError::ValidationFailed);
+    }
+    Ok((
+        content,
         RuleProvenance {
             source_label: "aiGenerated".into(),
             provider_profile_id: Some(profile_id),
@@ -384,8 +453,63 @@ pub fn import_approved_ai_rule(
             ai_draft_id: Some(envelope.draft_id.clone()),
             ai_draft_revision: Some(envelope.revision),
         },
-        context,
-    )
+    ))
+}
+
+fn latest_live_ai_record(snapshot: &RuleLibrarySnapshot) -> Option<&RuleRecord> {
+    snapshot
+        .records
+        .iter()
+        .filter(|record| {
+            record.origin == RuleOrigin::AiGenerated && record.state != RuleRecordState::Deleted
+        })
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then(left.id.cmp(&right.id))
+        })
+}
+
+fn record_has_ai_envelope(record: &RuleRecord, envelope: &ApprovedRuleEnvelope) -> bool {
+    let Some(active_id) = record.active_revision_id else {
+        return false;
+    };
+    record.revisions.iter().any(|revision| {
+        revision.id == active_id
+            && revision.provenance.ai_draft_id.as_deref() == Some(&envelope.draft_id)
+            && revision.provenance.ai_draft_revision == Some(envelope.revision)
+    })
+}
+
+fn approve_ai_draft_as_one_generation(
+    snapshot: &RuleLibrarySnapshot,
+    drafted: &RuleLibrarySnapshot,
+    record_id: Uuid,
+    context: &RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    let pending = drafted
+        .records
+        .iter()
+        .find(|record| record.id == record_id)
+        .ok_or(RuleLibraryError::NotFound)?;
+    let revision = pending_revision(pending)?;
+    let expected_hash = revision.content_hash.clone();
+    let revision_id = revision.id;
+    let mut approved = approve_pending_revision(
+        drafted,
+        record_id,
+        &expected_hash,
+        RuleMutationContext {
+            expected_generation: drafted.generation,
+            expected_head_revision_id: Some(revision_id),
+            mutation_id: Uuid::new_v4(),
+            actor_id: context.actor_id,
+            timestamp: context.timestamp.clone(),
+        },
+    )?;
+    approved.generation = snapshot.generation + 1;
+    approved.last_mutation_id = context.mutation_id;
+    Ok(approved)
 }
 
 /// Creates a subscription draft from the original source artifact and approves it
@@ -422,6 +546,158 @@ pub fn import_and_approve_subscription(
     approved.generation = snapshot.generation + 1;
     approved.last_mutation_id = context.mutation_id;
     Ok(approved)
+}
+
+/// Compiles the bundled starter YAML, then creates and approves an imported record
+/// in one in-memory transaction. Existing starter records are not overwritten.
+pub fn import_and_approve_starter_rules(
+    snapshot: &RuleLibrarySnapshot,
+    display_name: String,
+    context: RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    import_and_approve_starter_content(
+        snapshot,
+        display_name,
+        bundled_starter_rules_yaml(),
+        context,
+    )
+}
+
+fn import_and_approve_starter_content(
+    snapshot: &RuleLibrarySnapshot,
+    display_name: String,
+    content: &str,
+    context: RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    let compilation = compile_library_content(content, &RuleOrigin::Imported);
+    if !compilation.report.valid {
+        return Err(RuleLibraryError::ValidationFailed);
+    }
+    check_generation(snapshot, &context)?;
+    let canonical = canonicalize_rule_content(content)?;
+    let hash = rule_content_hash(&canonical)?;
+    if let Some(record) = find_bundled_starter_record(snapshot) {
+        match record.state {
+            RuleRecordState::Disabled => return Err(RuleLibraryError::StarterRulesDisabled),
+            RuleRecordState::Deleted => {}
+            RuleRecordState::Approved | RuleRecordState::Draft => {
+                let head = record
+                    .pending_revision_id
+                    .or(record.active_revision_id)
+                    .and_then(|id| record.revisions.iter().find(|revision| revision.id == id))
+                    .ok_or(RuleLibraryError::NotFound)?;
+                if head.content_hash == hash {
+                    if record.state == RuleRecordState::Approved
+                        && record.pending_revision_id.is_none()
+                    {
+                        return Ok(snapshot.clone());
+                    }
+                    let record_id = record.id;
+                    let expected_hash = head.content_hash.clone();
+                    let approve_context = RuleMutationContext {
+                        expected_generation: snapshot.generation,
+                        expected_head_revision_id: Some(head.id),
+                        mutation_id: context.mutation_id,
+                        actor_id: context.actor_id,
+                        timestamp: context.timestamp.clone(),
+                    };
+                    return approve_pending_revision(
+                        snapshot,
+                        record_id,
+                        &expected_hash,
+                        approve_context,
+                    );
+                }
+                if record.pending_revision_id.is_some() {
+                    return Err(RuleLibraryError::StarterRulesEdited);
+                }
+                let record_id = record.id;
+                let head_id = head.id;
+                let drafted = save_rule_draft(
+                    snapshot,
+                    record_id,
+                    content,
+                    bundled_starter_provenance(),
+                    RuleMutationContext {
+                        expected_generation: snapshot.generation,
+                        expected_head_revision_id: Some(head_id),
+                        mutation_id: context.mutation_id,
+                        actor_id: context.actor_id,
+                        timestamp: context.timestamp.clone(),
+                    },
+                )?;
+                let pending = drafted
+                    .records
+                    .iter()
+                    .find(|item| item.id == record_id)
+                    .ok_or(RuleLibraryError::NotFound)?;
+                let revision = pending_revision(pending)?;
+                let mut approved = approve_pending_revision(
+                    &drafted,
+                    record_id,
+                    &revision.content_hash,
+                    RuleMutationContext {
+                        expected_generation: drafted.generation,
+                        expected_head_revision_id: Some(revision.id),
+                        mutation_id: Uuid::new_v4(),
+                        actor_id: context.actor_id,
+                        timestamp: context.timestamp.clone(),
+                    },
+                )?;
+                approved.generation = snapshot.generation + 1;
+                approved.last_mutation_id = context.mutation_id;
+                return Ok(approved);
+            }
+        }
+    }
+
+    let drafted = create_rule_draft(
+        snapshot,
+        display_name,
+        RuleOrigin::Imported,
+        content,
+        bundled_starter_provenance(),
+        context.clone(),
+    )?;
+    let record = drafted.records.last().ok_or(RuleLibraryError::NotFound)?;
+    let record_id = record.id;
+    let revision = pending_revision(record)?;
+    let expected_hash = revision.content_hash.clone();
+    let approve_context = RuleMutationContext {
+        expected_generation: drafted.generation,
+        expected_head_revision_id: Some(revision.id),
+        mutation_id: Uuid::new_v4(),
+        actor_id: context.actor_id,
+        timestamp: context.timestamp.clone(),
+    };
+    let mut approved =
+        approve_pending_revision(&drafted, record_id, &expected_hash, approve_context)?;
+    approved.generation = snapshot.generation + 1;
+    approved.last_mutation_id = context.mutation_id;
+    Ok(approved)
+}
+
+fn bundled_starter_provenance() -> RuleProvenance {
+    RuleProvenance {
+        source_label: BUNDLED_STARTER_SOURCE_LABEL.into(),
+        provider_profile_id: None,
+        model: None,
+        scan_summary_hash: None,
+        source_url: None,
+        generated_at: None,
+        ai_draft_id: None,
+        ai_draft_revision: None,
+    }
+}
+
+fn find_bundled_starter_record(snapshot: &RuleLibrarySnapshot) -> Option<&RuleRecord> {
+    snapshot.records.iter().find(|record| {
+        record.state != RuleRecordState::Deleted
+            && record
+                .revisions
+                .iter()
+                .any(|revision| revision.provenance.source_label == BUNDLED_STARTER_SOURCE_LABEL)
+    })
 }
 
 pub fn save_rule_draft(
@@ -575,6 +851,65 @@ pub fn disable_rule_record(
         false,
         context,
     )
+}
+
+pub fn enable_rule_record(
+    snapshot: &RuleLibrarySnapshot,
+    record_id: Uuid,
+    context: RuleMutationContext,
+) -> Result<RuleLibrarySnapshot, RuleLibraryError> {
+    check_generation(snapshot, &context)?;
+    let mut next = snapshot.clone();
+    let (revision_id, origin, content) = {
+        let record = next
+            .records
+            .iter()
+            .find(|record| record.id == record_id)
+            .ok_or(RuleLibraryError::NotFound)?;
+        check_head(record, context.expected_head_revision_id)?;
+        if record.state != RuleRecordState::Disabled {
+            return Err(RuleLibraryError::InvalidInvariant(
+                "only disabled records can be enabled".into(),
+            ));
+        }
+        let revision_id = record
+            .last_approved_revision_id
+            .or(record.active_revision_id)
+            .ok_or_else(|| {
+                RuleLibraryError::InvalidInvariant(
+                    "disabled record has no approved revision to enable".into(),
+                )
+            })?;
+        let revision = record
+            .revisions
+            .iter()
+            .find(|revision| revision.id == revision_id)
+            .ok_or(RuleLibraryError::NotFound)?;
+        (revision_id, record.origin.clone(), revision.content.clone())
+    };
+    let compilation = compile_library_content(&content, &origin);
+    if !compilation.report.valid {
+        return Err(RuleLibraryError::ValidationFailed);
+    }
+    ensure_no_rule_id_conflict(&next, record_id, &compilation.rules)?;
+    let record = find_record_mut(&mut next, record_id)?;
+    let from_state = record.state.clone();
+    record.active_revision_id = Some(revision_id);
+    record.last_approved_revision_id = Some(revision_id);
+    record.state = RuleRecordState::Approved;
+    record.deleted_at = None;
+    record.updated_at = context.timestamp.clone();
+    record.events.push(event(
+        RuleLibraryEventKind::Enable,
+        Some(from_state),
+        RuleRecordState::Approved,
+        Some(revision_id),
+        Some(revision_id),
+        &context,
+    ));
+    commit_metadata(&mut next, &context);
+    validate_library(&next)?;
+    Ok(next)
 }
 
 pub fn delete_rule_record(
@@ -1049,6 +1384,135 @@ mod tests {
         assert_eq!(duplicate, imported);
     }
 
+    fn approved_ai_envelope(id: &str, rule_id: &str) -> crate::ApprovedRuleEnvelope {
+        let profile_id = Uuid::new_v4();
+        let rules = crate::AiGeneratedRuleSet::parse(&format!(
+            r#"{{"schema_version":1,"rules":[{{"id":"{rule_id}","tier":"light","name":"AI cache","app":"Fixture","category":"cache","paths":["%TEMP%\\{rule_id}"],"clean":"contents","keep_days":7,"exclude":["*.lock"],"note":"fixture","evidence":["aggregate"],"cautions":["review"]}}]}}"#
+        ))
+        .unwrap();
+        let mut draft = crate::AiRuleDraft::new(
+            id.into(),
+            SUMMARY_HASH.into(),
+            crate::AiGenerationMode::SingleTier,
+            Some(crate::AiRuleTier::Light),
+            profile_id.to_string(),
+            "fixture-model".into(),
+            "2026-03-14T00:00:00Z".into(),
+            rules,
+        )
+        .unwrap();
+        draft.validate_current_revision().unwrap();
+        draft.approve(1, SUMMARY_HASH).unwrap()
+    }
+
+    #[test]
+    fn import_and_approve_ai_rule_upserts_one_live_record() {
+        let first_envelope = approved_ai_envelope("draft-one", "ai.one");
+        let first = import_and_approve_ai_rule(
+            &empty(),
+            "AI rules".into(),
+            &first_envelope,
+            context(0, None),
+        )
+        .unwrap();
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.records[0].state, RuleRecordState::Approved);
+        assert_eq!(first.generation, 1);
+        assert_eq!(build_active_rule_snapshot(&first).rules.len(), 1);
+
+        let second_envelope = approved_ai_envelope("draft-two", "ai.two");
+        let second = import_and_approve_ai_rule(
+            &first,
+            "AI rules".into(),
+            &second_envelope,
+            context(first.generation, None),
+        )
+        .unwrap();
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].id, first.records[0].id);
+        assert_eq!(second.records[0].state, RuleRecordState::Approved);
+        assert_eq!(second.generation, first.generation + 1);
+        let active = build_active_rule_snapshot(&second);
+        assert_eq!(active.rules.len(), 1);
+        assert_eq!(active.rules[0].id, "ai.two");
+    }
+
+    #[test]
+    fn import_and_approve_ai_rule_failure_does_not_change_snapshot() {
+        let start = empty();
+        let mut envelope = approved_ai_envelope("draft-bad", "ai.bad");
+        envelope.provider_profile_id = "not-a-uuid".into();
+        assert!(
+            import_and_approve_ai_rule(&start, "AI rules".into(), &envelope, context(0, None))
+                .is_err()
+        );
+        assert!(start.records.is_empty());
+        assert_eq!(start.generation, 0);
+    }
+
+    #[test]
+    fn disable_then_enable_ai_record_reenters_active_rules() {
+        let imported = import_and_approve_ai_rule(
+            &empty(),
+            "AI rules".into(),
+            &approved_ai_envelope("draft-enable", "ai.enable"),
+            context(0, None),
+        )
+        .unwrap();
+        let record_id = imported.records[0].id;
+        let head = imported.records[0].active_revision_id;
+        let disabled =
+            disable_rule_record(&imported, record_id, context(imported.generation, head)).unwrap();
+        assert!(build_active_rule_snapshot(&disabled).rules.is_empty());
+        assert_eq!(disabled.records[0].state, RuleRecordState::Disabled);
+
+        let enabled = enable_rule_record(
+            &disabled,
+            record_id,
+            context(disabled.generation, disabled.records[0].active_revision_id),
+        )
+        .unwrap();
+        assert_eq!(enabled.records[0].state, RuleRecordState::Approved);
+        assert!(enabled.records[0]
+            .events
+            .iter()
+            .any(|event| event.kind == RuleLibraryEventKind::Enable));
+        assert_eq!(build_active_rule_snapshot(&enabled).rules.len(), 1);
+    }
+
+    #[test]
+    fn deleted_ai_record_stays_out_of_projection_and_is_not_reused() {
+        let imported = import_and_approve_ai_rule(
+            &empty(),
+            "AI rules".into(),
+            &approved_ai_envelope("draft-old", "ai.old"),
+            context(0, None),
+        )
+        .unwrap();
+        let deleted = delete_rule_record(
+            &imported,
+            imported.records[0].id,
+            context(imported.generation, imported.records[0].active_revision_id),
+        )
+        .unwrap();
+        assert_eq!(deleted.records[0].state, RuleRecordState::Deleted);
+        assert!(build_active_rule_snapshot(&deleted).rules.is_empty());
+
+        let replacement = import_and_approve_ai_rule(
+            &deleted,
+            "AI rules".into(),
+            &approved_ai_envelope("draft-new", "ai.new"),
+            context(deleted.generation, None),
+        )
+        .unwrap();
+        assert_eq!(replacement.records.len(), 2);
+        assert_eq!(replacement.records[0].state, RuleRecordState::Deleted);
+        assert_eq!(replacement.records[1].state, RuleRecordState::Approved);
+        let active = build_active_rule_snapshot(&replacement);
+        assert_eq!(active.rules.len(), 1);
+        assert_eq!(active.rules[0].id, "ai.new");
+    }
+
     #[test]
     fn pending_revision_keeps_old_active_rule() {
         let draft = create_rule_draft(
@@ -1207,5 +1671,161 @@ mod tests {
                 .unwrap();
         assert_eq!(rolled.records[0].active_revision_id, Some(first_id));
         assert_ne!(rolled.records[0].pending_revision_id, Some(first_id));
+    }
+
+    #[test]
+    fn starter_import_approves_once_and_is_idempotent() {
+        let mutation_id = Uuid::new_v4();
+        let mut first_context = context(0, None);
+        first_context.mutation_id = mutation_id;
+        let imported = import_and_approve_starter_rules(&empty(), "Starter".into(), first_context)
+            .expect("import");
+        assert_eq!(imported.generation, 1);
+        assert_eq!(imported.last_mutation_id, mutation_id);
+        assert_eq!(imported.records.len(), 1);
+        assert_eq!(imported.records[0].origin, RuleOrigin::Imported);
+        assert_eq!(imported.records[0].state, RuleRecordState::Approved);
+        assert_eq!(
+            imported.records[0].revisions[0].provenance.source_label,
+            BUNDLED_STARTER_SOURCE_LABEL
+        );
+        let active = build_active_rule_snapshot(&imported);
+        assert!(!active.rules.is_empty());
+        assert!(active.blocking_issues.is_empty());
+
+        let again = import_and_approve_starter_rules(
+            &imported,
+            "Starter".into(),
+            context(imported.generation, None),
+        )
+        .expect("noop");
+        assert_eq!(again, imported);
+    }
+
+    #[test]
+    fn starter_import_does_not_reenable_disabled_record() {
+        let imported =
+            import_and_approve_starter_rules(&empty(), "Starter".into(), context(0, None)).unwrap();
+        let record_id = imported.records[0].id;
+        let head = imported.records[0].active_revision_id;
+        let disabled =
+            disable_rule_record(&imported, record_id, context(imported.generation, head)).unwrap();
+        assert_eq!(disabled.records[0].state, RuleRecordState::Disabled);
+        assert_eq!(
+            import_and_approve_starter_rules(
+                &disabled,
+                "Starter".into(),
+                context(disabled.generation, None)
+            ),
+            Err(RuleLibraryError::StarterRulesDisabled)
+        );
+        assert!(build_active_rule_snapshot(&disabled).rules.is_empty());
+    }
+
+    #[test]
+    fn starter_import_refreshes_approved_catalog_when_bundled_yaml_changes() {
+        let previous = import_and_approve_starter_content(
+            &empty(),
+            "Starter".into(),
+            VALID_RULE,
+            context(0, None),
+        )
+        .unwrap();
+        assert_eq!(previous.records[0].revisions.len(), 1);
+        let refreshed = import_and_approve_starter_rules(
+            &previous,
+            "Starter".into(),
+            context(previous.generation, None),
+        )
+        .unwrap();
+        assert_eq!(refreshed.generation, previous.generation + 1);
+        assert_eq!(refreshed.records.len(), 1);
+        assert_eq!(refreshed.records[0].state, RuleRecordState::Approved);
+        assert_eq!(refreshed.records[0].revisions.len(), 2);
+        assert_ne!(
+            refreshed.records[0].revisions.last().unwrap().content_hash,
+            previous.records[0].revisions[0].content_hash
+        );
+        assert!(build_active_rule_snapshot(&refreshed)
+            .rules
+            .iter()
+            .any(|rule| rule.id == "windows.user.temp"));
+    }
+
+    #[test]
+    fn starter_import_does_not_overwrite_edited_content() {
+        let imported =
+            import_and_approve_starter_rules(&empty(), "Starter".into(), context(0, None)).unwrap();
+        let record = &imported.records[0];
+        let edited = save_rule_draft(
+            &imported,
+            record.id,
+            VALID_RULE,
+            bundled_starter_provenance(),
+            context(
+                imported.generation,
+                record.pending_revision_id.or(record.active_revision_id),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            import_and_approve_starter_rules(
+                &edited,
+                "Starter".into(),
+                context(edited.generation, None)
+            ),
+            Err(RuleLibraryError::StarterRulesEdited)
+        );
+        assert_eq!(edited.records[0].revisions.len(), 2);
+    }
+
+    #[test]
+    fn starter_import_compile_failure_writes_nothing() {
+        let snapshot = empty();
+        assert_eq!(
+            import_and_approve_starter_content(
+                &snapshot,
+                "Starter".into(),
+                "version: [",
+                context(0, None)
+            ),
+            Err(RuleLibraryError::ValidationFailed)
+        );
+        assert_eq!(snapshot.generation, 0);
+        assert!(snapshot.records.is_empty());
+    }
+
+    #[test]
+    fn starter_import_fails_on_duplicate_business_rule_id() {
+        let draft = create_rule_draft(
+            &empty(),
+            "Manual".into(),
+            RuleOrigin::Manual,
+            bundled_starter_rules_yaml(),
+            RuleProvenance::manual(),
+            context(0, None),
+        )
+        .unwrap();
+        let record = &draft.records[0];
+        let revision = pending_revision(record).unwrap();
+        let approved = approve_pending_revision(
+            &draft,
+            record.id,
+            &revision.content_hash,
+            context(draft.generation, Some(revision.id)),
+        )
+        .unwrap();
+        let before = approved.clone();
+        assert_eq!(
+            import_and_approve_starter_rules(
+                &approved,
+                "Starter".into(),
+                context(approved.generation, None)
+            ),
+            Err(RuleLibraryError::RuleIdConflict)
+        );
+        assert_eq!(approved, before);
+        assert_eq!(approved.records.len(), 1);
+        assert_eq!(approved.records[0].origin, RuleOrigin::Manual);
     }
 }

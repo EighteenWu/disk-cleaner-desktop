@@ -1,20 +1,20 @@
 import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
-import { AI_RULE_TIERS, tierRules } from "../aiRuleYaml";
-import { aiGenerationRequest, aiGenerationRequestPreview } from "../aiGeneration";
-import { aiDraftApprovalReady } from "../aiDraftWorkflow";
+import { useState } from "react";
 import { Dialog } from "./Dialog";
+import { AiRuleChatPanel } from "./AiRuleChatPanel";
 import { PROVIDER_VENDOR_PRESETS } from "../providerPresets";
 import {
   MAX_PROVIDER_TIMEOUT_SECONDS,
   MIN_PROVIDER_TIMEOUT_SECONDS,
   type AiRuleGenerationState
 } from "../useAiRuleGeneration";
-import type { RuleSourcesState } from "../useRuleSources";
+import {
+  libraryTableActions,
+  visibleRuleLibraryRecords,
+  type RuleSourcesState
+} from "../useRuleSources";
 import type {
-  AiGenerationMode,
   AiProviderKind,
-  AiRuleTier,
   RuleRecord,
   RuleValidationReport,
   ScanSnapshot
@@ -76,32 +76,25 @@ export function RulesDialog({
     models,
     loadingModels,
     probingGeneration,
-    summary: aiSummary,
-    generationMode,
-    setGenerationMode,
-    targetTier,
-    setTargetTier,
-    draft,
-    draftEditor,
-    draftEditorDirty,
-    setDraftEditor,
+    messages,
+    composer,
+    setComposer,
+    planning,
     generating,
+    canApprove,
+    replaceWarning,
     message: aiMessage,
-    sessionEvents,
-    clearSessionEvents
+    clearSessionEvents,
+    resetConversation
   } = ai;
-  const generatedRules = draft?.rules ?? null;
-  const generatedReport = draft?.compilation?.report ?? null;
 
-  useEffect(
-    () => () => {
-      // The hook outlives this dialog, so clear plaintext keys and the
-      // in-memory session panel when the dialog closes (design: dialog-scoped).
-      setApiKey("");
-      clearSessionEvents();
-    },
-    [setApiKey, clearSessionEvents]
-  );
+  function handleClose() {
+    if (planning || generating) void ai.cancel();
+    setApiKey("");
+    clearSessionEvents();
+    resetConversation();
+    onClose();
+  }
 
   function openRecordEditor(record: RuleRecord) {
     const head = record.revisions.find(
@@ -141,15 +134,16 @@ export function RulesDialog({
   const subscriptionCount = rules.subscriptionCompilation?.report.valid
     ? String(rules.subscriptionCompilation.report.ruleCount)
     : translate("rule.notEnabled");
+  const visibleRecords = visibleRuleLibraryRecords(rules.library?.snapshot?.records);
 
   return (
     <Dialog
       title={translate("dialog.rules")}
       closeLabel={translate("button.close")}
-      onClose={onClose}
+      onClose={handleClose}
       className="ruleDialog"
       footer={
-        <button className="button primary" onClick={onClose}>
+        <button className="button primary" onClick={handleClose}>
           {translate("button.done")}
         </button>
       }
@@ -266,18 +260,26 @@ export function RulesDialog({
               ))}
             </select>
           </label>
-          <label className="ruleField ruleFieldWide">
+          <div className="ruleField ruleFieldWide">
             <span className="ruleFieldLabel">{translate("rule.aiApiKey")}</span>
             <div className="ruleUrlRow">
               <input
-                type="password"
+                type="text"
                 value={apiKey}
                 autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                lang="en"
+                inputMode="text"
+                name="diskclean-ai-api-key"
                 onChange={(event) => setApiKey(event.target.value)}
+                onPaste={() => ai.onApiKeyPaste()}
                 onBlur={() => ai.onApiKeyBlur()}
                 placeholder={translate("rule.aiKeyPlaceholder")}
               />
               <button
+                type="button"
                 className="button"
                 disabled={loadingModels || probingGeneration}
                 onClick={() => void ai.probeGeneration()}
@@ -287,7 +289,7 @@ export function RulesDialog({
                   : translate("rule.aiDetect")}
               </button>
             </div>
-          </label>
+          </div>
           <label className="ruleField ruleFieldWide">
             <span className="ruleFieldLabel">{translate("rule.aiModel")}</span>
             <div className="ruleUrlRow">
@@ -328,29 +330,6 @@ export function RulesDialog({
               placeholder={translate("rule.aiModelPlaceholder")}
             />
           </label>
-          <label className="ruleField">
-            <span className="ruleFieldLabel">{translate("rule.aiGenerationMode")}</span>
-            <select
-              value={generationMode}
-              onChange={(event) => setGenerationMode(event.target.value as AiGenerationMode)}
-            >
-              <option value="allTiers">{translate("rule.aiGenerationModeAll")}</option>
-              <option value="singleTier">{translate("rule.aiGenerationModeSingle")}</option>
-            </select>
-          </label>
-          {generationMode === "singleTier" ? (
-            <label className="ruleField">
-              <span className="ruleFieldLabel">{translate("rule.aiTargetTier")}</span>
-              <select
-                value={targetTier}
-                onChange={(event) => setTargetTier(event.target.value as AiRuleTier)}
-              >
-                {AI_RULE_TIERS.map((tier) => (
-                  <option value={tier} key={tier}>{translate(`rule.aiTier.${tier}`)}</option>
-                ))}
-              </select>
-            </label>
-          ) : null}
         </div>
         <div className="ruleAiProviderAdvanced">
           <button
@@ -408,156 +387,24 @@ export function RulesDialog({
           <button className="button" onClick={() => void ai.saveProvider()}>
             {translate("rule.aiSaveProvider")}
           </button>
-          <button
-            className="button"
-            disabled={!aiGenerationReady || !selectedProfileId}
-            onClick={() => void ai.preparePreview(snapshot, aiGenerationReady)}
-          >
-            {translate("rule.aiPreparePreview")}
-          </button>
-          <button
-            className="button primary"
-            disabled={generating || !aiSummary || !selectedProfileId}
-            onClick={() => void ai.generate()}
-          >
-            {generating ? translate("rule.aiGenerating") : translate("rule.aiGenerate")}
-          </button>
-          {generating ? (
-            <button className="button danger" onClick={() => void ai.cancel()}>
-              {translate("rule.aiCancel")}
-            </button>
-          ) : null}
         </div>
         {!aiGenerationReady ? (
           <p className="ruleAdvancedHint">{translate("rule.aiNeedsFullScan")}</p>
         ) : null}
-        {aiMessage ? <p className="ruleAdvancedHint" role="status">{aiMessage}</p> : null}
-        {aiSummary ? (
-          <details className="ruleAiSummary" open>
-            <summary>{translate("rule.aiSummaryPreview")}</summary>
-            <p>
-              {translate("rule.aiSummaryStats", {
-                count: aiSummary.buckets.reduce((total, bucket) => total + bucket.candidateCount, 0),
-                buckets: aiSummary.buckets.length
-              })}
-            </p>
-            <p>
-              {profiles.find((profile) => profile.id === selectedProfileId)?.displayName} · {profiles.find((profile) => profile.id === selectedProfileId)?.baseUrl} · {profiles.find((profile) => profile.id === selectedProfileId)?.model} · {translate(
-                generationMode === "allTiers"
-                  ? "rule.aiGenerationModeAll"
-                  : `rule.aiTier.${targetTier}`
-              )}
-            </p>
-            <code>{aiSummary.summaryHash}</code>
-            {aiSummary.riskSignals.length > 0 ? (
-              <p>{translate("rule.aiRiskSignals", { signals: aiSummary.riskSignals.join(", ") })}</p>
-            ) : null}
-            {aiSummary.truncated ? <p>{translate("rule.aiSummaryTruncated")}</p> : null}
-            <pre>
-              {aiGenerationRequestPreview(
-                aiGenerationRequest(
-                  aiSummary,
-                  generationMode,
-                  generationMode === "singleTier" ? targetTier : null
-                )
-              )}
-            </pre>
-          </details>
-        ) : null}
-        {sessionEvents.length > 0 ? (
-          <details
-            className="ruleAiSummary"
-            key={sessionEvents[0]?.at}
-            open={sessionEvents[0]?.kind === "error"}
-          >
-            <summary>{translate("rule.aiSessionPanel")}</summary>
-            <p className="ruleAdvancedHint">{translate("rule.aiSessionPanelHint")}</p>
-            <ul className="ruleAiSessionList">
-              {sessionEvents.map((event) => (
-                <li key={`${event.at}-${event.kind}-${event.message}`}>
-                  <strong>{translate(`rule.aiSessionKind.${event.kind}`)}</strong>
-                  {" · "}
-                  {event.at}
-                  {event.summaryHash ? ` · ${event.summaryHash.slice(0, 12)}…` : ""}
-                  {event.mode
-                    ? ` · ${translate(
-                        event.mode === "allTiers"
-                          ? "rule.aiGenerationModeAll"
-                          : "rule.aiGenerationModeSingle"
-                      )}`
-                    : ""}
-                  {event.model ? ` · ${event.model}` : ""}
-                  {event.latencyMs !== undefined
-                    ? ` · ${translate("rule.aiSessionLatency", { ms: event.latencyMs })}`
-                    : ""}
-                  {event.ruleCount !== undefined
-                    ? ` · ${translate("rule.aiSessionRuleCount", { count: event.ruleCount })}`
-                    : ""}
-                  <div>{event.message}</div>
-                </li>
-              ))}
-            </ul>
-          </details>
-        ) : null}
-        {generatedRules ? (
-          <div className="ruleAiResults">
-            {generatedReport ? <RuleReport report={generatedReport} translate={translate} /> : null}
-            {AI_RULE_TIERS.map((tier) => {
-              const candidates = tierRules(generatedRules, tier);
-              return (
-                <section className={`ruleAiTier ruleAiTier-${tier}`} key={tier}>
-                  <h4>{translate(`rule.aiTier.${tier}`)}</h4>
-                  {candidates.length === 0 ? (
-                    <p className="ruleAdvancedHint">{translate("rule.aiTierEmpty")}</p>
-                  ) : null}
-                  {candidates.map((rule) => (
-                    <div key={rule.id} className="ruleAiCandidate">
-                      <strong>{rule.name}</strong>
-                      <p>{rule.note}</p>
-                      <small>{rule.paths.join(" · ")}</small>
-                      {rule.cautions.length ? <p>{rule.cautions.join("；")}</p> : null}
-                    </div>
-                  ))}
-                </section>
-              );
-            })}
-            <label className="ruleField">
-              <span className="ruleFieldLabel">{translate("rule.aiDraftEditor")}</span>
-              <textarea
-                value={draftEditor}
-                onChange={(event) => setDraftEditor(event.target.value)}
-                rows={12}
-                spellCheck={false}
-              />
-            </label>
-            <div className="ruleActions">
-              <button
-                className="button"
-                disabled={!draftEditorDirty}
-                onClick={() => void ai.applyDraftEdit()}
-              >
-                {translate("rule.aiApplyEdit")}
-              </button>
-              <button
-                className="button"
-                disabled={draftEditorDirty}
-                onClick={() => void ai.validateDraft()}
-              >
-                {translate("rule.aiValidateDraft")}
-              </button>
-              <button
-                className="button primary"
-                disabled={
-                  rules.libraryMutating ||
-                  !aiDraftApprovalReady(draft, draftEditorDirty)
-                }
-                onClick={() => void ai.approveAndImportDraft()}
-              >
-                {translate("rule.aiApproveHandoff")}
-              </button>
-            </div>
-          </div>
-        ) : null}
+        <AiRuleChatPanel
+          messages={messages}
+          composer={composer}
+          setComposer={setComposer}
+          planning={planning}
+          generating={generating}
+          canApprove={canApprove}
+          replaceWarning={replaceWarning}
+          message={aiMessage}
+          onSend={() => void ai.sendPlan(snapshot, aiGenerationReady)}
+          onCancel={() => void ai.cancel()}
+          onApprove={() => void ai.approvePlan()}
+          translate={translate}
+        />
       </section>
 
       <section className="ruleLibrary" aria-labelledby="rule-library-title">
@@ -598,15 +445,16 @@ export function RulesDialog({
             ))}
           </ul>
         ) : null}
-        {rules.library?.snapshot?.records.length ? (
+        {visibleRecords.length ? (
           <ul className="ruleLibraryList">
-            {rules.library.snapshot.records.map((record) => {
+            {visibleRecords.map((record) => {
               const pending = record.revisions.find(
                 (revision) => revision.id === record.pendingRevisionId
               );
               const active = record.revisions.find(
                 (revision) => revision.id === record.activeRevisionId
               );
+              const actions = libraryTableActions(record);
               return (
                 <li className="ruleLibraryItem" key={record.id}>
                   <div className="ruleLibraryItemHead">
@@ -662,7 +510,7 @@ export function RulesDialog({
                     </div>
                   ) : null}
                   <div className="ruleActions ruleLibraryActions">
-                    {record.state !== "deleted" && editingRecordId !== record.id ? (
+                    {editingRecordId !== record.id && actions.includes("edit") ? (
                       <button
                         className="button"
                         disabled={rules.libraryMutating}
@@ -671,7 +519,7 @@ export function RulesDialog({
                         {translate("rule.libraryEdit")}
                       </button>
                     ) : null}
-                    {pending ? (
+                    {actions.includes("approve") ? (
                       <button
                         className="button primary"
                         disabled={rules.libraryMutating}
@@ -680,7 +528,7 @@ export function RulesDialog({
                         {translate("rule.libraryApprove")}
                       </button>
                     ) : null}
-                    {record.state === "approved" ? (
+                    {actions.includes("disable") ? (
                       <button
                         className="button"
                         disabled={rules.libraryMutating}
@@ -689,39 +537,26 @@ export function RulesDialog({
                         {translate("rule.libraryDisable")}
                       </button>
                     ) : null}
-                    {record.state === "deleted" ? (
+                    {actions.includes("enable") ? (
                       <button
-                        className="button"
+                        className="button primary"
                         disabled={rules.libraryMutating}
-                        onClick={() => void rules.restoreLibraryRecord(record)}
+                        onClick={() => void rules.enableLibraryRecord(record)}
                       >
-                        {translate("rule.libraryRestore")}
+                        {translate("rule.libraryEnable")}
                       </button>
-                    ) : (
+                    ) : null}
+                    {actions.includes("delete") ? (
                       <button
                         className="button danger"
                         disabled={rules.libraryMutating}
                         onClick={() => {
-                          if (window.confirm(translate("rule.libraryDelete"))) {
+                          if (window.confirm(translate("rule.libraryDeleteConfirm"))) {
                             void rules.deleteLibraryRecord(record);
                           }
                         }}
                       >
                         {translate("rule.libraryDelete")}
-                      </button>
-                    )}
-                    {record.revisions.length > 1 ? (
-                      <button
-                        className="button"
-                        disabled={rules.libraryMutating}
-                        onClick={() =>
-                          void rules.rollbackLibraryRecord(
-                            record,
-                            record.revisions[record.revisions.length - 2].id
-                          )
-                        }
-                      >
-                        {translate("rule.libraryRollback")}
                       </button>
                     ) : null}
                   </div>

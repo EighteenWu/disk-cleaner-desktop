@@ -352,6 +352,40 @@ pub(crate) fn scan_volume_inventory<C: ScanController + ?Sized>(
     control: &C,
     sink: &mut dyn InventorySink,
 ) -> InventoryVolumeRun {
+    #[cfg(windows)]
+    if volume_prefers_ntfs_mft(volume) {
+        match crate::ntfs_mft::try_scan_ntfs_mft_inventory(session_id, volume, control, sink) {
+            Ok(run) => return run,
+            Err(error) => {
+                return scan_volume_inventory_directory_walk(
+                    session_id,
+                    volume,
+                    control,
+                    sink,
+                    Some(error),
+                );
+            }
+        }
+    }
+
+    scan_volume_inventory_directory_walk(session_id, volume, control, sink, None)
+}
+
+#[cfg(windows)]
+fn volume_prefers_ntfs_mft(volume: &VolumeInfo) -> bool {
+    volume.supports_fast_index || volume.filesystem.to_ascii_uppercase().contains("NTFS")
+}
+
+fn scan_volume_inventory_directory_walk<C: ScanController + ?Sized>(
+    session_id: &str,
+    volume: &VolumeInfo,
+    control: &C,
+    sink: &mut dyn InventorySink,
+    mft_fallback: Option<crate::ntfs_mft::MftScanError>,
+) -> InventoryVolumeRun {
+    control.on_progress_reset(None);
+    control.on_phase(crate::ScanPhase::Walking);
+
     let root = PathBuf::from(&volume.mount_point);
     let backend = if cfg!(windows) {
         "file-id-extd-directory-info"
@@ -373,6 +407,14 @@ pub(crate) fn scan_volume_inventory<C: ScanController + ?Sized>(
             ..VolumeCoverage::default()
         },
     };
+
+    if let Some(error) = mft_fallback.as_ref() {
+        // Keep the actionable open/parse reason in path_hint for UI diagnostics.
+        state.record_gap(error.gap_reason(), Some(Path::new(error.message())));
+        if !matches!(error.gap_reason(), CoverageGapReason::BackendFallback) {
+            state.record_gap(CoverageGapReason::BackendFallback, Some(&root));
+        }
+    }
 
     let root_id = state.entry_id();
     let root_name = root.to_string_lossy().to_string();
@@ -427,8 +469,8 @@ pub(crate) fn scan_volume_inventory<C: ScanController + ?Sized>(
         match next {
             Some(Ok(dir_entry)) => {
                 let path = dir_entry.path;
-                control.on_location(&path);
                 control.on_visited(1);
+                control.on_location(&path);
                 state.coverage.visited_entries = state.coverage.visited_entries.saturating_add(1);
 
                 let object_type = dir_entry.object_type;
@@ -446,6 +488,7 @@ pub(crate) fn scan_volume_inventory<C: ScanController + ?Sized>(
                 } else {
                     0
                 };
+                control.on_scanned_bytes(accounted_allocated);
                 let disposition = inventory_disposition_for_path(&path);
                 let entry_id = state.entry_id();
                 let parent_entry_id = frames
@@ -967,7 +1010,7 @@ mod tests {
         assert_eq!(run.coverage.status, ScanCoverageStatus::Complete);
         assert!(run.summary.logical_bytes >= 40);
         assert!(sink.entries.iter().any(|entry| {
-            entry.name == "runtime.bin" && entry.disposition == InventoryDisposition::Blocked
+            entry.name == "runtime.bin" && entry.disposition == InventoryDisposition::AnalysisOnly
         }));
         assert!(!run
             .candidates
@@ -1057,6 +1100,36 @@ mod tests {
         assert_eq!(entry.logical_bytes, 1024 * 1024);
         assert!(entry.allocated_bytes <= entry.logical_bytes);
         assert_eq!(run.summary.logical_bytes, 1024 * 1024);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ntfs_mft_failure_falls_back_to_directory_walk_with_gap() {
+        let root = temp_root("mft-fallback");
+        fs::create_dir_all(&root).expect("create fixture");
+        fs::write(root.join("keep.bin"), vec![9_u8; 11]).expect("write fixture");
+        let volume = VolumeInfo {
+            id: "TEST".to_string(),
+            label: "Test".to_string(),
+            mount_point: root.to_string_lossy().to_string(),
+            filesystem: "NTFS".to_string(),
+            total_bytes: 0,
+            available_bytes: 0,
+            selected: true,
+            supports_fast_index: true,
+        };
+        let mut sink = RecordingSink::default();
+
+        let run = scan_volume_inventory("session", &volume, &crate::NoopScanController, &mut sink);
+
+        assert_ne!(run.coverage.backend, "ntfs-mft");
+        assert!(run.coverage.gaps.iter().any(|gap| {
+            matches!(
+                gap.reason,
+                CoverageGapReason::BackendFallback | CoverageGapReason::AccessDenied
+            )
+        }));
+        assert!(sink.entries.iter().any(|entry| entry.name == "keep.bin"));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -1,6 +1,7 @@
 use crate::credentials::{CredentialStore, SecretString};
 use cleaner_core::{
-    AiGeneratedRuleSet, AiGenerationMode, AiRuleTier, RedactedScanSummary, RuleCompilation,
+    AiGeneratedRuleSet, AiGenerationMode, AiGenerationRevision, AiRuleTier, RedactedScanSummary,
+    RuleCompilation, MAX_AI_RESPONSE_BYTES,
 };
 use reqwest::{header, redirect::Policy, Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,10 @@ use std::{
 const PROFILE_FILE: &[&str] = &["config", "ai-provider-profiles.json"];
 const PROFILE_SCHEMA_VERSION: u16 = 1;
 const MAX_PROFILES: usize = 16;
-const MAX_PROVIDER_RESPONSE_BYTES: u64 = 256 * 1024;
+/// Incomplete SSE event still in the read buffer (one event, not the whole stream).
+const MAX_SSE_PENDING_BYTES: usize = 256 * 1024;
+/// Total bytes read from the provider, including ignored reasoning frames.
+const MAX_PROVIDER_WIRE_BYTES: u64 = 8 * 1024 * 1024;
 /// Relay gateways routinely expose several hundred models, so the catalog gets
 /// a wider ceiling than a rule-generation reply.
 const MAX_MODEL_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -92,6 +96,10 @@ pub struct ProviderGenerationRequest {
     pub generation_mode: Option<AiGenerationMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_tier: Option<AiRuleTier>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<AiGenerationRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_text: Option<String>,
 }
 
 impl ProviderGenerationRequest {
@@ -161,12 +169,55 @@ pub struct ProviderGenerationProbeResult {
     pub request_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AiGenerationPhase {
+    Plan,
+    Rules,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiGenerationProgress {
     pub elapsed_ms: u64,
     pub output_chars: usize,
     pub bytes_received: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<AiGenerationPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanMessageRole {
+    User,
+    Assistant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderPlanMessage {
+    pub role: PlanMessageRole,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderPlanRequest {
+    pub summary: RedactedScanSummary,
+    pub messages: Vec<ProviderPlanMessage>,
+    #[serde(default)]
+    pub scan_session_id: Option<String>,
+    #[serde(default)]
+    pub space_digest: Option<cleaner_core::SpaceDigest>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPlanResponse {
+    pub reply: String,
+    pub model: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -424,8 +475,21 @@ pub async fn generate_rules(
     if request.summary.validate_for_provider().is_err() {
         return Err(provider_error(
             ProviderErrorCategory::Configuration,
-            "脱敏摘要无效，请重新生成发送预览。",
+            "脱敏摘要无效，请重新扫描后再发送。",
         ));
+    }
+    if let Some(plan_text) = &request.plan_text {
+        if plan_text.chars().count() > MAX_PLAN_TEXT_CHARS {
+            return Err(provider_error(
+                ProviderErrorCategory::Configuration,
+                "审阅范围超过 16384 字上限。",
+            ));
+        }
+    }
+    if let Some(revision) = &request.revision {
+        revision
+            .validate()
+            .map_err(|message| provider_error(ProviderErrorCategory::Configuration, message))?;
     }
     let (generation_mode, target_tier) = request
         .resolved_mode()
@@ -454,8 +518,10 @@ pub async fn generate_rules(
     let request_json = serde_json::to_string(request).map_err(|_| {
         provider_error(ProviderErrorCategory::Configuration, "序列化脱敏摘要失败。")
     })?;
-    let prompt = format!("{GENERATION_USER_PREFIX}\n{request_json}");
-    let system = generation_system_prompt(generation_mode, target_tier);
+    let user_prefix =
+        materialize_user_prefix(request.plan_text.is_some(), request.revision.is_some());
+    let prompt = format!("{user_prefix}\n{request_json}");
+    let system = generation_system_prompt(generation_mode, target_tier, request.revision.is_some());
     let output_schema = provider_output_schema();
 
     let builder = match profile.kind {
@@ -502,17 +568,16 @@ pub async fn generate_rules(
         Some(prompt.len()),
     )
     .await?;
-    if response.content_length().unwrap_or(0) > MAX_PROVIDER_RESPONSE_BYTES {
-        return Err(provider_error(
-            ProviderErrorCategory::ResponseTooLarge,
-            "Provider 响应超过 256 KB 上限。",
-        ));
-    }
     let structured = collect_generation_output(
         response,
         profile.kind,
         Duration::from_millis(profile.timeout_ms),
         idle_timeout(profile.timeout_ms),
+        StreamCollectOptions {
+            max_output_bytes: MAX_AI_RESPONSE_BYTES,
+            phase: Some(AiGenerationPhase::Rules),
+            emit_delta: false,
+        },
         &mut on_progress,
     )
     .await?;
@@ -536,6 +601,11 @@ pub async fn generate_rules(
             "生成规则未通过本地安全校验。",
         ));
     }
+    if let Some(revision) = &request.revision {
+        revision
+            .enforce_on(&rules)
+            .map_err(|message| provider_error(ProviderErrorCategory::InvalidSchema, message))?;
+    }
     Ok(ProviderGenerationResponse {
         request_id,
         rules,
@@ -544,10 +614,202 @@ pub async fn generate_rules(
 }
 
 const GENERATION_PROMPT_VERSION: &str = "v1";
+const PLAN_PROMPT_VERSION: &str = "v2";
 const GENERATION_USER_PREFIX: &str = "Draft cleanup rules from this redacted scan summary.";
+const REVISION_USER_PREFIX: &str = "Revise the previous cleanup-rule json. Honor droppedIds, tierChanges, rewriteIds, and instruction.";
+const PLAN_MATERIALIZE_USER_PREFIX: &str = "Draft cleanup-rule json from this redacted scan summary. Honor planText as the reviewed light/medium/heavy scope.";
+const PLAN_REVISION_USER_PREFIX: &str = "Revise the previous cleanup-rule json using planText as the reviewed scope. Honor droppedIds, tierChanges, and rewriteIds if present.";
 const GENERATION_RULE_EXAMPLE: &str = r#"{"schema_version":1,"rules":[{"id":"cache.temp","tier":"light","name":"Temp cache","app":"Windows","category":"cache","paths":["%TEMP%\\AppCache"],"clean":"contents","keep_days":7,"exclude":["*.lock"],"note":"cache","evidence":["aggregate"],"cautions":["review"]}]}"#;
+const MAX_PLAN_MESSAGES: usize = 8;
+const MAX_PLAN_MESSAGE_CHARS: usize = 2000;
+const MAX_PLAN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_PLAN_TEXT_CHARS: usize = 16_384;
 
-fn generation_system_prompt(mode: AiGenerationMode, target_tier: Option<AiRuleTier>) -> String {
+#[derive(Clone, Copy)]
+struct StreamCollectOptions {
+    max_output_bytes: usize,
+    phase: Option<AiGenerationPhase>,
+    emit_delta: bool,
+}
+
+fn materialize_user_prefix(has_plan_text: bool, revising: bool) -> &'static str {
+    match (has_plan_text, revising) {
+        (true, true) => PLAN_REVISION_USER_PREFIX,
+        (true, false) => PLAN_MATERIALIZE_USER_PREFIX,
+        (false, true) => REVISION_USER_PREFIX,
+        (false, false) => GENERATION_USER_PREFIX,
+    }
+}
+
+pub async fn generate_plan(
+    profile: &ProviderProfile,
+    request: &ProviderPlanRequest,
+    credentials: &dyn CredentialStore,
+    mut on_progress: impl FnMut(AiGenerationProgress) + Send,
+) -> Result<ProviderPlanResponse, ProviderError> {
+    let base_url = profile
+        .validate()
+        .map_err(|message| provider_error(ProviderErrorCategory::Configuration, message))?;
+    validate_plan_request(request)?;
+    let secret = credentials
+        .read(&profile.id)
+        .map_err(|message| provider_error(ProviderErrorCategory::CredentialMissing, message))?
+        .ok_or_else(|| {
+            provider_error(
+                ProviderErrorCategory::CredentialMissing,
+                "尚未保存该 Provider 的 API Key。",
+            )
+        })?;
+    let endpoint = endpoint(&base_url, profile.kind)?;
+    let client = Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(connect_timeout(profile.timeout_ms))
+        .timeout(Duration::from_millis(profile.timeout_ms))
+        .build()
+        .map_err(|_| {
+            provider_error(
+                ProviderErrorCategory::Configuration,
+                "创建 Provider HTTP 客户端失败。",
+            )
+        })?;
+    let summary_json = serde_json::to_string(&request.summary).map_err(|_| {
+        provider_error(ProviderErrorCategory::Configuration, "序列化脱敏摘要失败。")
+    })?;
+    let digest_json = request
+        .space_digest
+        .as_ref()
+        .map(|digest| {
+            serde_json::to_string(digest).map_err(|_| {
+                provider_error(ProviderErrorCategory::Configuration, "序列化占空间目录摘要失败。")
+            })
+        })
+        .transpose()?;
+    let system = plan_system_prompt();
+    let evidence = match digest_json {
+        Some(digest_json) => format!(
+            "Space directory digest JSON (largest directories from the local full-scan inventory; not every file):\n{digest_json}\n\nCandidate summary JSON:\n{summary_json}"
+        ),
+        None => format!(
+            "No space directory digest (full-scan inventory unavailable). Candidate summary JSON:\n{summary_json}"
+        ),
+    };
+    let mut messages = vec![json!({
+        "role": "user",
+        "content": evidence
+    })];
+    for message in &request.messages {
+        let role = match message.role {
+            PlanMessageRole::User => "user",
+            PlanMessageRole::Assistant => "assistant",
+        };
+        messages.push(json!({ "role": role, "content": message.content }));
+    }
+    let prompt_chars: usize = messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .map(|content| content.len())
+        .sum();
+
+    let builder = match profile.kind {
+        ProviderKind::OpenAiCompatible => client
+            .post(endpoint)
+            .bearer_auth(secret.expose().map_err(|message| {
+                provider_error(ProviderErrorCategory::CredentialMissing, message)
+            })?)
+            .json(&openai_chat_payload_with_messages(
+                &profile.model,
+                &system,
+                &messages,
+                true,
+                &base_url,
+                false,
+            )),
+        ProviderKind::AnthropicCompatible => client
+            .post(endpoint)
+            .header(
+                "x-api-key",
+                secret.expose().map_err(|message| {
+                    provider_error(ProviderErrorCategory::CredentialMissing, message)
+                })?,
+            )
+            .header("anthropic-version", "2023-06-01")
+            .json(&json!({
+                "model": profile.model,
+                "max_tokens": 4096,
+                "stream": true,
+                "system": system,
+                "messages": messages
+            })),
+    };
+    let response = builder.send().await.map_err(map_reqwest_error)?;
+    let (_request_id, response) = accept_provider_response(
+        response,
+        "plan",
+        Some(profile.model.as_str()),
+        Some(prompt_chars),
+    )
+    .await?;
+    let reply = collect_generation_output(
+        response,
+        profile.kind,
+        Duration::from_millis(profile.timeout_ms),
+        idle_timeout(profile.timeout_ms),
+        StreamCollectOptions {
+            max_output_bytes: MAX_PLAN_RESPONSE_BYTES,
+            phase: Some(AiGenerationPhase::Plan),
+            emit_delta: true,
+        },
+        &mut on_progress,
+    )
+    .await?;
+    if reply.trim().is_empty() {
+        return Err(provider_error(
+            ProviderErrorCategory::InvalidSchema,
+            "Provider 响应为空。",
+        ));
+    }
+    Ok(ProviderPlanResponse {
+        reply,
+        model: profile.model.clone(),
+    })
+}
+
+fn validate_plan_request(request: &ProviderPlanRequest) -> Result<(), ProviderError> {
+    if request.summary.validate_for_provider().is_err() {
+        return Err(provider_error(
+            ProviderErrorCategory::Configuration,
+            "脱敏摘要无效，请重新扫描后再发送。",
+        ));
+    }
+    if request.messages.is_empty() || request.messages.len() > MAX_PLAN_MESSAGES {
+        return Err(provider_error(
+            ProviderErrorCategory::Configuration,
+            "对话轮次必须介于 1 和 8 条之间。",
+        ));
+    }
+    for message in &request.messages {
+        let chars = message.content.chars().count();
+        if message.content.trim().is_empty() || chars > MAX_PLAN_MESSAGE_CHARS {
+            return Err(provider_error(
+                ProviderErrorCategory::Configuration,
+                "对话内容无效或超过 2000 字上限。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn plan_system_prompt() -> String {
+    format!(
+        "cleanup-scope plan contract {PLAN_PROMPT_VERSION}. Reply in the user's language. Identify junk from the space directory digest when present (largest directories only, not every file) and the candidate summary. You MUST use three sections: 建议可清, 要确认, 不要动 (or Recommended / Confirm / Do not touch). Each item MUST include 大小 (size), 路径 (path), 说明 (what it is), 影响 (what deleting does). Prefer a table or one line per item with those four columns. A section may be empty if labeled empty. Do not output YAML, executable cleanup-rule JSON, or markdown fences of rules. Paths must use environment-variable templates only (%LOCALAPPDATA%, %TEMP%, %APPDATA%, %WINDIR%). This is a review plan, not executable rules."
+    )
+}
+
+fn generation_system_prompt(
+    mode: AiGenerationMode,
+    target_tier: Option<AiRuleTier>,
+    revising: bool,
+) -> String {
     let scope = match mode {
         AiGenerationMode::AllTiers => {
             "Generate light, medium, and/or heavy cleanup rule drafts in one response. Each rule must set tier to light, medium, or heavy. Empty tiers are allowed; at least one rule is required.".to_string()
@@ -561,8 +823,13 @@ fn generation_system_prompt(mode: AiGenerationMode, target_tier: Option<AiRuleTi
             format!("Generate only {tier} cleanup rule drafts. Every rule tier must be {tier}.")
         }
     };
+    let revision = if revising {
+        " Honor revision.droppedIds, revision.tierChanges, revision.rewriteIds, and revision.instruction."
+    } else {
+        ""
+    };
     format!(
-        "cleanup-rule json contract {GENERATION_PROMPT_VERSION}. Return one json object only, no markdown, no extra keys. {scope} Paths must use environment-variable templates only (%LOCALAPPDATA%, %TEMP%, %APPDATA%). Never infer personal paths. clean must be contents, files, recycle, or manual — never delete. Prefer contents for cache directories. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions. Example json: {GENERATION_RULE_EXAMPLE}"
+        "cleanup-rule json contract {GENERATION_PROMPT_VERSION}. Return one json object only, no markdown, no extra keys. {scope}{revision} Paths must use environment-variable templates only (%LOCALAPPDATA%, %TEMP%, %APPDATA%). Never infer personal paths. clean must be contents, files, recycle, or manual — never delete. Prefer contents for cache directories. Required fields: schema_version and rules with id,tier,name,app,category,paths,clean,keep_days,exclude,note,evidence,cautions. Example json: {GENERATION_RULE_EXAMPLE}"
     )
 }
 
@@ -588,19 +855,49 @@ fn openai_chat_payload(
     stream: bool,
     base_url: &Url,
 ) -> Value {
+    openai_chat_payload_with_messages(
+        model,
+        system,
+        &[json!({"role": "user", "content": user})],
+        stream,
+        base_url,
+        true,
+    )
+}
+
+fn openai_chat_payload_with_messages(
+    model: &str,
+    system: &str,
+    messages: &[Value],
+    stream: bool,
+    base_url: &Url,
+    json_object: bool,
+) -> Value {
+    let mut chat_messages = vec![json!({"role": "system", "content": system})];
+    chat_messages.extend_from_slice(messages);
     let mut payload = json!({
         "model": model,
         "stream": stream,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "response_format": { "type": "json_object" }
+        "messages": chat_messages
     });
+    if json_object {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
     if thinking_disabled_host(base_url) {
         payload["thinking"] = json!({ "type": "disabled" });
     }
     payload
+}
+
+fn response_too_large() -> ProviderError {
+    response_too_large_for(MAX_AI_RESPONSE_BYTES)
+}
+
+fn response_too_large_for(max_bytes: usize) -> ProviderError {
+    provider_error(
+        ProviderErrorCategory::ResponseTooLarge,
+        format!("Provider 响应超过 {} KB 上限。", max_bytes / 1024),
+    )
 }
 
 async fn collect_generation_output(
@@ -608,18 +905,37 @@ async fn collect_generation_output(
     kind: ProviderKind,
     overall: Duration,
     idle: Duration,
+    options: StreamCollectOptions,
     on_progress: &mut (impl FnMut(AiGenerationProgress) + Send),
 ) -> Result<String, ProviderError> {
     let started = Instant::now();
-    let mut bytes = Vec::new();
+    let mut pending = Vec::new();
+    let mut output = String::new();
+    let mut wire_bytes: u64 = 0;
+    let mut sse = false;
     let mut last_emit = Instant::now() - PROGRESS_EMIT_INTERVAL;
-    let mut emit = |bytes_len: usize, output_chars: usize, force: bool| {
+    let mut emitted_chars = 0usize;
+    let mut emit = |bytes_len: usize, current: &str, force: bool| {
         if force || last_emit.elapsed() >= PROGRESS_EMIT_INTERVAL {
             last_emit = Instant::now();
+            let output_chars = current.chars().count();
+            let delta = if options.emit_delta {
+                let increment: String = current.chars().skip(emitted_chars).collect();
+                emitted_chars = output_chars;
+                if increment.is_empty() {
+                    None
+                } else {
+                    Some(increment)
+                }
+            } else {
+                None
+            };
             on_progress(AiGenerationProgress {
                 elapsed_ms: started.elapsed().as_millis() as u64,
                 output_chars,
                 bytes_received: bytes_len,
+                phase: options.phase,
+                delta,
             });
         }
     };
@@ -644,29 +960,85 @@ async fn collect_generation_output(
         let Some(chunk) = chunk else {
             break;
         };
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
-            return Err(provider_error(
-                ProviderErrorCategory::ResponseTooLarge,
-                "Provider 响应超过 256 KB 上限。",
-            ));
+        wire_bytes += chunk.len() as u64;
+        if wire_bytes > MAX_PROVIDER_WIRE_BYTES {
+            return Err(response_too_large_for(options.max_output_bytes));
         }
-        let parsed = parse_generation_buffer(kind, &bytes)?;
-        emit(bytes.len(), parsed.chars().count(), false);
+        pending.extend_from_slice(&chunk);
+        if !sse && looks_like_sse(&String::from_utf8_lossy(&pending)) {
+            sse = true;
+        }
+        if sse {
+            drain_sse_events(kind, &mut pending, &mut output)?;
+            if pending.len() > MAX_SSE_PENDING_BYTES || output.len() > options.max_output_bytes {
+                return Err(response_too_large_for(options.max_output_bytes));
+            }
+            emit(wire_bytes as usize, &output, false);
+        } else {
+            if pending.len() > options.max_output_bytes {
+                return Err(response_too_large_for(options.max_output_bytes));
+            }
+            emit(wire_bytes as usize, "", false);
+        }
     }
 
-    let structured = finalize_generation_buffer(kind, &bytes)?;
-    emit(bytes.len(), structured.chars().count(), true);
+    let structured = if sse {
+        if !pending.is_empty() {
+            apply_sse_event(kind, &String::from_utf8_lossy(&pending), &mut output)?;
+        }
+        if output.len() > options.max_output_bytes {
+            return Err(response_too_large_for(options.max_output_bytes));
+        }
+        if output.is_empty() {
+            return Err(provider_error(
+                ProviderErrorCategory::InvalidSchema,
+                "Provider 响应为空。",
+            ));
+        }
+        output
+    } else {
+        finalize_generation_buffer(kind, &pending)?
+    };
+    if structured.len() > options.max_output_bytes {
+        return Err(response_too_large_for(options.max_output_bytes));
+    }
+    emit(wire_bytes as usize, &structured, true);
     Ok(structured)
 }
 
-fn parse_generation_buffer(kind: ProviderKind, bytes: &[u8]) -> Result<String, ProviderError> {
-    let text = String::from_utf8_lossy(bytes);
-    if looks_like_sse(&text) {
-        parse_sse_output(kind, &text, false)
-    } else {
-        Ok(String::new())
+fn drain_sse_events(
+    kind: ProviderKind,
+    pending: &mut Vec<u8>,
+    output: &mut String,
+) -> Result<(), ProviderError> {
+    while let Some(consumed) = split_sse_event_bytes(pending) {
+        let event = String::from_utf8_lossy(&pending[..consumed]).into_owned();
+        pending.drain(..consumed);
+        apply_sse_event(kind, &event, output)?;
+        if output.len() > MAX_AI_RESPONSE_BYTES {
+            return Err(response_too_large());
+        }
     }
+    Ok(())
+}
+
+fn split_sse_event_bytes(buf: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index + 1 < buf.len() {
+        if buf[index] == b'\n' && buf[index + 1] == b'\n' {
+            return Some(index + 2);
+        }
+        if index + 3 < buf.len()
+            && buf[index] == b'\r'
+            && buf[index + 1] == b'\n'
+            && buf[index + 2] == b'\r'
+            && buf[index + 3] == b'\n'
+        {
+            return Some(index + 4);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn finalize_generation_buffer(kind: ProviderKind, bytes: &[u8]) -> Result<String, ProviderError> {
@@ -924,17 +1296,16 @@ pub async fn probe_generation(
     let response = builder.send().await.map_err(map_reqwest_error)?;
     let (request_id, response) =
         accept_provider_response(response, "probe", Some(query.model.as_str()), None).await?;
-    if response.content_length().unwrap_or(0) > MAX_PROVIDER_RESPONSE_BYTES {
-        return Err(provider_error(
-            ProviderErrorCategory::ResponseTooLarge,
-            "Provider 响应超过 256 KB 上限。",
-        ));
-    }
     let structured = collect_generation_output(
         response,
         query.kind,
         Duration::from_millis(query.timeout_ms),
         idle_timeout(query.timeout_ms),
+        StreamCollectOptions {
+            max_output_bytes: MAX_AI_RESPONSE_BYTES,
+            phase: None,
+            emit_delta: false,
+        },
         &mut |_| {},
     )
     .await?;
@@ -1644,7 +2015,7 @@ mod tests {
 
     #[test]
     fn generation_prompt_is_short_json_contract() {
-        let prompt = generation_system_prompt(AiGenerationMode::AllTiers, None);
+        let prompt = generation_system_prompt(AiGenerationMode::AllTiers, None, false);
         let lowered = prompt.to_ascii_lowercase();
         assert!(lowered.contains("json"));
         assert!(prompt.contains(GENERATION_PROMPT_VERSION));
@@ -1653,7 +2024,11 @@ mod tests {
         assert!(prompt.contains("contents"));
         assert!(prompt.contains("never delete"));
         assert!(!prompt.contains("json_schema"));
-        let single = generation_system_prompt(AiGenerationMode::SingleTier, Some(AiRuleTier::Light));
+        assert!(!prompt.contains("droppedIds"));
+        let single =
+            generation_system_prompt(AiGenerationMode::SingleTier, Some(AiRuleTier::Light), false);
+        let revising = generation_system_prompt(AiGenerationMode::AllTiers, None, true);
+        assert!(revising.contains("droppedIds"));
         assert!(single.contains("light"));
         assert!(single.to_ascii_lowercase().contains("json"));
         assert!(!single.contains("json_schema"));
@@ -1705,6 +2080,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sse_split_handles_lf_and_crlf() {
+        assert_eq!(split_sse_event_bytes(b"data: x\n\nrest"), Some(9));
+        assert_eq!(split_sse_event_bytes(b"data: x\r\n\r\nrest"), Some(11));
+        assert_eq!(split_sse_event_bytes(b"data: x\n"), None);
+    }
+
+    #[test]
+    fn sse_concat_skips_reasoning_content() {
+        let text = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"ok\\\":true}\"}}]}\n\n",
+        );
+        assert_eq!(
+            parse_sse_output(ProviderKind::OpenAiCompatible, text, true).unwrap(),
+            "{\"ok\":true}"
+        );
+    }
+
     #[tokio::test]
     async fn both_provider_protocols_send_hybrid_summary_with_samples() {
         for kind in [
@@ -1730,8 +2124,9 @@ mod tests {
             assert!(request.contains("AppData"));
             assert!(request.contains("alice"));
             assert!(request.contains("schemaVersion"));
-            assert!(request.contains("token=[redacted]"));
+            assert!(!request.contains("token=[redacted]"));
             assert!(!request.contains("API_KEY"));
+            assert!(!request.contains("\"reason\":\"browser cache"));
             match kind {
                 ProviderKind::OpenAiCompatible => {
                     assert!(request.starts_with("POST /v1/chat/completions"));
@@ -1785,8 +2180,189 @@ mod tests {
         assert_eq!(generated.rules.rules.len(), 1);
         let progress: Vec<_> = progress_rx.try_iter().collect();
         assert!(progress.iter().any(|item| item.bytes_received > 0));
+        assert!(progress.iter().all(|item| item.delta.is_none()));
+        assert!(progress
+            .iter()
+            .all(|item| item.phase != Some(AiGenerationPhase::Plan)));
         let request = captured.recv().unwrap();
         assert!(request.contains("\"stream\":true"));
+    }
+
+    fn plan_request() -> ProviderPlanRequest {
+        ProviderPlanRequest {
+            summary: generation_request().summary,
+            messages: vec![ProviderPlanMessage {
+                role: PlanMessageRole::User,
+                content: "根据这次扫描，识别可清理的垃圾目录。".into(),
+            }],
+            scan_session_id: None,
+            space_digest: None,
+        }
+    }
+
+    #[test]
+    fn plan_prompt_is_not_the_json_rule_contract() {
+        let prompt = plan_system_prompt();
+        let lowered = prompt.to_ascii_lowercase();
+        assert!(prompt.contains(PLAN_PROMPT_VERSION));
+        assert!(prompt.contains("大小") && prompt.contains("路径") && prompt.contains("说明") && prompt.contains("影响"));
+        assert!(prompt.contains("建议可清") && prompt.contains("要确认") && prompt.contains("不要动"));
+        assert!(lowered.contains("digest") || prompt.contains("directory"));
+        assert!(prompt.contains("%TEMP%") || prompt.contains("%LOCALAPPDATA%"));
+        assert!(!prompt.contains(GENERATION_RULE_EXAMPLE));
+        assert!(!prompt.contains("json_schema"));
+        assert!(!prompt.contains("schema_version"));
+        assert!(!prompt.contains("submit_cleanup_rules"));
+    }
+
+    #[test]
+    fn plan_request_rejects_oversized_messages() {
+        let mut request = plan_request();
+        request.messages = (0..9)
+            .map(|index| ProviderPlanMessage {
+                role: PlanMessageRole::User,
+                content: format!("scope {index}"),
+            })
+            .collect();
+        assert_eq!(
+            validate_plan_request(&request).unwrap_err().category,
+            ProviderErrorCategory::Configuration
+        );
+        request.messages = vec![ProviderPlanMessage {
+            role: PlanMessageRole::User,
+            content: "x".repeat(MAX_PLAN_MESSAGE_CHARS + 1),
+        }];
+        assert_eq!(
+            validate_plan_request(&request).unwrap_err().category,
+            ProviderErrorCategory::Configuration
+        );
+    }
+
+    #[tokio::test]
+    async fn generate_ai_rule_plan_streams_delta_without_json_object() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"轻度：缓存\\n\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"中度：日志\\n\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"重度：无\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, captured) = spawn_server(200, body.into(), Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let mut request = plan_request();
+        request.space_digest = Some(cleaner_core::SpaceDigest {
+            schema_version: 1,
+            directory_count: 1,
+            truncated: false,
+            directories: vec![cleaner_core::SpaceDirectory {
+                path: "%LOCALAPPDATA%\\npm-cache".into(),
+                allocated_bytes: 900_000_000,
+                logical_bytes: 900_000_000,
+                file_count: 12,
+                protected: false,
+            }],
+        });
+        let planned = generate_plan(&provider, &request, &credentials, move |progress| {
+            let _ = progress_tx.send(progress);
+        })
+        .await
+        .unwrap();
+        assert!(planned.reply.contains("轻度"));
+        assert!(planned.reply.contains("中度"));
+        assert!(planned.reply.contains("重度"));
+        let progress: Vec<_> = progress_rx.try_iter().collect();
+        assert!(progress
+            .iter()
+            .any(|item| item.phase == Some(AiGenerationPhase::Plan) && item.delta.is_some()));
+        let outbound = captured.recv().unwrap();
+        assert!(outbound.contains("\"stream\":true"));
+        assert!(!outbound.contains("json_object"));
+        assert!(!outbound.contains("json_schema"));
+        assert!(!outbound.contains(GENERATION_RULE_EXAMPLE));
+        assert!(outbound.contains("cleanup-scope plan contract"));
+        assert!(outbound.contains("Space directory digest"));
+        assert!(outbound.contains("npm-cache"));
+        assert!(!outbound.contains("\"stream\":false"));
+    }
+
+    #[tokio::test]
+    async fn generate_rules_includes_plan_text_outside_instruction() {
+        let response = provider_response(ProviderKind::OpenAiCompatible, &valid_rules());
+        let (base_url, captured) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let mut request = generation_request();
+        request.plan_text = Some("轻度：仅 %TEMP% 缓存。中度：空。重度：空。".into());
+        generate_rules(&provider, &request, &credentials, |_| {})
+            .await
+            .unwrap();
+        let outbound = captured.recv().unwrap();
+        assert!(outbound.contains("planText") || outbound.contains("Honor planText"));
+        assert!(outbound.contains("%TEMP%"));
+        assert!(
+            !outbound.contains("\"instruction\":\"轻度：仅 %TEMP% 缓存。中度：空。重度：空。\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_reasoning_frames_over_legacy_256kb_still_generate() {
+        let pad = "a".repeat(1024);
+        let mut body = String::new();
+        for _ in 0..400 {
+            body.push_str("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"");
+            body.push_str(&pad);
+            body.push_str("\"}}]}\n\n");
+        }
+        let rules = valid_rules();
+        body.push_str("data: ");
+        body.push_str(&json!({"choices": [{"delta": {"content": rules}}]}).to_string());
+        body.push_str("\n\ndata: [DONE]\n\n");
+        assert!(body.len() > 256 * 1024);
+
+        let (base_url, _) = spawn_server(200, body, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let generated = generate_rules(&provider, &generation_request(), &credentials, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(generated.rules.rules.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn revision_generation_rejects_dropped_rule_coming_back() {
+        let previous = AiGeneratedRuleSet::parse(&valid_rules()).unwrap();
+        let dropped_id = previous.rules[0].id.clone();
+        let response = provider_response(ProviderKind::OpenAiCompatible, &valid_rules());
+        let (base_url, captured) = spawn_server(200, response, Duration::ZERO);
+        let credentials = FakeCredentials::default();
+        save_credential("profile-1", "fixture-secret-token".into(), &credentials).unwrap();
+        let mut provider = profile();
+        provider.base_url = base_url;
+        let mut request = generation_request();
+        request.revision = Some(cleaner_core::AiGenerationRevision {
+            previous_rules: previous,
+            dropped_ids: vec![dropped_id],
+            tier_changes: vec![],
+            rewrite_ids: vec![],
+            instruction: Some("只要缓存".into()),
+        });
+        assert_eq!(
+            generate_rules(&provider, &request, &credentials, |_| {})
+                .await
+                .unwrap_err()
+                .category,
+            ProviderErrorCategory::InvalidSchema
+        );
+        let outbound = captured.recv().unwrap();
+        assert!(outbound.contains("droppedIds") || outbound.contains(REVISION_USER_PREFIX));
+        assert!(outbound.contains("只要缓存"));
     }
 
     #[tokio::test]
@@ -1992,11 +2568,8 @@ mod tests {
             ProviderErrorCategory::Timeout
         );
 
-        let (base_url, _) = spawn_server(
-            200,
-            "x".repeat(MAX_PROVIDER_RESPONSE_BYTES as usize + 1),
-            Duration::ZERO,
-        );
+        let (base_url, _) =
+            spawn_server(200, "x".repeat(MAX_AI_RESPONSE_BYTES + 1), Duration::ZERO);
         assert_eq!(
             call_fixture(base_url, 5_000).await.unwrap_err().category,
             ProviderErrorCategory::ResponseTooLarge
@@ -2041,6 +2614,8 @@ mod tests {
             summary,
             generation_mode: None,
             target_tier: Some(AiRuleTier::Light),
+            revision: None,
+            plan_text: None,
         }
     }
 

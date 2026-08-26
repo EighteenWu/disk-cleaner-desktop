@@ -134,8 +134,8 @@ export function setGroupSelection(
 }
 
 /**
- * The default one-click selection: everything the rules consider safe, and
- * nothing that needs a human decision.
+ * The default one-click selection: safe recommended items that also opted
+ * into default selection. Recycle bin can be recommended yet stay unchecked.
  */
 export function applyRecommendedSelection(candidates: CleanupCandidate[]): CleanupCandidate[] {
   const recommendedIds: string[] = [];
@@ -146,7 +146,7 @@ export function applyRecommendedSelection(candidates: CleanupCandidate[]): Clean
       continue;
     }
 
-    if (candidate.riskLevel === "safeRecommended") {
+    if (candidate.riskLevel === "safeRecommended" && candidate.defaultSelected) {
       recommendedIds.push(candidate.id);
     } else {
       otherIds.push(candidate.id);

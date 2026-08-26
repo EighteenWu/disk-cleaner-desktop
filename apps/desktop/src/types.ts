@@ -84,10 +84,6 @@ export type CoverageGapReason =
   | "identityFallback"
   | "backendFallback"
   | "resourceLimit";
-export type InventoryDisposition = "normal" | "analysisOnly" | "blocked";
-export type InventoryObjectType = "file" | "directory" | "reparsePoint" | "other";
-export type InventorySort = "name" | "logicalBytes" | "allocatedBytes";
-
 export interface CoverageGap {
   volumeId: string;
   reason: CoverageGapReason;
@@ -125,6 +121,10 @@ export interface VolumeSpaceSummary {
   analysisOnlyCount: number;
   blockedCount: number;
 }
+
+export type InventoryDisposition = "normal" | "analysisOnly" | "blocked";
+export type InventoryObjectType = "file" | "directory" | "reparsePoint" | "other";
+export type InventorySort = "name" | "logicalBytes" | "allocatedBytes";
 
 export interface InventoryQueryItem {
   entryId: string;
@@ -194,6 +194,7 @@ export interface ScanProgress {
   scannedFiles: number;
   candidateCount: number;
   reclaimableBytes: number;
+  scannedBytes: number;
   currentPath: string;
   currentVolume: string;
   totalFiles: number | null;
@@ -202,6 +203,7 @@ export interface ScanProgress {
 
 export type RiskFilter = "all" | "recommended" | "caution" | "dangerous";
 export type ScanMode = "quick" | "full";
+export type RuleIntensity = "light" | "medium" | "heavy";
 export type ScanStatus = "idle" | "scanning" | "paused" | "complete" | "failed";
 export type CleanupStatus = "idle" | "running" | "paused" | "canceling" | "complete" | "cancelled" | "failed";
 export type AppLogKind = "scan" | "cleanup" | "operation";
@@ -295,6 +297,12 @@ export type AiProviderErrorCategory =
   | "invalidSchema"
   | "provider";
 
+export interface RedactedScanSample {
+  path: string;
+  displayName: string;
+  sizeBytes: number;
+}
+
 export interface RedactedScanBucket {
   sourceKind: string;
   riskLevel: string;
@@ -302,6 +310,7 @@ export interface RedactedScanBucket {
   candidateCount: number;
   totalBytes: number;
   sizeBand: string;
+  samples: RedactedScanSample[];
 }
 
 export interface RedactedScanSummary {
@@ -366,11 +375,52 @@ export interface AiGeneratedRuleSet {
   rules: AiGeneratedRule[];
 }
 
+export interface AiRuleTierChange {
+  id: string;
+  tier: AiRuleTier;
+}
+
+export interface AiGenerationRevision {
+  previousRules: AiGeneratedRuleSet;
+  droppedIds: string[];
+  tierChanges: AiRuleTierChange[];
+  rewriteIds: string[];
+  instruction?: string;
+}
+
 export interface AiProviderGenerationRequest {
   summary: RedactedScanSummary;
   generationMode: AiGenerationMode;
   /** Required for `singleTier`; null for `allTiers`. */
   targetTier: AiRuleTier | null;
+  revision?: AiGenerationRevision;
+  planText?: string;
+}
+
+export type AiChatRole = "user" | "assistant";
+export type AiChatMessageStatus = "streaming" | "complete" | "cancelled" | "error";
+
+export interface AiChatMessage {
+  id: string;
+  role: AiChatRole;
+  content: string;
+  status: AiChatMessageStatus;
+}
+
+export interface AiProviderPlanMessage {
+  role: AiChatRole;
+  content: string;
+}
+
+export interface AiProviderPlanRequest {
+  summary: RedactedScanSummary;
+  messages: AiProviderPlanMessage[];
+  scanSessionId?: string | null;
+}
+
+export interface AiProviderPlanResponse {
+  reply: string;
+  model: string;
 }
 
 export interface AiProviderGenerationResponse {
@@ -378,10 +428,14 @@ export interface AiProviderGenerationResponse {
   draft: AiRuleDraft;
 }
 
+export type AiGenerationPhase = "plan" | "rules";
+
 export interface AiGenerationProgress {
   elapsedMs: number;
   outputChars: number;
   bytesReceived: number;
+  phase?: AiGenerationPhase;
+  delta?: string;
 }
 
 export interface AiProviderGenerationProbeQuery {
@@ -460,6 +514,7 @@ export type RuleLibraryEventKind =
   | "saveDraft"
   | "approve"
   | "disable"
+  | "enable"
   | "delete"
   | "restore"
   | "rollbackRequested"
@@ -577,6 +632,11 @@ export type RuleLibraryMutationAction =
       envelope: ApprovedRuleEnvelope;
     }
   | {
+      type: "importAndApproveAiRule";
+      displayName: string;
+      envelope: ApprovedRuleEnvelope;
+    }
+  | {
       type: "saveDraft";
       recordId: string;
       content: string;
@@ -584,6 +644,7 @@ export type RuleLibraryMutationAction =
     }
   | { type: "approve"; recordId: string; expectedHash: string }
   | { type: "disable"; recordId: string }
+  | { type: "enable"; recordId: string }
   | { type: "delete"; recordId: string }
   | { type: "restore"; recordId: string }
   | { type: "rollback"; recordId: string; revisionId: string }
@@ -592,6 +653,10 @@ export type RuleLibraryMutationAction =
       displayName: string;
       content: string;
       provenance: RuleProvenance;
+    }
+  | {
+      type: "importAndApproveStarter";
+      displayName: string;
     };
 
 export interface RuleLibraryMutationRequest {

@@ -1,4 +1,4 @@
-use crate::{classify_path_state_markers, PathGuardLevel, RiskLevel};
+use crate::RiskLevel;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -56,34 +56,6 @@ const SUPPORTED_ENV_VARS: &[&str] = &[
     "%systemroot%",
 ];
 
-const BLOCKED_PATH_MARKERS: &[&str] = &[
-    "\\program files\\",
-    "\\program files (x86)\\",
-    "\\programfiles\\",
-    "\\windowsapps\\",
-    "\\wpsystem\\",
-    "\\config.msi\\",
-    "\\users\\public\\documents\\",
-    "\\documents\\",
-    "\\desktop\\",
-    "\\pictures\\",
-    "\\videos\\",
-    "\\music\\",
-    "\\source\\",
-    "\\repos\\",
-    "\\projects\\",
-    "\\cleandeck\\",
-    "\\resources\\app\\",
-    "\\resources\\app.asar",
-    "\\app.asar.unpacked\\",
-    "\\app.asar",
-    "\\node_modules\\",
-    "\\.venv\\",
-    "\\site-packages\\",
-    "\\vendor\\",
-    "\\.cargo\\registry\\src\\",
-];
-
 const BLOCKED_STATE_MARKERS: &[&str] = &[
     "token",
     "session",
@@ -109,28 +81,6 @@ const BLOCKED_STATE_MARKERS: &[&str] = &[
 ];
 
 const REVIEW_STATE_MARKERS: &[&str] = &["backup", "recovery", "autosave", "profile"];
-
-const REVIEW_DEPENDENCY_CACHE_MARKERS: &[&str] = &[
-    "\\npm-cache",
-    "\\npm\\cache",
-    "\\.pnpm-store",
-    "\\pnpm\\store",
-    "\\yarn\\cache",
-    "\\pip\\cache",
-    "\\uv\\cache",
-    "\\node-gyp\\cache",
-    "\\.gradle\\caches",
-    "\\gradle\\caches",
-    "\\pub\\cache",
-    "\\.pub-cache",
-    "\\nuget\\packages",
-    "\\nuget\\cache",
-    "\\composer\\cache",
-    "\\.cargo\\registry\\cache",
-    "\\.cache\\codex-runtimes",
-    "\\.cache\\chrome-devtools-mcp",
-    "\\.cache\\hyperframes",
-];
 
 const WINAPP2_HIGH_RISK_MARKERS: &[&str] = &[
     "autofill",
@@ -195,6 +145,22 @@ impl RuleLevel {
             Self::Cautious | Self::ReviewRequired => 7,
         }
     }
+
+    fn included_in(&self, intensity: RuleIntensity) -> bool {
+        match intensity {
+            RuleIntensity::Light => matches!(self, Self::Recommended),
+            RuleIntensity::Medium => matches!(self, Self::Recommended | Self::Cautious),
+            RuleIntensity::Heavy => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleIntensity {
+    Light,
+    Medium,
+    Heavy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -309,6 +275,21 @@ pub fn mandatory_rule_excludes() -> &'static [&'static str] {
     MANDATORY_RULE_EXCLUDES
 }
 
+pub fn bundled_starter_rules_yaml() -> &'static str {
+    include_str!("../../../rules/default-rules.yaml")
+}
+
+pub fn filter_rules_for_intensity(
+    rules: &[CompiledCleanupRule],
+    intensity: RuleIntensity,
+) -> Vec<CompiledCleanupRule> {
+    rules
+        .iter()
+        .filter(|rule| rule.level.included_in(intensity))
+        .cloned()
+        .collect()
+}
+
 pub fn compile_cleanup_rules_yaml(content: &str, source: RuleSourceKind) -> RuleCompilation {
     let document = match serde_yaml::from_str::<RawRuleDocument>(content) {
         Ok(document) => document,
@@ -357,7 +338,7 @@ pub fn import_winapp2_ini(content: &str, source: RuleSourceKind) -> RuleCompilat
         }
     }
 
-    let warnings = winapp2_import_warnings(&stats);
+    let mut warnings = winapp2_import_warnings(&stats);
 
     if raw_rules.is_empty() {
         return RuleCompilation {
@@ -373,19 +354,47 @@ pub fn import_winapp2_ini(content: &str, source: RuleSourceKind) -> RuleCompilat
         };
     }
 
-    let mut compilation = compile_rule_document(
-        RawRuleDocument {
-            version: Some(1),
-            name: Some("Imported Winapp2 rules".to_string()),
-            publisher: Some("Winapp2 adapter".to_string()),
-            updated_at: None,
-            rules: Some(raw_rules),
-        },
-        source,
-    );
-
-    compilation.report.warnings.splice(0..0, warnings);
+    let mut compilation = compile_winapp2_raw_rules(raw_rules, source);
+    compilation.report.warnings.splice(0..0, warnings.drain(..));
     compilation
+}
+
+fn compile_winapp2_raw_rules(
+    raw_rules: Vec<RawCleanupRule>,
+    source: RuleSourceKind,
+) -> RuleCompilation {
+    let mut compiled = Vec::new();
+    let mut warnings = Vec::new();
+    let mut ids = HashSet::new();
+
+    for raw_rule in raw_rules {
+        match compile_raw_rule(raw_rule, &source, &mut ids) {
+            Ok((rule, mut rule_warnings)) => {
+                warnings.append(&mut rule_warnings);
+                compiled.push(rule);
+            }
+            Err(rule_errors) => warnings.extend(rule_errors),
+        }
+    }
+
+    if compiled.is_empty() {
+        RuleCompilation {
+            rules: Vec::new(),
+            report: RuleValidationReport::invalid(
+                vec![issue(
+                    None,
+                    "winapp2",
+                    "没有可导入的 Winapp2 FileKey；请确认内容包含有效的 FileKey 规则（纯 RegKey 条目不会导入）",
+                )],
+                warnings,
+            ),
+        }
+    } else {
+        RuleCompilation {
+            report: RuleValidationReport::valid(compiled.len(), warnings),
+            rules: compiled,
+        }
+    }
 }
 
 pub fn validate_rule_subscription_url(url: &str) -> Result<(), RuleValidationIssue> {
@@ -469,6 +478,7 @@ struct Winapp2ImportStats {
     skipped_registry_only_entries: usize,
     skipped_entries_without_supported_file_key: usize,
     skipped_complex_file_keys: usize,
+    skipped_unsupported_file_keys: usize,
 }
 
 struct Winapp2FileKey {
@@ -541,6 +551,11 @@ fn import_winapp2_entry(
     for value in file_values {
         match parse_winapp2_file_key(value) {
             Ok(file_key) => {
+                if !winapp2_base_path_supported(&file_key.base_path) {
+                    stats.skipped_unsupported_file_keys += 1;
+                    continue;
+                }
+
                 uses_recursive_file_key |= file_key.recursive;
                 for pattern in &file_key.patterns {
                     let combined = if file_key.recursive {
@@ -719,6 +734,10 @@ fn winapp2_import_warnings(stats: &Winapp2ImportStats) -> Vec<RuleValidationIssu
             "跳过无可导入 FileKey 的条目",
         ),
         (stats.skipped_complex_file_keys, "跳过无法解析的 FileKey"),
+        (
+            stats.skipped_unsupported_file_keys,
+            "跳过不支持的 FileKey 路径",
+        ),
     ];
 
     for (count, label) in skipped {
@@ -759,6 +778,12 @@ fn winapp2_entry_matches_markers(entry: &Winapp2Entry, paths: &[String], markers
             .iter()
             .any(|marker| normalized.contains(&marker.to_ascii_lowercase()))
     })
+}
+
+fn winapp2_base_path_supported(path: &str) -> bool {
+    let mut errors = Vec::new();
+    validate_rule_path(path, &None, &mut errors);
+    errors.is_empty()
 }
 
 fn normalize_winapp2_env_path(path: &str) -> String {
@@ -947,7 +972,7 @@ fn compile_raw_rule(
 ) -> Result<(CompiledCleanupRule, Vec<RuleValidationIssue>), Vec<RuleValidationIssue>> {
     let rule_id = raw_rule.id.clone();
     let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let warnings: Vec<RuleValidationIssue> = Vec::new();
 
     let id = required_string(rule_id.as_deref(), "id", &rule_id, &mut errors);
     let name = required_string(raw_rule.name.as_deref(), "name", &rule_id, &mut errors);
@@ -1039,19 +1064,7 @@ fn compile_raw_rule(
     }
 
     let id = id.expect("validated id");
-    let mut risk_level = level.risk_level();
-
-    for path in &paths {
-        let normalized = normalize_rule_path_for_match(path);
-        let safety = evaluate_rule_path_safety(&normalized, source);
-        match safety {
-            PathSafety::Allowed => {}
-            PathSafety::Review(reason) => {
-                risk_level = downgrade_to_review(risk_level);
-                warnings.push(issue(Some(id.clone()), "paths", reason));
-            }
-        }
-    }
+    let risk_level = level.risk_level();
 
     let mut default_selected =
         raw_rule.default_selected.unwrap_or(false) && risk_level == RiskLevel::SafeRecommended;
@@ -1196,79 +1209,6 @@ fn is_drive_root(normalized_path: &str) -> bool {
         && normalized_path.as_bytes()[2] == b'\\'
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum PathSafety {
-    Allowed,
-    Review(String),
-}
-
-// 编译期只能看到含环境变量与通配符的规则路径，因此这里统一按共享守卫表给出降级建议；
-// HARD_DENY 的最终拦截由运行期 evaluate_cleanup_target_path 对展开后的真实路径执行。
-fn evaluate_rule_path_safety(normalized_path: &str, _source: &RuleSourceKind) -> PathSafety {
-    let state = classify_path_state_markers(normalized_path);
-
-    if let PathGuardLevel::HardDeny(reason) = state {
-        return PathSafety::Review(reason.to_string());
-    }
-
-    if normalized_path == "%userprofile%"
-        || normalized_path == "%appdata%"
-        || normalized_path == "%localappdata%"
-        || normalized_path == "%locallowappdata%"
-        || normalized_path == "%documents%"
-        || normalized_path == "%programdata%"
-        || normalized_path == "%windir%"
-        || normalized_path == "%systemroot%"
-    {
-        return PathSafety::Review(
-            "规则目标过宽，建议谨慎评估后再清理用户或系统根目录".to_string(),
-        );
-    }
-
-    if normalized_path.starts_with("%documents%\\") {
-        return PathSafety::Review("命中用户文档目录，建议谨慎评估后再清理".to_string());
-    }
-
-    if normalized_path.starts_with("%windir%")
-        && !normalized_path.starts_with("%windir%\\temp")
-        && !normalized_path.starts_with("%windir%\\softwaredistribution\\download")
-    {
-        return PathSafety::Review("命中 Windows 系统目录，建议谨慎评估后再清理".to_string());
-    }
-
-    if BLOCKED_PATH_MARKERS
-        .iter()
-        .any(|marker| normalized_path.contains(marker))
-    {
-        return PathSafety::Review(
-            "命中用户目录、程序目录或项目目录特征，建议谨慎评估后再清理".to_string(),
-        );
-    }
-
-    if let PathGuardLevel::NeedsConfirm(reason) = state {
-        return PathSafety::Review(reason.to_string());
-    }
-
-    if REVIEW_DEPENDENCY_CACHE_MARKERS
-        .iter()
-        .any(|marker| normalized_path.contains(marker))
-    {
-        return PathSafety::Review(
-            "命中开发依赖缓存，删除后可能需要重新下载依赖，需要用户确认".to_string(),
-        );
-    }
-
-    PathSafety::Allowed
-}
-
-fn downgrade_to_review(risk_level: RiskLevel) -> RiskLevel {
-    match risk_level {
-        RiskLevel::SafeRecommended => RiskLevel::CautiousRecommended,
-        RiskLevel::CautiousRecommended => RiskLevel::ReviewRequired,
-        RiskLevel::ReviewRequired | RiskLevel::Blocked => risk_level,
-    }
-}
-
 fn issue(
     rule_id: Option<String>,
     field: impl Into<String>,
@@ -1319,17 +1259,15 @@ rules:
         let rule = &compilation.rules[0];
         assert_eq!(rule.id, "npm.cache");
         assert_eq!(rule.clean, RuleCleanupMethod::Contents);
-        assert_eq!(rule.risk_level, RiskLevel::CautiousRecommended);
-        assert!(!rule.default_selected);
+        assert_eq!(rule.risk_level, RiskLevel::SafeRecommended);
+        assert!(rule.default_selected);
         assert!(rule.mandatory_exclude.is_empty());
     }
 
     #[test]
     fn bundled_default_rules_compile_as_conservative_user_rules() {
-        let compilation = compile_cleanup_rules_yaml(
-            include_str!("../../../rules/default-rules.yaml"),
-            RuleSourceKind::User,
-        );
+        let compilation =
+            compile_cleanup_rules_yaml(bundled_starter_rules_yaml(), RuleSourceKind::User);
 
         assert!(compilation.report.valid);
         assert!(compilation.report.rule_count >= 3);
@@ -1338,6 +1276,178 @@ rules:
                 && rule.risk_level == RiskLevel::ReviewRequired
                 && !rule.default_selected
         }));
+
+        for id in [
+            "windows.directx.shader.cache",
+            "windows.gpu.vendor.shader.cache",
+        ] {
+            let rule = compilation
+                .rules
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!(rule.level, RuleLevel::Cautious);
+            assert!(!rule.default_selected);
+        }
+
+        let thumbs = compilation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "windows.thumbnail.icon.cache")
+            .expect("thumbnail rule");
+        assert_eq!(thumbs.level, RuleLevel::Recommended);
+        assert!(thumbs.default_selected);
+        assert!(thumbs.paths.iter().all(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains("thumbcache") || lower.contains("iconcache")
+        }));
+        assert!(!thumbs.paths.iter().any(|path| {
+            path.eq_ignore_ascii_case("%LOCALAPPDATA%\\Microsoft\\Windows\\Explorer")
+        }));
+
+        for id in [
+            "windows.update.download",
+            "windows.delivery.optimization",
+            "windows.old.review",
+        ] {
+            let rule = compilation
+                .rules
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!(rule.level, RuleLevel::ReviewRequired, "{id}");
+            assert!(!rule.default_selected, "{id}");
+        }
+
+        let downloads = compilation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "user.downloads.installers")
+            .expect("downloads installers");
+        assert_eq!(downloads.level, RuleLevel::Recommended);
+        assert!(downloads.default_selected);
+        assert_eq!(downloads.clean, RuleCleanupMethod::Files);
+        assert_eq!(downloads.keep_days, 14);
+        assert!(downloads.paths.iter().all(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains("\\downloads\\") || lower.contains("\\下载\\")
+        }));
+
+        let recycle = compilation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "windows.recycle.bin")
+            .expect("recycle bin");
+        assert_eq!(recycle.level, RuleLevel::Recommended);
+        assert!(!recycle.default_selected);
+        assert_eq!(recycle.keep_days, 7);
+        assert!(recycle
+            .paths
+            .iter()
+            .any(|path| path.to_ascii_lowercase().contains("$recycle.bin")));
+
+        let discord = compilation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "discord.cache")
+            .expect("discord");
+        assert_eq!(discord.level, RuleLevel::Cautious);
+        assert!(!discord.default_selected);
+
+        let dumps = compilation
+            .rules
+            .iter()
+            .find(|rule| rule.id == "windows.crash.dumps")
+            .expect("crash dumps");
+        assert!(dumps
+            .paths
+            .iter()
+            .any(|path| path.eq_ignore_ascii_case("%WINDIR%\\Minidump")));
+
+        for rule in compilation
+            .rules
+            .iter()
+            .filter(|rule| rule.category == "浏览器缓存")
+        {
+            let joined = rule.paths.join(" ").to_ascii_lowercase();
+            assert!(!joined.contains("cookies"), "{}", rule.id);
+            assert!(!joined.contains("login data"), "{}", rule.id);
+            assert!(!joined.contains("history"), "{}", rule.id);
+            assert!(!joined.contains("indexeddb"), "{}", rule.id);
+        }
+
+        for id in [
+            "wechat.file.cache.review",
+            "qq.media.cache.review",
+            "dingtalk.cache.review",
+            "feishu.cache.review",
+            "netease.cloudmusic.cache.review",
+            "qq.music.cache.review",
+            "baidunetdisk.cache",
+            "thunder.cache",
+            "wegame.cache",
+        ] {
+            let rule = compilation
+                .rules
+                .iter()
+                .find(|rule| rule.id == id)
+                .unwrap_or_else(|| panic!("{id} missing"));
+            assert_eq!(rule.level, RuleLevel::Cautious, "{id}");
+            assert!(!rule.default_selected, "{id}");
+        }
+    }
+
+    #[test]
+    fn filter_rules_for_intensity_nests_levels_and_keeps_empty_lists() {
+        let compilation = compile_cleanup_rules_yaml(
+            r#"
+version: 1
+rules:
+  - id: a.rec
+    name: Rec
+    app: App
+    category: 临时文件
+    level: 推荐清理
+    default: true
+    paths:
+      - "%TEMP%\\rec"
+    clean: contents
+    note: rec
+  - id: b.caut
+    name: Caut
+    app: App
+    category: Windows 缓存
+    level: 谨慎清理
+    default: false
+    paths:
+      - "%TEMP%\\caut"
+    clean: contents
+    note: caut
+  - id: c.rev
+    name: Rev
+    app: App
+    category: 应用缓存
+    level: 需要确认
+    default: false
+    paths:
+      - "%TEMP%\\rev"
+    clean: contents
+    note: rev
+"#,
+            RuleSourceKind::User,
+        );
+        assert!(compilation.report.valid);
+        let cases: [(RuleIntensity, &[&str]); 3] = [
+            (RuleIntensity::Light, &["a.rec"]),
+            (RuleIntensity::Medium, &["a.rec", "b.caut"]),
+            (RuleIntensity::Heavy, &["a.rec", "b.caut", "c.rev"]),
+        ];
+        for (intensity, expected) in cases {
+            let filtered = filter_rules_for_intensity(&compilation.rules, intensity);
+            let ids: Vec<&str> = filtered.iter().map(|rule| rule.id.as_str()).collect();
+            assert_eq!(ids, expected, "{intensity:?}");
+        }
+        assert!(filter_rules_for_intensity(&[], RuleIntensity::Heavy).is_empty());
     }
 
     #[test]
@@ -1352,7 +1462,7 @@ rules:
     }
 
     #[test]
-    fn custom_rule_with_state_database_is_downgraded_and_not_default_selected() {
+    fn custom_rule_with_state_database_keeps_authored_level() {
         let yaml = r#"
 version: 1
 rules:
@@ -1372,14 +1482,10 @@ rules:
 
         assert!(compilation.report.valid);
         let rule = &compilation.rules[0];
-        assert_eq!(rule.risk_level, RiskLevel::CautiousRecommended);
+        assert_eq!(rule.risk_level, RiskLevel::SafeRecommended);
         assert_eq!(rule.clean, RuleCleanupMethod::Contents);
-        assert!(!rule.default_selected);
-        assert!(compilation
-            .report
-            .warnings
-            .iter()
-            .any(|warning| warning.message.contains("会话")));
+        assert!(rule.default_selected);
+        assert!(rule.mandatory_exclude.is_empty());
     }
 
     #[test]
@@ -1388,7 +1494,7 @@ rules:
 
         assert!(compilation.report.valid);
         let rule = &compilation.rules[0];
-        assert!(!rule.default_selected);
+        assert!(rule.default_selected);
         assert!(!rule.requires_default_confirmation);
     }
 
@@ -1561,8 +1667,8 @@ FileKey1=%Documents%\My Games\runic games\hob|ogre.log;microcodecache*
             .find(|rule| rule.id == "winapp2.hob")
             .expect("Hob rule should be imported");
         assert_eq!(hob.category, "游戏缓存");
-        assert_eq!(hob.risk_level, RiskLevel::ReviewRequired);
-        assert!(!hob.default_selected);
+        assert_eq!(hob.risk_level, RiskLevel::SafeRecommended);
+        assert!(hob.default_selected);
         assert_eq!(
             hob.paths,
             vec![
@@ -1570,6 +1676,41 @@ FileKey1=%Documents%\My Games\runic games\hob|ogre.log;microcodecache*
                 "%DOCUMENTS%\\My Games\\runic games\\hob\\microcodecache*"
             ]
         );
+    }
+
+    #[test]
+    fn winapp2_import_skips_unsupported_package_paths_without_failing_the_pack() {
+        let ini = r#"
+[Dolby Access *]
+LangSecRef=3021
+FileKey1=%LocalAppData%\Packages\DolbyLaboratories.DolbyAccess_rz1tebttyb220\AC|*|RECURSE
+FileKey2=%Package\LocalCache|*.log
+
+[Samsung Live Wallpaper *]
+LangSecRef=3021
+FileKey1=%Package\LiveWallpaperData\Log|*
+FileKey2=%Package\LiveWallpaperData\Temporary|*
+"#;
+
+        let compilation = import_winapp2_ini(ini, RuleSourceKind::User);
+
+        assert!(
+            compilation.report.valid,
+            "unsupported FileKeys should not invalidate the pack: {:?}",
+            compilation.report.errors
+        );
+        assert_eq!(compilation.rules.len(), 1);
+        assert_eq!(compilation.rules[0].id, "winapp2.dolby.access");
+        assert!(compilation.rules[0]
+            .paths
+            .iter()
+            .all(|path| !path.to_ascii_lowercase().contains("%package")));
+        assert!(compilation
+            .report
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("跳过不支持的 FileKey 路径")));
+        assert!(compilation.report.errors.is_empty());
     }
 
     #[test]
@@ -1598,7 +1739,7 @@ rules:
     }
 
     #[test]
-    fn custom_rules_cannot_target_application_runtime_payloads() {
+    fn custom_rules_keep_authored_level_for_runtime_payload_paths() {
         let yaml = r#"
 version: 1
 rules:
@@ -1616,7 +1757,7 @@ rules:
 
         assert!(compilation.report.valid);
         let rule = &compilation.rules[0];
-        assert_eq!(rule.risk_level, RiskLevel::CautiousRecommended);
+        assert_eq!(rule.risk_level, RiskLevel::SafeRecommended);
         assert_eq!(rule.clean, RuleCleanupMethod::Manual);
     }
 }

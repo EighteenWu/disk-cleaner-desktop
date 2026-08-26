@@ -1,6 +1,7 @@
 use cleaner_core::{
     CoverageGap, DirectoryAggregate, InventoryDisposition, InventoryEntry, InventoryObjectType,
-    InventoryPage, InventoryQueryItem, InventorySink, InventorySort, ScanCoverageStatus,
+    InventoryPage, InventoryQueryItem, InventorySink, InventorySort, RawSpaceDirectory,
+    ScanCoverageStatus, SPACE_DIGEST_FETCH_LIMIT,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
@@ -149,6 +150,48 @@ impl InventoryRepository {
                 requested_limit: limit,
             },
         )
+    }
+
+    pub fn list_largest_directories(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<RawSpaceDirectory>, String> {
+        let limit = limit.clamp(1, SPACE_DIGEST_FETCH_LIMIT);
+        let state = self.lock();
+        let connection = active_connection(&state, session_id)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT e.entry_id, a.subtree_logical_bytes, a.subtree_allocated_bytes, a.file_count, e.disposition \
+                 FROM directory_aggregate a INNER JOIN entry e ON e.entry_id = a.entry_id \
+                 WHERE e.object_type = 'directory' \
+                 ORDER BY a.subtree_allocated_bytes DESC, e.entry_id LIMIT ?1",
+            )
+            .map_err(db_error("准备最大目录查询"))?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    from_i64(row.get(1)?),
+                    from_i64(row.get(2)?),
+                    from_i64(row.get(3)?),
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(db_error("执行最大目录查询"))?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (entry_id, logical_bytes, allocated_bytes, file_count, disposition) =
+                row.map_err(db_error("读取最大目录"))?;
+            items.push(RawSpaceDirectory {
+                path: reconstruct_path(connection, &entry_id)?,
+                allocated_bytes,
+                logical_bytes,
+                file_count,
+                disposition: parse_disposition(&disposition),
+            });
+        }
+        Ok(items)
     }
 
     pub fn list_largest(
@@ -648,6 +691,57 @@ mod tests {
         );
         assert!(fs::read_dir(&root).expect("read root").next().is_none());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn largest_directories_use_subtree_aggregates() {
+        let root = test_root("dirs");
+        let repository = InventoryRepository::default();
+        repository.initialize(root.clone()).expect("initialize");
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut writer = repository
+            .start_session(&session_id, &["C".to_string()])
+            .expect("start session");
+        writer
+            .write_entry(&dir_entry(&session_id, "1", None, "C:", 0))
+            .expect("root");
+        writer
+            .write_entry(&dir_entry(&session_id, "2", Some("1"), "Cache", 0))
+            .expect("cache dir");
+        writer
+            .write_directory_aggregate(&DirectoryAggregate {
+                scan_session_id: session_id.clone(),
+                entry_id: "2".into(),
+                subtree_logical_bytes: 50 * 1024 * 1024,
+                subtree_allocated_bytes: 50 * 1024 * 1024,
+                file_count: 12,
+                directory_count: 1,
+                analysis_only_count: 0,
+                blocked_count: 0,
+            })
+            .expect("aggregate");
+        writer.finish(ScanCoverageStatus::Complete).expect("finish");
+        let dirs = repository
+            .list_largest_directories(&session_id, 10)
+            .expect("dirs");
+        assert_eq!(dirs.len(), 1);
+        assert!(dirs[0].path.replace('/', "\\").ends_with("Cache"));
+        assert_eq!(dirs[0].allocated_bytes, 50 * 1024 * 1024);
+        assert_eq!(dirs[0].file_count, 12);
+        repository.close_session(&session_id).expect("close");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn dir_entry(
+        session_id: &str,
+        entry_id: &str,
+        parent_entry_id: Option<&str>,
+        name: &str,
+        allocated_bytes: u64,
+    ) -> InventoryEntry {
+        let mut item = entry(session_id, entry_id, parent_entry_id, name, allocated_bytes);
+        item.object_type = InventoryObjectType::Directory;
+        item
     }
 
     fn entry(

@@ -1,19 +1,28 @@
-import { Database, Search, ShieldAlert } from "lucide-react";
+import { ChevronRight, FolderOpen, HardDrive, Search, ShieldAlert } from "lucide-react";
+import { isIncompleteCoverage, mergeActionableGaps, occupancyPercent } from "../inventory";
 import { formatBytes } from "../state";
-import { isIncompleteCoverage } from "../inventory";
-import type { InventoryQueryItem, ScanSnapshot } from "../types";
+import type { InventoryQueryItem, ScanSnapshot, VolumeInfo, VolumeSpaceSummary } from "../types";
+
+export interface SpaceCrumb {
+  entryId: string | null;
+  name: string;
+}
 
 export interface SpaceAnalysisPanelProps {
   snapshot: ScanSnapshot;
   items: InventoryQueryItem[];
+  crumbs: SpaceCrumb[];
   query: string;
-  mode: "largest" | "search";
+  mode: "largest" | "children" | "search";
   loading: boolean;
   error: string | null;
   hasMore: boolean;
   onQueryChange: (value: string) => void;
   onSearch: () => void;
   onShowLargest: () => void;
+  onOpenRoot: () => void;
+  onOpenCrumb: (index: number) => void;
+  onOpenDirectory: (item: InventoryQueryItem) => void;
   onLoadMore: () => void;
   onReveal: (path: string) => void;
   translate: (key: string, values?: Record<string, string | number>) => string;
@@ -22,6 +31,7 @@ export interface SpaceAnalysisPanelProps {
 export function SpaceAnalysisPanel({
   snapshot,
   items,
+  crumbs,
   query,
   mode,
   loading,
@@ -30,24 +40,21 @@ export function SpaceAnalysisPanel({
   onQueryChange,
   onSearch,
   onShowLargest,
+  onOpenRoot,
+  onOpenCrumb,
+  onOpenDirectory,
   onLoadMore,
   onReveal,
   translate
 }: SpaceAnalysisPanelProps) {
-  if (!snapshot.scanSessionId || snapshot.coverage.status === "notStarted") {
-    return null;
-  }
-
   const incomplete = isIncompleteCoverage(snapshot.coverage.status);
+  const volumes = snapshot.volumes.filter((volume) => volume.selected);
 
   return (
-    <section className="spaceAnalysis" aria-labelledby="space-analysis-title">
-      <div className="spaceAnalysisHeader">
+    <section className="spaceWorkbench" aria-labelledby="space-analysis-title">
+      <header className={`spaceBanner ${incomplete ? "incomplete" : "complete"}`}>
         <div>
-          <h3 id="space-analysis-title">
-            <Database size={15} />
-            {translate("inventory.title")}
-          </h3>
+          <h3 id="space-analysis-title">{translate("inventory.title")}</h3>
           <p>
             {translate("inventory.coverageSummary", {
               visited: snapshot.coverage.visitedEntries,
@@ -60,46 +67,40 @@ export function SpaceAnalysisPanel({
           {incomplete ? <ShieldAlert size={12} /> : null}
           {translate(`inventory.status.${snapshot.coverage.status}`)}
         </span>
-      </div>
+      </header>
 
-      <div className="volumeSummaryList">
-        {snapshot.spaceSummary.map((volume) => (
-          <div className="volumeSummaryRow" key={volume.volumeId}>
-            <strong>{volume.volumeId}:</strong>
-            <span>{formatBytes(volume.allocatedBytes)}</span>
-            <span>
-              {translate("inventory.logical", { size: formatBytes(volume.logicalBytes) })}
-            </span>
-            <span>
-              {translate("inventory.objects", {
-                files: volume.fileCount,
-                directories: volume.directoryCount
-              })}
-            </span>
-            <span>
-              {translate("inventory.protected", {
-                count: volume.analysisOnlyCount + volume.blockedCount
-              })}
-            </span>
-          </div>
-        ))}
-      </div>
-
-      {snapshot.coverage.gaps.length > 0 ? (
-        <div className="coverageGaps" role="status">
-          {snapshot.coverage.gaps.slice(0, 5).map((gap, index) => (
-            <span key={`${gap.volumeId}-${gap.reason}-${index}`}>
+      {incomplete && snapshot.coverage.gaps.length > 0 ? (
+        <ul className="spaceGaps">
+          {mergeActionableGaps(snapshot.coverage.gaps).slice(0, 6).map((gap) => (
+            <li key={`${gap.volumeId}-${gap.reason}`}>
               {translate("inventory.gap", {
                 volume: gap.volumeId,
                 reason: translate(`inventory.gap.${gap.reason}`),
                 count: gap.count
               })}
-            </span>
+            </li>
           ))}
-        </div>
+        </ul>
       ) : null}
 
-      <div className="inventoryToolbar">
+      {snapshot.spaceSummary.length > 0 ? (
+        <ul className="spaceVolumes">
+          {snapshot.spaceSummary.map((summary) => {
+            const volume = volumes.find((item) => item.id === summary.volumeId);
+            return (
+              <li key={summary.volumeId}>
+                <VolumeOccupancy
+                  summary={summary}
+                  volume={volume}
+                  translate={translate}
+                />
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+
+      <div className="spaceToolbar">
         <label className="searchField">
           <Search size={14} />
           <input
@@ -117,33 +118,66 @@ export function SpaceAnalysisPanel({
         <button className="ghostButton" onClick={onSearch} disabled={loading || !query.trim()}>
           {translate("inventory.search")}
         </button>
-        <button className="ghostButton" onClick={onShowLargest} disabled={loading}>
+        <button
+          className={`ghostButton ${mode === "largest" ? "active" : ""}`}
+          onClick={onShowLargest}
+          disabled={loading}
+        >
           {translate("inventory.largest")}
         </button>
       </div>
 
-      <div className="inventoryResults" aria-busy={loading}>
-        <div className="inventoryResultsTitle">
-          {translate(mode === "largest" ? "inventory.largestTitle" : "inventory.searchTitle")}
+      <nav className="spaceCrumbs" aria-label={translate("inventory.breadcrumb")}>
+        <button type="button" onClick={onOpenRoot} disabled={loading}>
+          <HardDrive size={13} />
+          {translate("inventory.root")}
+        </button>
+        {crumbs.map((crumb, index) => (
+          <span key={`${crumb.entryId ?? "root"}-${crumb.name}`}>
+            <ChevronRight size={12} />
+            <button type="button" onClick={() => onOpenCrumb(index)} disabled={loading}>
+              {crumb.name}
+            </button>
+          </span>
+        ))}
+      </nav>
+
+      <div className="spaceResults" aria-busy={loading}>
+        <div className="spaceResultsHead">
+          <span>{translate(listTitleKey(mode))}</span>
+          <span>{translate("inventory.sizeAllocated")}</span>
         </div>
         {error ? <p className="inventoryError">{error}</p> : null}
         {!loading && !error && items.length === 0 ? (
           <p className="inventoryEmpty">{translate("inventory.empty")}</p>
         ) : null}
-        {items.map((item) => (
-          <button
-            className="inventoryRow"
-            key={item.entryId}
-            onClick={() => onReveal(item.path)}
-            title={item.path}
-          >
-            <span className="inventoryName">{item.name}</span>
-            <span>{formatBytes(item.allocatedBytes)}</span>
-            <span className={`badge ${item.disposition === "normal" ? "info" : "warn"}`}>
-              {translate(`inventory.disposition.${item.disposition}`)}
-            </span>
-          </button>
-        ))}
+        {items.map((item) => {
+          const expandable = item.objectType === "directory" && item.hasChildren;
+          return (
+            <div className="spaceRow" key={item.entryId}>
+              <button
+                type="button"
+                className="spaceRowMain"
+                onClick={() => (expandable ? onOpenDirectory(item) : onReveal(item.path))}
+                title={item.path}
+              >
+                <span className="inventoryName">{item.name}</span>
+                <span className="spaceRowSize">{formatBytes(item.allocatedBytes)}</span>
+                <span className={`badge ${dispositionBadge(item.disposition)}`}>
+                  {translate(`inventory.disposition.${item.disposition}`)}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="ghostButton spaceReveal"
+                onClick={() => onReveal(item.path)}
+                title={translate("inventory.openLocation")}
+              >
+                <FolderOpen size={14} />
+              </button>
+            </div>
+          );
+        })}
         {hasMore ? (
           <button className="ghostButton inventoryMore" onClick={onLoadMore} disabled={loading}>
             {loading ? translate("inventory.loading") : translate("inventory.loadMore")}
@@ -153,3 +187,65 @@ export function SpaceAnalysisPanel({
     </section>
   );
 }
+
+function VolumeOccupancy({
+  summary,
+  volume,
+  translate
+}: {
+  summary: VolumeSpaceSummary;
+  volume: VolumeInfo | undefined;
+  translate: SpaceAnalysisPanelProps["translate"];
+}) {
+  const total = volume?.totalBytes ?? 0;
+  const usedPercent = occupancyPercent(summary.allocatedBytes, total);
+
+  return (
+    <div className="spaceVolume">
+      <div className="spaceVolumeTop">
+        <strong>{summary.volumeId}:</strong>
+        <span>
+          {formatBytes(summary.allocatedBytes)}
+          {total > 0 ? ` / ${formatBytes(total)}` : ""}
+        </span>
+      </div>
+      <div className="meter" aria-hidden="true">
+        <span style={{ width: `${usedPercent}%` }} />
+      </div>
+      <p className="spaceVolumeMeta">
+        {translate("inventory.logical", { size: formatBytes(summary.logicalBytes) })}
+        {" · "}
+        {translate("inventory.objects", {
+          files: summary.fileCount,
+          directories: summary.directoryCount
+        })}
+        {" · "}
+        {translate("inventory.protected", {
+          count: summary.analysisOnlyCount + summary.blockedCount
+        })}
+      </p>
+    </div>
+  );
+}
+
+function listTitleKey(mode: SpaceAnalysisPanelProps["mode"]): string {
+  if (mode === "search") {
+    return "inventory.searchTitle";
+  }
+  if (mode === "children") {
+    return "inventory.folderTitle";
+  }
+  return "inventory.largestTitle";
+}
+
+function dispositionBadge(disposition: InventoryQueryItem["disposition"]): string {
+  if (disposition === "blocked") {
+    return "danger";
+  }
+  if (disposition === "analysisOnly") {
+    return "warn";
+  }
+  return "info";
+}
+
+

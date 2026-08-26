@@ -1,6 +1,8 @@
 # DiskClean 自定义规则编写说明
 
-DiskClean 自定义规则使用 YAML。规则通过校验后会在下一次扫描时传给后端，命中的路径会生成清理候选。执行清理时仍会再次应用路径保护、`keep_days`、`exclude` 和强制安全排除项。
+DiskClean 自定义规则使用 YAML。规则通过校验、保存并批准进本地规则库后，才会在下一次扫描时传给后端，命中的路径会生成清理候选。执行清理时仍会再次应用路径保护、`keep_days`、`exclude` 和强制安全排除项。
+
+仓库里的 `rules/default-rules.yaml` 是推荐规则包，不会在启动时自动加载。空库时点击「使用推荐规则」会把它作为一条 `imported` / `bundledStarter` 记录批准进本地库；已导入且无未批准草稿时再次点击会更新到最新官方包。扫描侧栏的低/中/高是**清理档位**，只决定清哪些规则，并且会自动勾选当前档位内的项（回收站除外）：低档是临时文件、浏览器缓存、下载目录中超过 14 天的安装包；中档再加上常用软件缓存、软件内下载和工具记录；高档再加上开发依赖、Windows 更新残留和 Windows.old。是否遍历整盘由「快速扫描 / 全盘分析」决定，和清理档位无关。自动化任务不受档位影响。
 
 规则文件启用了严格字段校验：未定义字段、空必填字段、非法路径或非法枚举值都会导致校验失败。
 
@@ -169,16 +171,21 @@ paths:
 **\\*.vscdb
 ```
 
-以下路径或特征会被锁定或降级：
+以下路径会禁止清理（即使用户勾选）：
 
-- `%USERPROFILE%`、`%APPDATA%`、`%LOCALAPPDATA%`、`%LOCALLOWAPPDATA%`、`%DOCUMENTS%`、`%PROGRAMDATA%`、`%WINDIR%`、`%SYSTEMROOT%` 根目录。
-- 非临时 Windows 系统目录；目前只允许 `%WINDIR%\\Temp`、`%WINDIR%\\SoftwareDistribution\\Download` 和部分诊断、错误报告、崩溃转储路径进入审查。
-- `Program Files`、`WindowsApps`、`WpSystem`、`Config.Msi`、用户文档、桌面、图片、视频、音乐、源码、仓库、项目目录。
-- Electron / Chromium 应用主体，例如 `resources\\app`、`app.asar`、`app.asar.unpacked`。
-- 项目依赖运行目录，例如 `node_modules`、`.venv`、`site-packages`、`vendor`、`.cargo\\registry\\src`。
-- 账号、会话、钱包、密钥、凭据、IndexedDB、Local Storage、Session Storage、Cookies、Login Data、History、SQLite、数据库文件。
-- 普通应用日志、备份、恢复、自动保存、Profile 数据。
+- 盘符根目录，以及 DiskClean 自身运行目录。
+- 非白名单 Windows 系统目录；目前只允许 `%WINDIR%\\Temp`、`%WINDIR%\\SoftwareDistribution\\Download` 和部分诊断、错误报告、崩溃转储路径。
+- `WindowsApps`、`WpSystem`、`Config.Msi`。
+
+以下路径默认不勾选，用户确认后可以删除：
+
+- `Program Files` 安装目录，以及 Electron / Chromium 应用主体（`resources\\app`、`app.asar`）。
+- 钱包、密钥串、凭据、令牌、会话机密路径。
+- 用户文档、桌面、图片、视频、音乐。
+- IndexedDB、Local Storage、Cookies、Login Data、History、SQLite 和其它应用状态数据库。
+- 项目依赖运行目录，例如 `node_modules`、`.venv`、`site-packages`、`vendor`。
 - npm、pnpm、Yarn、pip、uv、Gradle、Pub、NuGet、Composer、Cargo 等开发依赖缓存。
+- 备份、恢复、自动保存、Profile 数据。
 
 ## 订阅规则
 
@@ -202,16 +209,16 @@ paths:
 
 - 只导入可以准确映射的 `FileKey=path|fileParameters`。
 - `RegKey` 暂不导入。
-- 浏览器历史、Cookie、账号会话、`Web Data`、`Local Storage` 等状态数据不导入或降级。
-- `%ProgramFiles%`、`%SystemDrive%` 等安装目录或系统根路径会触发审查或跳过。
-- 导入规则全部会经过 DiskClean 路径保护、强制排除、`keep_days` 和清理前复检。
+- `%Package` 等不受支持的路径前缀会跳过该 FileKey 并记警告，其余合法规则继续导入。
+- 高风险条目标题（Cookie、History、密码等）导入为「需要确认」，不会默认勾选。
+- 导入成功的规则批准后按路径执行，不再被启发式保护表整包拦截。
 
 ## 推荐实践
 
 - 先写 `manual` 或 `需要确认`，确认命中路径准确后再提升为 `谨慎清理` 或 `推荐清理`。
 - 优先清理明确可再生的缓存和临时目录。
-- 构建产物、依赖缓存、日志和诊断数据默认设为 `需要确认`。
-- 不要清理配置、用户数据、状态数据库、项目依赖安装目录和应用运行文件。
+- 构建产物、依赖缓存、日志和诊断数据建议设为 `谨慎清理` 或 `需要确认`。
+- 系统目录（盘符根、Windows 系统目录、WindowsApps）不要写进规则。安装目录和钱包/凭据可以写，但应设为 `需要确认`。
 - 不要把根目录或过宽路径作为清理目标。
 - `note` 要写清楚为什么可清理，以及删除后是否会重新生成。
 - 每次新增规则后，在应用的规则面板中先执行校验，再进行扫描和清理验证。

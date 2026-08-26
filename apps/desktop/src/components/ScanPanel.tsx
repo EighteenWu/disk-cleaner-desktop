@@ -1,6 +1,7 @@
+import { isIncompleteCoverage } from "../inventory";
 import { formatBytes } from "../state";
 import { localizedScanPhase, type LanguageCode } from "../i18n";
-import { isScanBusy, scanStatsVisible, type SessionState } from "../session";
+import { isScanBusy, scanHeadlineBytes, scanStatsVisible, type SessionState } from "../session";
 
 /**
  * Reads straight off the session machine. Because `scan.hasRun` never flips
@@ -32,6 +33,11 @@ export function ScanPanel({
   const { scan } = session;
   const busy = isScanBusy(session);
   const determinate = scan.percent !== null;
+  const coverageStatus = session.snapshot?.coverage.status;
+  const phaseLabel =
+    !busy && coverageStatus && isIncompleteCoverage(coverageStatus)
+      ? translate(`inventory.status.${coverageStatus}`)
+      : localizedScanPhase(language, scan.phase);
 
   return (
     <section className="scanPanel" aria-live="polite">
@@ -41,9 +47,9 @@ export function ScanPanel({
           <strong className="scanCountValue">{formatCount(scan.scannedFiles)}</strong>
         </div>
         <div className="scanPanelStats">
-          <span>{localizedScanPhase(language, scan.phase)}</span>
+          <span>{phaseLabel}</span>
           <span>{translate("scan.elapsedValue", { duration: formatDuration(scan.elapsedMs) })}</span>
-          <span>{formatBytes(scan.reclaimableBytes)}</span>
+          <span>{formatBytes(scanHeadlineBytes(scan))}</span>
         </div>
       </div>
 

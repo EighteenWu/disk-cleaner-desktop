@@ -159,6 +159,12 @@ textarea {
   color: inherit;
 }
 
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 :focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
@@ -1100,6 +1106,13 @@ textarea {
   border-bottom: 0;
 }
 
+.candidateRow.active,
+.candidateRow:focus-within {
+  align-items: flex-start;
+  padding-top: var(--space-1);
+  padding-bottom: var(--space-1);
+}
+
 .candidateRow.active {
   background: var(--info-bg);
 }
@@ -1132,6 +1145,14 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.candidateRow.active .candidatePath,
+.candidateRow:focus-within .candidatePath {
+  overflow: visible;
+  text-overflow: unset;
+  white-space: normal;
+  word-break: break-all;
 }
 
 .candidateSource {
@@ -1332,8 +1353,13 @@ textarea {
 }
 
 .dialog.ruleDialog,
-.dialog.logDialog {
+.dialog.logDialog,
+.dialog.ruleConfirmDialog {
   width: min(720px, 100%);
+}
+
+.dialogOverlay.ruleConfirmOverlay {
+  z-index: 50;
 }
 
 .dialogHeader {
@@ -1507,6 +1533,63 @@ textarea {
   gap: var(--space-2);
 }
 
+.ruleAiChat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.ruleAiChatLog {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 240px;
+  overflow: auto;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--muted-surface);
+}
+
+.ruleAiChatBubble {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+.ruleAiChatBubble-user {
+  border: 1px solid var(--border-strong);
+}
+
+.ruleAiChatBubble-assistant {
+  border: 1px solid var(--info-border);
+}
+
+.ruleAiChatBubble.isMuted {
+  color: var(--muted);
+}
+
+.ruleAiChatBubble p,
+.ruleAiChatBubble small {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ruleAiChatInput {
+  width: 100%;
+  min-height: 72px;
+  padding: var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--foreground);
+  resize: vertical;
+}
+
 .ruleAiSummary {
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
@@ -1583,6 +1666,51 @@ textarea {
   margin: var(--space-1) 0 0;
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.ruleConfirmList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ruleConfirmItem {
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--muted-surface);
+}
+
+.ruleConfirmItemHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.ruleConfirmItem p,
+.ruleConfirmItem small {
+  display: block;
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.ruleConfirmItemActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.ruleConfirmCheck {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 .ruleLibrary {
@@ -1750,11 +1878,15 @@ textarea {
 
 .ruleUrlRow input {
   flex: 1;
+  min-width: 0;
   height: 30px;
   padding: 0 var(--space-2);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-sm);
   background: var(--surface);
+  color: var(--foreground);
+  -webkit-user-select: text;
+  user-select: text;
 }
 
 .ruleReport {

@@ -118,6 +118,33 @@ export function shouldAutoDetectProvider(apiKey: string): boolean {
   return apiKey.trim().length > 0;
 }
 
+export type ProviderDetectTrigger = "change" | "paste" | "blur" | "explicit";
+
+/** Keystrokes must not hit the network. Paste is queued after the input commits. */
+export function shouldQueueProviderDetect(
+  trigger: ProviderDetectTrigger,
+  apiKey: string
+): boolean {
+  if (trigger === "change") {
+    return false;
+  }
+  if (trigger === "explicit") {
+    return true;
+  }
+  return shouldAutoDetectProvider(apiKey);
+}
+
+export function nextInputValueFromPaste(
+  current: string,
+  selectionStart: number | null,
+  selectionEnd: number | null,
+  pasted: string
+): string {
+  const start = selectionStart ?? current.length;
+  const end = selectionEnd ?? current.length;
+  return `${current.slice(0, start)}${pasted}${current.slice(end)}`;
+}
+
 /** Named vendor templates must not clobber an unrelated saved profile on auto-save. */
 export function shouldCreateProfileForVendor(
   vendorId: ProviderVendorId,

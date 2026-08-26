@@ -7,6 +7,7 @@ import {
   isCleanupBusy,
   isScanBusy,
   primaryAction,
+  scanHeadlineBytes,
   scanStatsVisible,
   sessionReducer,
   type SessionEvent,
@@ -50,6 +51,7 @@ function scanProgress(overrides: Partial<ScanProgress> = {}): ScanProgress {
     scannedFiles: 1200,
     candidateCount: 5,
     reclaimableBytes: 1024,
+    scannedBytes: 0,
     currentPath: "C:\\Windows\\Temp",
     currentVolume: "C",
     totalFiles: 2400,
@@ -179,6 +181,35 @@ describe("session lifecycle", () => {
 
     expect(settled.scan.candidateCount).toBe(11);
     expect(settled.scan.percent).toBe(100);
+  });
+
+  it("copies live scanned bytes from progress events", () => {
+    const scanning = reduceAll(READY, [
+      { type: "scanStarted", at: 0 },
+      { type: "scanProgress", progress: scanProgress({ scannedBytes: 12_345, reclaimableBytes: 4096 }) }
+    ]);
+
+    expect(scanning.scan.scannedBytes).toBe(12_345);
+    expect(scanHeadlineBytes(scanning.scan)).toBe(12_345);
+  });
+
+  it("uses coverage allocated bytes as the finished scan total", () => {
+    const finished = snapshot();
+    finished.coverage = {
+      ...finished.coverage,
+      allocatedBytes: 50 * 1024 * 1024 * 1024,
+      logicalBytes: 48 * 1024 * 1024 * 1024
+    };
+
+    const settled = reduceAll(READY, [
+      { type: "scanStarted", at: 0 },
+      { type: "scanProgress", progress: scanProgress({ reclaimableBytes: 4096 }) },
+      { type: "scanSucceeded", snapshot: finished, at: 100 }
+    ]);
+
+    expect(settled.scan.reclaimableBytes).toBe(4096);
+    expect(settled.scan.scannedBytes).toBe(50 * 1024 * 1024 * 1024);
+    expect(scanHeadlineBytes(settled.scan)).toBe(50 * 1024 * 1024 * 1024);
   });
 });
 

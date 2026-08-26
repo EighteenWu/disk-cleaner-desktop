@@ -1,27 +1,47 @@
 #[cfg(test)]
 use crate::rules::RuleCleanupMethod;
-use crate::rules::{
-    compile_cleanup_rules_yaml, mandatory_rule_excludes, RuleCompilation, RuleLevel, RuleSourceKind,
-};
+use crate::rules::{compile_cleanup_rules_yaml, RuleCompilation, RuleLevel, RuleSourceKind};
 use crate::{CleanupCandidate, RiskLevel, ScanSnapshot};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-pub const AI_SUMMARY_SCHEMA_VERSION: u16 = 1;
-pub const AI_REDACTION_VERSION: u16 = 1;
+pub const AI_SUMMARY_SCHEMA_VERSION: u16 = 3;
+pub const AI_REDACTION_VERSION: u16 = 3;
+const AI_RULE_SCHEMA_VERSION: u16 = 1;
+const AI_DRAFT_SCHEMA_VERSION: u16 = 1;
+const AI_DRAFT_REDACTION_VERSION: u16 = 1;
 const MAX_BUCKETS: usize = 64;
-const MAX_SUMMARY_BYTES: usize = 16 * 1024;
+const MAX_SUMMARY_BYTES: usize = 128 * 1024;
+const MAX_SAMPLES_PER_BUCKET: usize = 10;
 const MAX_RULES_PER_TIER: usize = 32;
 const MAX_PATHS_PER_RULE: usize = 16;
 const MAX_EXCLUDES_PER_RULE: usize = 32;
 const MAX_EXPLANATIONS_PER_RULE: usize = 8;
-const MAX_AI_RESPONSE_BYTES: usize = 256 * 1024;
+pub const MAX_AI_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_TEXT_CHARS: usize = 512;
 const MAX_PATH_CHARS: usize = 1024;
+const ALLOWED_RISK_SIGNALS: &[&str] = &[
+    "credentials",
+    "sessions",
+    "databases",
+    "sourceTree",
+    "locallyBlocked",
+    "coverage-partial",
+    "coverage-cancelled",
+    "coverage-failed",
+    "coverage-access-denied",
+    "coverage-reparse-boundary",
+    "coverage-resource-limit",
+    "coverage-backend-fallback",
+    "coverage-metadata-gap",
+    "inventory-analysis-only",
+    "inventory-blocked",
+];
 
-/// A deterministic, path-free representation of a completed local scan.
-/// It is the only scan payload allowed to cross the AI provider boundary.
+/// Hybrid scan summary for the AI provider boundary: full aggregate buckets plus
+/// limited path samples (`path` / `displayName` / `sizeBytes`). `redaction_version`
+/// tracks disclosure policy, not zero-path.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RedactedScanSummary {
@@ -44,6 +64,15 @@ pub struct RedactedScanBucket {
     pub candidate_count: u32,
     pub total_bytes: u64,
     pub size_band: String,
+    pub samples: Vec<RedactedScanSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RedactedScanSample {
+    pub path: String,
+    pub display_name: String,
+    pub size_bytes: u64,
 }
 
 impl RedactedScanSummary {
@@ -91,6 +120,8 @@ impl RedactedScanSummary {
                     | "cache"
                     | "other"
             ) || bucket.candidate_count == 0
+                || bucket.samples.len() > MAX_SAMPLES_PER_BUCKET
+                || bucket.samples.len() > bucket.candidate_count as usize
                 || bucket.size_band != size_band(bucket.total_bytes)
                 || !bucket_keys.insert((
                     bucket.source_kind.as_str(),
@@ -100,14 +131,18 @@ impl RedactedScanSummary {
             {
                 return Err("脱敏摘要聚合桶无效。".to_string());
             }
+            for sample in &bucket.samples {
+                if !valid_summary_text(&sample.path, MAX_PATH_CHARS)
+                    || !valid_summary_text(&sample.display_name, MAX_PATH_CHARS)
+                {
+                    return Err("脱敏摘要路径样本无效。".to_string());
+                }
+            }
         }
 
         let mut signals = HashSet::new();
         if self.risk_signals.iter().any(|signal| {
-            !matches!(
-                signal.as_str(),
-                "credentials" | "sessions" | "databases" | "sourceTree" | "locallyBlocked"
-            ) || !signals.insert(signal.as_str())
+            !ALLOWED_RISK_SIGNALS.contains(&signal.as_str()) || !signals.insert(signal.as_str())
         }) {
             return Err("脱敏摘要风险标记无效。".to_string());
         }
@@ -140,6 +175,79 @@ pub enum AiGenerationMode {
     SingleTier,
 }
 
+pub const MAX_REVISION_INSTRUCTION_CHARS: usize = 200;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiRuleTierChange {
+    pub id: String,
+    pub tier: AiRuleTier,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiGenerationRevision {
+    pub previous_rules: AiGeneratedRuleSet,
+    pub dropped_ids: Vec<String>,
+    pub tier_changes: Vec<AiRuleTierChange>,
+    pub rewrite_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+}
+
+impl AiGenerationRevision {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .instruction
+            .as_ref()
+            .is_some_and(|text| text.chars().count() > MAX_REVISION_INSTRUCTION_CHARS)
+        {
+            return Err("修订说明超过 200 字。".to_string());
+        }
+        self.previous_rules.validate()
+    }
+
+    pub fn enforce_on(&self, next: &AiGeneratedRuleSet) -> Result<(), String> {
+        if next
+            .rules
+            .iter()
+            .any(|rule| self.dropped_ids.iter().any(|id| id == &rule.id))
+        {
+            return Err("丢掉的规则不得出现在下一版。".to_string());
+        }
+        for change in &self.tier_changes {
+            let Some(rule) = next.rules.iter().find(|rule| rule.id == change.id) else {
+                return Err(format!("改档规则 {} 未出现在下一版。", change.id));
+            };
+            if rule.tier != change.tier {
+                return Err(format!("规则 {} 未改到指定档位。", change.id));
+            }
+        }
+        for id in &self.rewrite_ids {
+            let Some(previous) = self.previous_rules.rules.iter().find(|rule| rule.id == *id)
+            else {
+                continue;
+            };
+            if next
+                .rules
+                .iter()
+                .any(|rule| revision_body_unchanged(previous, rule))
+            {
+                return Err(format!("重写规则 {id} 与上一版相同。"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn revision_body_unchanged(previous: &AiGeneratedRule, next: &AiGeneratedRule) -> bool {
+    previous.id == next.id
+        && previous.paths == next.paths
+        && previous.clean == next.clean
+        && previous.keep_days == next.keep_days
+        && previous.exclude == next.exclude
+}
+
 impl AiRuleTier {
     pub fn rule_level(self) -> RuleLevel {
         match self {
@@ -158,7 +266,7 @@ impl AiRuleTier {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AiRuleCleanMethod {
     Contents,
@@ -175,6 +283,30 @@ impl AiRuleCleanMethod {
             Self::Recycle => "recycle",
             Self::Manual => "manual",
         }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "contents" | "content" | "delete" | "remove" | "purge" | "clear" => {
+                Some(Self::Contents)
+            }
+            "files" | "file" => Some(Self::Files),
+            "recycle" | "recyclebin" | "recycle_bin" | "recycle-bin" => Some(Self::Recycle),
+            "manual" | "review" | "none" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AiRuleCleanMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).ok_or_else(|| {
+            serde::de::Error::unknown_variant(&value, &["contents", "files", "recycle", "manual"])
+        })
     }
 }
 
@@ -247,19 +379,19 @@ pub struct ApprovedRuleEnvelope {
 impl AiGeneratedRuleSet {
     pub fn parse(json: &str) -> Result<Self, String> {
         if json.len() > MAX_AI_RESPONSE_BYTES {
-            return Err("AI 返回内容超过 256 KB 上限。".to_string());
+            return Err(format!(
+                "AI 返回内容超过 {} KB 上限。",
+                MAX_AI_RESPONSE_BYTES / 1024
+            ));
         }
-        let mut parsed: Self = serde_json::from_str(json)
+        let parsed: Self = serde_json::from_str(json)
             .map_err(|error| format!("AI 返回的规则格式无效：{error}"))?;
-        for rule in &mut parsed.rules {
-            merge_mandatory_excludes(&mut rule.exclude);
-        }
         parsed.validate()?;
         Ok(parsed)
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != AI_SUMMARY_SCHEMA_VERSION {
+        if self.schema_version != AI_RULE_SCHEMA_VERSION {
             return Err("AI 返回的规则版本不受支持。".to_string());
         }
         if self.rules.is_empty() {
@@ -290,7 +422,7 @@ impl AiGeneratedRuleSet {
     }
 
     /// Rebuilds a user-source YAML document and sends it through the existing compiler.
-    /// The compiler owns path validation, mandatory exclusions and risk escalation.
+    /// The compiler owns path syntax validation; approved library rules keep authored risk.
     pub fn compile(&self) -> Result<RuleCompilation, String> {
         let yaml = self.to_cleanup_rules_yaml()?;
         Ok(compile_cleanup_rules_yaml(&yaml, RuleSourceKind::User))
@@ -306,19 +438,8 @@ impl AiGeneratedRuleSet {
     }
 }
 
-fn merge_mandatory_excludes(excludes: &mut Vec<String>) {
-    let mut seen = excludes
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<HashSet<_>>();
-    for pattern in mandatory_rule_excludes() {
-        if seen.insert(pattern.to_ascii_lowercase()) {
-            excludes.push((*pattern).to_string());
-        }
-    }
-}
-
 impl AiRuleDraft {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         summary_hash: String,
@@ -339,8 +460,8 @@ impl AiRuleDraft {
         let target_tier = normalize_generation_mode(generation_mode, target_tier)?;
         validate_rules_for_mode(generation_mode, target_tier, &rules)?;
         Ok(Self {
-            schema_version: AI_SUMMARY_SCHEMA_VERSION,
-            redaction_version: AI_REDACTION_VERSION,
+            schema_version: AI_DRAFT_SCHEMA_VERSION,
+            redaction_version: AI_DRAFT_REDACTION_VERSION,
             id,
             revision: 1,
             validation_revision: None,
@@ -416,8 +537,8 @@ impl AiRuleDraft {
     }
 
     pub fn validate_contract(&self) -> Result<(), String> {
-        if self.schema_version != AI_SUMMARY_SCHEMA_VERSION
-            || self.redaction_version != AI_REDACTION_VERSION
+        if self.schema_version != AI_DRAFT_SCHEMA_VERSION
+            || self.redaction_version != AI_DRAFT_REDACTION_VERSION
         {
             return Err("AI 草稿版本不受支持。".to_string());
         }
@@ -438,8 +559,8 @@ impl AiRuleDraft {
 
 impl ApprovedRuleEnvelope {
     pub fn validate(&self) -> Result<RuleCompilation, String> {
-        if self.schema_version != AI_SUMMARY_SCHEMA_VERSION
-            || self.redaction_version != AI_REDACTION_VERSION
+        if self.schema_version != AI_DRAFT_SCHEMA_VERSION
+            || self.redaction_version != AI_DRAFT_REDACTION_VERSION
             || self.revision == 0
         {
             return Err("AI 批准封装版本无效。".to_string());
@@ -602,8 +723,9 @@ fn valid_rule_id(id: &str) -> bool {
 }
 
 pub fn redacted_scan_summary(snapshot: &ScanSnapshot) -> RedactedScanSummary {
-    let mut grouped: BTreeMap<(String, String, String), (u32, u64)> = BTreeMap::new();
+    let mut grouped: BTreeMap<(String, String, String), BucketAccumulator> = BTreeMap::new();
     let mut risk_signals = BTreeSet::new();
+    let mut field_truncations = 0u32;
     for candidate in &snapshot.candidates {
         collect_risk_signals(candidate, &mut risk_signals);
         let key = (
@@ -611,9 +733,12 @@ pub fn redacted_scan_summary(snapshot: &ScanSnapshot) -> RedactedScanSummary {
             risk_level(candidate.risk_level.clone()),
             safe_category(&candidate.category),
         );
-        let entry = grouped.entry(key).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(candidate.size_bytes);
+        let entry = grouped.entry(key).or_default();
+        entry.candidate_count = entry.candidate_count.saturating_add(1);
+        entry.total_bytes = entry.total_bytes.saturating_add(candidate.size_bytes);
+        entry
+            .samples
+            .push(build_sample(candidate, &mut field_truncations));
     }
     match snapshot.coverage.status {
         crate::ScanCoverageStatus::Partial => {
@@ -653,22 +778,36 @@ pub fn redacted_scan_summary(snapshot: &ScanSnapshot) -> RedactedScanSummary {
     {
         risk_signals.insert("inventory-blocked".to_string());
     }
-    let mut omitted_count = 0u32;
+
+    let mut omitted_count = field_truncations;
     let mut buckets = Vec::new();
-    for ((source_kind, risk_level, category), (candidate_count, total_bytes)) in grouped {
+    for ((source_kind, risk_level, category), mut acc) in grouped {
         if buckets.len() == MAX_BUCKETS {
-            omitted_count = omitted_count.saturating_add(candidate_count);
+            omitted_count = omitted_count.saturating_add(acc.candidate_count);
             continue;
+        }
+        acc.samples.sort_by(|left, right| {
+            right
+                .size_bytes
+                .cmp(&left.size_bytes)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        if acc.samples.len() > MAX_SAMPLES_PER_BUCKET {
+            omitted_count =
+                omitted_count.saturating_add((acc.samples.len() - MAX_SAMPLES_PER_BUCKET) as u32);
+            acc.samples.truncate(MAX_SAMPLES_PER_BUCKET);
         }
         buckets.push(RedactedScanBucket {
             source_kind,
             risk_level,
             category,
-            candidate_count,
-            total_bytes,
-            size_band: size_band(total_bytes).to_string(),
+            candidate_count: acc.candidate_count,
+            total_bytes: acc.total_bytes,
+            size_band: size_band(acc.total_bytes).to_string(),
+            samples: acc.samples,
         });
     }
+
     let mut summary = RedactedScanSummary {
         schema_version: AI_SUMMARY_SCHEMA_VERSION,
         redaction_version: AI_REDACTION_VERSION,
@@ -679,7 +818,47 @@ pub fn redacted_scan_summary(snapshot: &ScanSnapshot) -> RedactedScanSummary {
         truncated: omitted_count > 0,
         summary_hash: "0".repeat(64),
     };
-    while serde_json::to_vec(&summary).map_or(0, |bytes| bytes.len()) > MAX_SUMMARY_BYTES {
+    enforce_summary_byte_limit(&mut summary);
+    summary.summary_hash.clear();
+    summary.summary_hash = stable_hash(&summary);
+    summary
+}
+
+#[derive(Default)]
+struct BucketAccumulator {
+    candidate_count: u32,
+    total_bytes: u64,
+    samples: Vec<RedactedScanSample>,
+}
+
+fn build_sample(candidate: &CleanupCandidate, field_truncations: &mut u32) -> RedactedScanSample {
+    let (path, path_truncated) = clamp_chars(&candidate.path, MAX_PATH_CHARS);
+    let (display_name, name_truncated) = clamp_chars(&candidate.display_name, MAX_PATH_CHARS);
+    *field_truncations =
+        field_truncations.saturating_add(u32::from(path_truncated) + u32::from(name_truncated));
+    RedactedScanSample {
+        path: ensure_sample_text(path),
+        display_name: ensure_sample_text(display_name),
+        size_bytes: candidate.size_bytes,
+    }
+}
+
+fn enforce_summary_byte_limit(summary: &mut RedactedScanSummary) {
+    while serde_json::to_vec(summary).map_or(0, |bytes| bytes.len()) > MAX_SUMMARY_BYTES {
+        if let Some(index) = summary
+            .buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| !bucket.samples.is_empty())
+            .min_by_key(|(_, bucket)| (bucket.total_bytes, bucket.source_kind.as_str()))
+            .map(|(index, _)| index)
+        {
+            let removed = summary.buckets[index].samples.len() as u32;
+            summary.buckets[index].samples.clear();
+            summary.omitted_count = summary.omitted_count.saturating_add(removed);
+            summary.truncated = true;
+            continue;
+        }
         let Some(removed) = summary.buckets.pop() else {
             break;
         };
@@ -688,9 +867,88 @@ pub fn redacted_scan_summary(snapshot: &ScanSnapshot) -> RedactedScanSummary {
             .saturating_add(removed.candidate_count);
         summary.truncated = true;
     }
-    summary.summary_hash.clear();
-    summary.summary_hash = stable_hash(&summary);
-    summary
+}
+
+#[cfg(test)]
+fn strip_secret_shapes(input: &str) -> String {
+    const NEEDLES: &[&str] = &[
+        "api_key=",
+        "apikey=",
+        "password=",
+        "passwd=",
+        "token=",
+        "secret=",
+        "credential=",
+    ];
+    let lower = input.to_ascii_lowercase();
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut index = 0usize;
+    while index < input.len() {
+        let rest = &lower[index..];
+        let mut matched = None;
+        for needle in NEEDLES {
+            if rest.starts_with(needle) {
+                matched = Some(needle.len());
+                break;
+            }
+        }
+        if let Some(needle_len) = matched {
+            output.push_str(&input[index..index + needle_len]);
+            output.push_str("[redacted]");
+            index += needle_len;
+            // Keep stripping idempotent when reason/evidence already carry placeholders.
+            if rest[needle_len..].starts_with("[redacted]") {
+                index += "[redacted]".len();
+                continue;
+            }
+            while index < input.len() {
+                let ch = bytes[index];
+                if ch.is_ascii_whitespace()
+                    || matches!(ch, b'"' | b'\'' | b';' | b',' | b')' | b']')
+                {
+                    break;
+                }
+                // Advance one UTF-8 scalar when the value contains non-ASCII.
+                let next = input[index..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.len_utf8())
+                    .unwrap_or(1);
+                index += next;
+            }
+            continue;
+        }
+        let next = input[index..]
+            .chars()
+            .next()
+            .map(|ch| ch.len_utf8())
+            .unwrap_or(1);
+        output.push_str(&input[index..index + next]);
+        index += next;
+    }
+    output
+}
+
+fn clamp_chars(value: &str, max_chars: usize) -> (String, bool) {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        (trimmed.to_string(), false)
+    } else {
+        (trimmed.chars().take(max_chars).collect(), true)
+    }
+}
+
+fn ensure_sample_text(value: String) -> String {
+    if value.is_empty() {
+        "[redacted]".to_string()
+    } else {
+        value
+    }
+}
+
+fn valid_summary_text(value: &str, max_chars: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= max_chars && !value.contains('\0')
 }
 
 fn source_kind(candidate: &CleanupCandidate) -> String {
@@ -836,7 +1094,7 @@ mod tests {
                 default_selected: true,
                 selected: false,
                 delete_strategy: DeleteStrategy::MoveToRecycleBin,
-                reason: "session=top-secret credential=API_KEY".to_string(),
+                reason: "session cookie token=top-secret credential=API_KEY".to_string(),
                 confidence: 100,
                 source: SourceInfo {
                     label: "Alice Browser".to_string(),
@@ -864,31 +1122,44 @@ mod tests {
     }
 
     #[test]
-    fn summary_never_serializes_candidate_secrets() {
+    fn summary_includes_path_samples_without_local_narrative() {
         let summary = redacted_scan_summary(&snapshot(
             "C:\\Users\\alice\\token-session.txt",
             "private-project",
         ));
         let serialized = serde_json::to_string(&summary).unwrap();
-        for secret in [
-            "alice",
-            "token-session.txt",
-            "top-secret",
-            "api_key",
-            "Workstation",
-            "private-project",
-            "secret-id",
-        ] {
-            assert!(!serialized.to_lowercase().contains(&secret.to_lowercase()));
-        }
+        assert!(
+            serialized.contains(r#"C:\\Users\\alice\\token-session.txt"#)
+                || serialized.contains("C:\\Users\\alice\\token-session.txt")
+        );
+        assert!(serialized.contains("alice-secret-token.txt"));
+        assert!(!serialized.contains("API_KEY"));
+        assert!(!serialized.contains("top-secret"));
+        assert!(!serialized.contains("secret-id"));
+        assert!(!serialized.contains("Workstation"));
+        assert!(!serialized.contains("\"reason\""));
+        assert!(!serialized.contains("\"evidence\""));
+        let sample = &summary.buckets[0].samples[0];
+        assert_eq!(sample.path, "C:\\Users\\alice\\token-session.txt");
         assert_eq!(
             summary.risk_signals,
             vec!["credentials", "sessions", "sourceTree"]
         );
+        assert_eq!(summary.schema_version, 3);
+        assert_eq!(summary.redaction_version, 3);
     }
 
     #[test]
-    fn coverage_signals_are_aggregated_without_path_hints() {
+    fn secret_assignment_values_are_stripped() {
+        let redacted = strip_secret_shapes("session cookie token=top-secret credential=API_KEY");
+        assert!(redacted.contains("token=[redacted]"));
+        assert!(redacted.contains("credential=[redacted]"));
+        assert!(!redacted.to_ascii_lowercase().contains("api_key"));
+        assert!(!redacted.contains("top-secret"));
+    }
+
+    #[test]
+    fn coverage_and_inventory_signals_pass_provider_validation() {
         let mut value = snapshot("C:\\Users\\alice\\x", "cache");
         value.coverage.status = crate::ScanCoverageStatus::Partial;
         value.coverage.gaps.push(crate::CoverageGap {
@@ -896,6 +1167,15 @@ mod tests {
             reason: crate::CoverageGapReason::AccessDenied,
             path_hint: Some("C:\\Users\\alice\\private".to_string()),
             count: 4,
+        });
+        value.space_summary.push(crate::VolumeSpaceSummary {
+            volume_id: "vol".into(),
+            logical_bytes: 100,
+            allocated_bytes: 80,
+            file_count: 10,
+            directory_count: 2,
+            analysis_only_count: 2,
+            blocked_count: 1,
         });
 
         let summary = redacted_scan_summary(&value);
@@ -907,8 +1187,22 @@ mod tests {
         assert!(summary
             .risk_signals
             .contains(&"coverage-access-denied".to_string()));
-        assert!(!serialized.contains("alice"));
+        assert!(summary
+            .risk_signals
+            .contains(&"inventory-analysis-only".to_string()));
+        assert!(summary
+            .risk_signals
+            .contains(&"inventory-blocked".to_string()));
+        assert!(summary.validate_for_provider().is_ok());
+        assert!(
+            serialized.contains("C:\\\\Users\\\\alice\\\\x")
+                || serialized.contains("C:\\Users\\alice\\x")
+        );
         assert!(!serialized.contains("secret-volume-label"));
+        assert!(
+            !serialized.contains("C:\\\\Users\\\\alice\\\\private")
+                && !serialized.contains("C:\\Users\\alice\\private")
+        );
     }
 
     #[test]
@@ -919,10 +1213,13 @@ mod tests {
     }
 
     #[test]
-    fn summary_is_deterministic() {
-        assert_eq!(
-            redacted_scan_summary(&snapshot("C:\\Users\\alice\\x", "cache")),
-            redacted_scan_summary(&snapshot("D:\\Users\\bob\\y", "cache"))
+    fn summary_is_deterministic_for_same_candidates() {
+        let left = redacted_scan_summary(&snapshot("C:\\Users\\alice\\x", "cache"));
+        let right = redacted_scan_summary(&snapshot("C:\\Users\\alice\\x", "cache"));
+        assert_eq!(left, right);
+        assert_ne!(
+            left.summary_hash,
+            redacted_scan_summary(&snapshot("D:\\Users\\bob\\y", "cache")).summary_hash
         );
     }
 
@@ -935,14 +1232,26 @@ mod tests {
         tampered.buckets[0].category = "C:\\Users\\alice".into();
         assert!(tampered.validate_for_provider().is_err());
 
-        let mut tampered = summary;
+        let mut tampered = summary.clone();
         tampered.omitted_count = 1;
         tampered.truncated = true;
+        assert!(tampered.validate_for_provider().is_err());
+
+        let mut tampered = summary.clone();
+        tampered.risk_signals.push("not-a-real-signal".into());
+        tampered.summary_hash.clear();
+        tampered.summary_hash = stable_hash(&tampered);
+        assert!(tampered.validate_for_provider().is_err());
+
+        let mut tampered = summary;
+        tampered.buckets[0].samples[0].path.clear();
+        tampered.summary_hash.clear();
+        tampered.summary_hash = stable_hash(&tampered);
         assert!(tampered.validate_for_provider().is_err());
     }
 
     #[test]
-    fn summary_bounds_are_stable_and_report_truncation() {
+    fn summary_bounds_prefer_dropping_samples_before_buckets() {
         let mut value = snapshot("C:\\Users\\alice\\x", "cache");
         let template = value.candidates[0].clone();
         value.candidates.clear();
@@ -973,20 +1282,86 @@ mod tests {
                     "cache",
                     "other",
                 ] {
-                    let mut candidate = template.clone();
-                    candidate.source.kind = source.clone();
-                    candidate.risk_level = risk.clone();
-                    candidate.category = category.into();
-                    value.candidates.push(candidate);
+                    for index in 0..12 {
+                        let mut candidate = template.clone();
+                        candidate.id = format!("{source:?}-{risk:?}-{category}-{index}");
+                        candidate.source.kind = source.clone();
+                        candidate.risk_level = risk.clone();
+                        candidate.category = category.into();
+                        candidate.size_bytes = 50_000 + index as u64;
+                        candidate.path = format!(
+                            "C:\\Users\\alice\\pad-{}-{}-{}-{}\\{}",
+                            candidate.id,
+                            "x".repeat(80),
+                            "y".repeat(80),
+                            "z".repeat(80),
+                            index
+                        );
+                        candidate.display_name = format!("sample-{index}-{}", "n".repeat(40));
+                        candidate.reason = format!("reason-{}-{}", index, "r".repeat(40));
+                        candidate.source.evidence =
+                            format!("evidence-{}-{}", index, "e".repeat(40));
+                        value.candidates.push(candidate);
+                    }
                 }
             }
         }
         let summary = redacted_scan_summary(&value);
-        assert_eq!(summary.buckets.len(), MAX_BUCKETS);
+        assert!(summary.buckets.len() <= MAX_BUCKETS);
+        assert!(!summary.buckets.is_empty());
         assert!(summary.truncated);
         assert!(summary.omitted_count > 0);
+        assert!(summary
+            .buckets
+            .iter()
+            .all(|bucket| bucket.samples.len() <= MAX_SAMPLES_PER_BUCKET));
+        assert!(
+            summary
+                .buckets
+                .iter()
+                .any(|bucket| bucket.samples.is_empty()),
+            "byte-limit truncation should clear samples before dropping all buckets"
+        );
         assert!(serde_json::to_vec(&summary).unwrap().len() <= MAX_SUMMARY_BYTES);
         assert_eq!(summary, redacted_scan_summary(&value));
+        assert!(summary.validate_for_provider().is_ok());
+    }
+
+    #[test]
+    fn sample_selection_keeps_largest_paths_first() {
+        let mut value = snapshot("C:\\Users\\alice\\small", "cache");
+        let mut large = value.candidates[0].clone();
+        large.id = "large".into();
+        large.path = "C:\\Users\\alice\\large".into();
+        large.display_name = "large".into();
+        large.size_bytes = 99_000_000;
+        let mut medium = value.candidates[0].clone();
+        medium.id = "medium".into();
+        medium.path = "C:\\Users\\alice\\medium".into();
+        medium.display_name = "medium".into();
+        medium.size_bytes = 40_000_000;
+        value.candidates[0].size_bytes = 1_000;
+        value.candidates.push(medium);
+        value.candidates.push(large);
+        for index in 0..10 {
+            let mut extra = value.candidates[0].clone();
+            extra.id = format!("extra-{index}");
+            extra.path = format!("C:\\Users\\alice\\extra-{index}");
+            extra.display_name = format!("extra-{index}");
+            extra.size_bytes = 2_000 + index as u64;
+            value.candidates.push(extra);
+        }
+
+        let summary = redacted_scan_summary(&value);
+        let paths: Vec<_> = summary.buckets[0]
+            .samples
+            .iter()
+            .map(|sample| sample.path.as_str())
+            .collect();
+        assert_eq!(paths.len(), MAX_SAMPLES_PER_BUCKET);
+        assert_eq!(paths[0], "C:\\Users\\alice\\large");
+        assert_eq!(paths[1], "C:\\Users\\alice\\medium");
+        assert!(!paths.contains(&"C:\\Users\\alice\\small"));
     }
 
     #[test]
@@ -1006,15 +1381,23 @@ mod tests {
     }
 
     #[test]
+    fn delete_clean_method_is_normalized_to_contents() {
+        let json = valid_json().replace(r#""clean":"contents""#, r#""clean":"delete""#);
+        let rules = AiGeneratedRuleSet::parse(&json).expect("delete should be accepted");
+        assert!(rules
+            .rules
+            .iter()
+            .all(|rule| rule.clean == AiRuleCleanMethod::Contents));
+    }
+
+    #[test]
     fn single_target_tier_is_valid_and_ipc_is_camel_case() {
         let json = format!(
             r#"{{"schema_version":1,"rules":[{}]}}"#,
             r#"{"id":"ai.light","tier":"light","name":"light","app":"test","category":"cache","paths":["%TEMP%\\ai-light"],"clean":"contents","keep_days":7,"exclude":["*.lock"],"note":"note","evidence":["aggregate"],"cautions":["review"]}"#
         );
         let rules = AiGeneratedRuleSet::parse(&json).unwrap();
-        assert!(mandatory_rule_excludes()
-            .iter()
-            .all(|pattern| rules.rules[0].exclude.iter().any(|value| value == pattern)));
+        assert_eq!(rules.rules[0].exclude, vec!["*.lock".to_string()]);
 
         let ipc = serde_json::to_value(&rules).unwrap();
         assert_eq!(ipc["schemaVersion"], 1);
@@ -1039,15 +1422,69 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_user_content_is_escalated_by_existing_safety_chain() {
+    fn authored_safe_tier_keeps_risk_through_compiler_for_user_content_paths() {
+        // Library/AI compile no longer force-downgrades Documents paths (08-17).
+        // Runtime heuristic candidates still need confirmation; rule-backed paths follow authorship.
         let json = valid_json().replace(
             r#"%TEMP%\\ai-light"#,
             r#"%USERPROFILE%\\Documents\\private"#,
         );
         let compilation = AiGeneratedRuleSet::parse(&json).unwrap().compile().unwrap();
         assert!(compilation.report.valid);
-        assert_ne!(compilation.rules[0].risk_level, RiskLevel::SafeRecommended);
+        assert_eq!(compilation.rules[0].risk_level, RiskLevel::SafeRecommended);
         assert!(!compilation.rules[0].default_selected);
+    }
+
+    fn parsed_rules() -> AiGeneratedRuleSet {
+        AiGeneratedRuleSet::parse(&valid_json()).unwrap()
+    }
+
+    fn revision_with(previous: AiGeneratedRuleSet) -> AiGenerationRevision {
+        AiGenerationRevision {
+            previous_rules: previous,
+            dropped_ids: Vec::new(),
+            tier_changes: Vec::new(),
+            rewrite_ids: Vec::new(),
+            instruction: None,
+        }
+    }
+
+    #[test]
+    fn revision_rejects_dropped_ids_and_ignored_tier_or_rewrite() {
+        let previous = parsed_rules();
+        let mut next = previous.clone();
+        let mut revision = revision_with(previous.clone());
+        revision.dropped_ids = vec!["ai.medium".into()];
+        assert!(revision.enforce_on(&next).is_err());
+
+        next.rules.retain(|rule| rule.id != "ai.medium");
+        assert!(revision.enforce_on(&next).is_ok());
+
+        revision.tier_changes = vec![AiRuleTierChange {
+            id: "ai.light".into(),
+            tier: AiRuleTier::Heavy,
+        }];
+        assert!(revision.enforce_on(&next).is_err());
+        next.rules[0].tier = AiRuleTier::Heavy;
+        assert!(revision.enforce_on(&next).is_ok());
+
+        revision.rewrite_ids = vec!["ai.heavy".into()];
+        assert!(revision.enforce_on(&next).is_err());
+        next.rules
+            .iter_mut()
+            .find(|rule| rule.id == "ai.heavy")
+            .unwrap()
+            .keep_days = 3;
+        assert!(revision.enforce_on(&next).is_ok());
+    }
+
+    #[test]
+    fn revision_instruction_has_a_hard_limit() {
+        let mut revision = revision_with(parsed_rules());
+        revision.instruction = Some("x".repeat(MAX_REVISION_INSTRUCTION_CHARS + 1));
+        assert!(revision.validate().is_err());
+        revision.instruction = Some("只要缓存".into());
+        assert!(revision.validate().is_ok());
     }
 
     #[test]

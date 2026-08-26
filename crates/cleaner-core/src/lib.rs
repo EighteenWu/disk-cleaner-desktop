@@ -13,12 +13,16 @@ pub mod ai_rules;
 pub mod automation;
 pub mod inventory;
 pub mod local_rule_library;
+pub(crate) mod ntfs_mft;
 pub mod rules;
+pub mod space_digest;
 
 pub use ai_rules::{
     redacted_scan_summary, AiGeneratedRule, AiGeneratedRuleSet, AiGenerationMode,
-    AiRuleCleanMethod, AiRuleDraft, AiRuleTier, ApprovedRuleEnvelope, RedactedScanBucket,
-    RedactedScanSummary, AI_REDACTION_VERSION, AI_SUMMARY_SCHEMA_VERSION,
+    AiGenerationRevision, AiRuleCleanMethod, AiRuleDraft, AiRuleTier, AiRuleTierChange,
+    ApprovedRuleEnvelope, RedactedScanBucket, RedactedScanSample, RedactedScanSummary,
+    AI_REDACTION_VERSION, AI_SUMMARY_SCHEMA_VERSION, MAX_AI_RESPONSE_BYTES,
+    MAX_REVISION_INSTRUCTION_CHARS,
 };
 
 pub use automation::*;
@@ -28,12 +32,15 @@ pub use inventory::{
     ScanCoverage, ScanCoverageStatus, VolumeCoverage, VolumeSpaceSummary,
 };
 pub use local_rule_library::*;
+pub use space_digest::{
+    build_space_digest, RawSpaceDirectory, SpaceDigest, SpaceDirectory, SPACE_DIGEST_FETCH_LIMIT,
+};
 
 pub use rules::{
-    compile_cleanup_rules_yaml, import_winapp2_ini, mandatory_rule_excludes,
-    validate_rule_subscription_bytes, validate_rule_subscription_url, CompiledCleanupRule,
-    RuleCleanupMethod, RuleCompilation, RuleLevel, RuleSourceKind, RuleValidationIssue,
-    RuleValidationReport,
+    bundled_starter_rules_yaml, compile_cleanup_rules_yaml, filter_rules_for_intensity,
+    import_winapp2_ini, mandatory_rule_excludes, validate_rule_subscription_bytes,
+    validate_rule_subscription_url, CompiledCleanupRule, RuleCleanupMethod, RuleCompilation,
+    RuleIntensity, RuleLevel, RuleSourceKind, RuleValidationIssue, RuleValidationReport,
 };
 
 const MAX_QUICK_SCAN_ENTRIES: u64 = 25_000;
@@ -346,6 +353,8 @@ pub struct ScanProgress {
     pub scanned_files: u64,
     pub candidate_count: u32,
     pub reclaimable_bytes: u64,
+    #[serde(default)]
+    pub scanned_bytes: u64,
     pub current_path: String,
     pub current_volume: String,
     pub total_files: Option<u64>,
@@ -365,7 +374,11 @@ pub trait ScanController: Send + Sync {
 
     fn on_visited(&self, _count: u64) {}
 
+    fn on_progress_reset(&self, _total: Option<u64>) {}
+
     fn on_candidate(&self, _size_bytes: u64) {}
+
+    fn on_scanned_bytes(&self, _size_bytes: u64) {}
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -381,6 +394,7 @@ struct ScanProgressState {
     scanned_files: u64,
     candidate_count: u32,
     reclaimable_bytes: u64,
+    scanned_bytes: u64,
     current_path: String,
     current_volume: String,
     total_files: Option<u64>,
@@ -394,6 +408,7 @@ impl ScanProgressState {
             scanned_files: self.scanned_files,
             candidate_count: self.candidate_count,
             reclaimable_bytes: self.reclaimable_bytes,
+            scanned_bytes: self.scanned_bytes,
             current_path: self.current_path.clone(),
             current_volume: self.current_volume.clone(),
             total_files: self.total_files,
@@ -433,6 +448,7 @@ impl<'a, C: ScanController + ?Sized> ScanProgressController<'a, C> {
                     scanned_files: 0,
                     candidate_count: 0,
                     reclaimable_bytes: 0,
+                    scanned_bytes: 0,
                     current_path: String::new(),
                     current_volume: String::new(),
                     total_files: None,
@@ -517,12 +533,11 @@ impl<C: ScanController + ?Sized> ScanController for ScanProgressController<'_, C
     }
 
     fn on_location(&self, path: &Path) {
-        // Called once per visited entry, so only pay for the path allocation when
-        // the throttle window is already open.
         let mut shared = self
             .shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        shared.state.current_path = path.to_string_lossy().to_string();
         let due = shared
             .state
             .last_emit
@@ -532,7 +547,6 @@ impl<C: ScanController + ?Sized> ScanController for ScanProgressController<'_, C
             return;
         }
 
-        shared.state.current_path = path.to_string_lossy().to_string();
         shared.state.last_emit = Some(Instant::now());
         let progress = shared.state.snapshot();
         (shared.sink)(progress);
@@ -545,10 +559,30 @@ impl<C: ScanController + ?Sized> ScanController for ScanProgressController<'_, C
         });
     }
 
+    fn on_progress_reset(&self, total: Option<u64>) {
+        self.with_shared(|state| {
+            // Keep a cumulative file visit count for the "files scanned" headline.
+            // Phase resets only refresh the optional percent denominator.
+            state.current_path = String::new();
+            state.total_files = match total {
+                Some(next) if next >= state.scanned_files => Some(next),
+                Some(_) | None => None,
+            };
+            true
+        });
+    }
+
     fn on_candidate(&self, size_bytes: u64) {
         self.with_shared(|state| {
             state.candidate_count = state.candidate_count.saturating_add(1);
             state.reclaimable_bytes = state.reclaimable_bytes.saturating_add(size_bytes);
+            false
+        });
+    }
+
+    fn on_scanned_bytes(&self, size_bytes: u64) {
+        self.with_shared(|state| {
+            state.scanned_bytes = state.scanned_bytes.saturating_add(size_bytes);
             false
         });
     }
@@ -572,7 +606,7 @@ struct ScanRoot {
 }
 
 #[derive(Clone, Debug, Default)]
-struct DirectoryStats {
+pub(crate) struct DirectoryStats {
     size_bytes: u64,
     children_count: u32,
     truncated: bool,
@@ -1361,7 +1395,8 @@ where
         return cleanup_recycle_bin_candidate(candidate, &path, progress, control);
     }
 
-    if let Err(warning) = validate_cleanup_target_path(&path) {
+    if let Err(warning) = validate_cleanup_target_path_for_policy(&path, &candidate.cleanup_policy)
+    {
         progress.advance_candidate(candidate, CleanupProgressStatus::Skipped);
         return CandidateCleanupOutcome::Skipped {
             warning: format!("{}：{}", candidate.display_name, warning),
@@ -1431,7 +1466,15 @@ where
     P: FnMut(CleanupProgress),
     C: CleanupController,
 {
-    let targets = recycle_bin_cleanup_targets(path);
+    let mut targets = recycle_bin_cleanup_targets(path);
+    if let Some(cutoff) = keep_days_cutoff(candidate.cleanup_policy.keep_days) {
+        targets.retain(|target| {
+            fs::symlink_metadata(target)
+                .and_then(|metadata| metadata.modified())
+                .map(|modified| modified <= cutoff)
+                .unwrap_or(false)
+        });
+    }
 
     if targets.is_empty() {
         progress.advance_candidate(candidate, CleanupProgressStatus::Skipped);
@@ -1567,7 +1610,9 @@ where
         let child_path = entry.path();
         progress.start_path(candidate, &child_path);
 
-        if let Err(warning) = validate_cleanup_target_path(&child_path) {
+        if let Err(warning) =
+            validate_cleanup_target_path_for_policy(&child_path, &candidate.cleanup_policy)
+        {
             warnings.push(format!("{}：{}", child_path.to_string_lossy(), warning));
             progress.advance_path(candidate, &child_path, CleanupProgressStatus::Skipped);
             continue;
@@ -1818,7 +1863,7 @@ fn cleanup_permanent_child_path(
     child_path: PathBuf,
     cleanup_policy: &CleanupPolicy,
 ) -> DirectoryChildCleanupResult {
-    if let Err(warning) = validate_cleanup_target_path(&child_path) {
+    if let Err(warning) = validate_cleanup_target_path_for_policy(&child_path, cleanup_policy) {
         return DirectoryChildCleanupResult {
             path: child_path.clone(),
             status: CleanupProgressStatus::Skipped,
@@ -2020,35 +2065,12 @@ fn evaluate_cleanup_target_path(path: &Path) -> PathGuardLevel {
         return PathGuardLevel::HardDeny("不能清理 DiskClean 当前运行目录或工作目录");
     }
 
-    if is_application_install_path(path, &normalized) {
-        return PathGuardLevel::HardDeny("不能清理应用安装目录或运行时依赖文件");
-    }
-
     if is_store_or_installer_system_path(&normalized) {
         return PathGuardLevel::HardDeny("不能清理应用商店、安装回滚或程序数据系统目录");
     }
 
-    if is_dependency_runtime_path(&normalized) {
-        return PathGuardLevel::HardDeny("不能清理项目依赖目录或运行依赖文件");
-    }
-
-    if normalized.contains("\\program files\\")
-        || normalized.contains("\\program files (x86)\\")
-        || normalized.contains("\\programfiles\\")
-    {
-        return PathGuardLevel::HardDeny("不能清理应用安装目录");
-    }
-
-    if is_user_content_path(&normalized) {
-        return PathGuardLevel::HardDeny("不能自动清理用户文档、桌面、图片、视频或音乐目录");
-    }
-
     if is_protected_windows_path(&normalized) {
         return PathGuardLevel::HardDeny("不能清理受保护的 Windows 系统目录");
-    }
-
-    if let PathGuardLevel::HardDeny(reason) = classify_path_state_markers(&normalized) {
-        return PathGuardLevel::HardDeny(reason);
     }
 
     // WHY: 回收站根候选项在 apply_cleanup_support_policy 里走专属确认流程，这里拦住其余绕过确认的深层路径。
@@ -2058,11 +2080,38 @@ fn evaluate_cleanup_target_path(path: &Path) -> PathGuardLevel {
         );
     }
 
-    if is_dependency_store_path(&normalized) {
+    if let PathGuardLevel::HardDeny(reason) = classify_path_state_markers(&normalized) {
+        return PathGuardLevel::HardDeny(reason);
+    }
+
+    if is_application_runtime_payload_path(&normalized) {
+        return PathGuardLevel::NeedsConfirm(REASON_APP_RUNTIME);
+    }
+
+    if is_program_files_install_path(&normalized) {
+        return PathGuardLevel::NeedsConfirm(REASON_PROGRAM_FILES);
+    }
+
+    if is_user_content_path(&normalized) {
+        return PathGuardLevel::NeedsConfirm(REASON_USER_CONTENT);
+    }
+
+    if is_dependency_runtime_path(&normalized) || is_dependency_store_path(&normalized) {
         return PathGuardLevel::NeedsConfirm(REASON_DEPENDENCY_STORE);
     }
 
     classify_path_state_markers(&normalized)
+}
+
+fn validate_cleanup_target_path_for_policy(
+    path: &Path,
+    cleanup_policy: &CleanupPolicy,
+) -> Result<(), String> {
+    if cleanup_policy.rule_id.is_some() {
+        return Ok(());
+    }
+
+    validate_cleanup_target_path(path)
 }
 
 fn validate_cleanup_target_path(path: &Path) -> Result<(), String> {
@@ -2081,17 +2130,23 @@ fn apply_cleanup_support_policy(mut candidate: CleanupCandidate) -> CleanupCandi
 
     let path = PathBuf::from(&candidate.path);
     let normalized_path = normalize_path_for_id(&path);
+    let rule_backed = candidate.cleanup_policy.rule_id.is_some();
 
     if is_recycle_bin_path(&normalized_path) {
-        candidate.risk_level = RiskLevel::ReviewRequired;
-        candidate.default_selected = false;
-        candidate.selected = false;
         candidate.delete_strategy = DeleteStrategy::PermanentDelete;
         candidate.reason = append_reason(
             candidate.reason,
             "回收站清空会永久删除其中项目，必须由用户手动勾选确认",
         );
         candidate.confidence = candidate.confidence.max(88);
+        if !rule_backed {
+            candidate.risk_level = RiskLevel::ReviewRequired;
+            candidate.default_selected = false;
+            candidate.selected = false;
+        } else {
+            candidate.selected =
+                candidate.default_selected && candidate.risk_level != RiskLevel::Blocked;
+        }
         return candidate;
     }
 
@@ -2102,8 +2157,11 @@ fn apply_cleanup_support_policy(mut candidate: CleanupCandidate) -> CleanupCandi
         );
     }
 
+    if rule_backed {
+        return candidate;
+    }
+
     match evaluate_cleanup_target_path(&path) {
-        // HARD_DENY 对所有候选项生效，包括内置规则与订阅规则。
         PathGuardLevel::HardDeny(reason) => mark_candidate_unsupported(candidate, reason),
         PathGuardLevel::NeedsConfirm(reason) => {
             mark_candidate_needs_confirmation(candidate, reason)
@@ -3227,7 +3285,7 @@ fn is_current_app_path(normalized_path: &str) -> bool {
         || (!current_exe.is_empty() && normalized_path.starts_with(&current_exe))
 }
 
-fn is_application_install_path(path: &Path, normalized_path: &str) -> bool {
+fn is_application_install_path(_path: &Path, normalized_path: &str) -> bool {
     if normalized_path.len() >= 11
         && normalized_path.as_bytes().get(1) == Some(&b':')
         && normalized_path.as_bytes().get(2) == Some(&b'\\')
@@ -3236,7 +3294,31 @@ fn is_application_install_path(path: &Path, normalized_path: &str) -> bool {
         return false;
     }
 
-    is_application_runtime_payload_path(normalized_path) || has_application_install_ancestor(path)
+    is_application_runtime_payload_path(normalized_path)
+        || is_program_files_install_path(normalized_path)
+}
+
+fn is_under_program_files(normalized_path: &str) -> bool {
+    normalized_path.contains("\\program files\\")
+        || normalized_path.contains("\\program files (x86)\\")
+        || normalized_path.contains("\\programfiles\\")
+}
+
+fn is_program_files_install_path(normalized_path: &str) -> bool {
+    if !is_under_program_files(normalized_path) {
+        return false;
+    }
+
+    let allows_cleanup_tail = is_regenerable_cache_path(normalized_path)
+        || is_known_regenerable_app_cache(normalized_path)
+        || normalized_path.contains("\\temp\\")
+        || path_segments(normalized_path).any(|segment| {
+            is_cache_directory_name(segment)
+                || is_temp_directory_name(segment)
+                || is_log_directory_name(segment)
+        });
+
+    !allows_cleanup_tail
 }
 
 fn is_application_runtime_payload_path(normalized_path: &str) -> bool {
@@ -3270,8 +3352,7 @@ pub(crate) enum PathGuardLevel {
 
 const REGENERABLE_CACHE_SEGMENTS: &[&str] =
     &["cache", "cache2", "code cache", "gpucache", "shadercache"];
-const HARD_DENY_SEGMENT_MARKERS: &[&str] =
-    &["token", "session", "wallet", "keychain", "credential"];
+const SECRET_SEGMENT_MARKERS: &[&str] = &["token", "session", "wallet", "keychain", "credential"];
 const LIVE_STATE_SEGMENTS: &[&str] = &[
     "indexeddb",
     "local storage",
@@ -3292,10 +3373,14 @@ const CONFIRM_STATE_SEGMENT_MARKERS: &[&str] = &["backup", "recovery", "autosave
 const DEPENDENCY_RUNTIME_SEGMENTS: &[&str] = &["node_modules", ".venv", "site-packages", "vendor"];
 const USER_CONTENT_SEGMENTS: &[&str] = &["desktop", "documents", "pictures", "videos", "music"];
 
-const REASON_SECRET: &str = "不能清理钱包、密钥串、凭据、令牌或会话等机密数据";
-const REASON_LIVE_STATE: &str = "不能清理账号、会话、数据库或应用持久化状态数据";
+const REASON_SECRET: &str = "命中钱包、密钥串、凭据、令牌或会话等机密数据，需要确认后才能清理";
+const REASON_LIVE_STATE: &str = "命中账号、数据库或应用持久化状态数据，需要确认后才能清理";
 const REASON_CONFIRM_STATE: &str = "命中备份、恢复、自动保存或浏览器 profile 数据，需要逐项确认";
 const REASON_DEPENDENCY_STORE: &str = "命中开发依赖缓存，删除后可能需要重新下载依赖，需要确认";
+const REASON_USER_CONTENT: &str = "命中用户文档、桌面、图片、视频或音乐目录，需要确认后才能清理";
+const REASON_PROGRAM_FILES: &str = "命中 Program Files 安装目录，删除后应用可能无法运行，需要确认";
+const REASON_APP_RUNTIME: &str =
+    "命中应用运行时文件（如 app.asar），删除后应用可能无法运行，需要确认";
 
 fn path_segments(normalized_path: &str) -> impl Iterator<Item = &str> {
     normalized_path
@@ -3330,9 +3415,9 @@ fn regenerable_cache_tail(normalized_path: &str) -> Option<String> {
 }
 
 pub(crate) fn classify_path_state_markers(normalized_path: &str) -> PathGuardLevel {
-    // WHY: 机密与会话数据无论是否位于缓存目录都不可删除，因此排在缓存豁免之前。
-    if has_segment_substring(normalized_path, HARD_DENY_SEGMENT_MARKERS) {
-        return PathGuardLevel::HardDeny(REASON_SECRET);
+    // WHY: 机密路径默认不勾选，但用户确认后可以删除，因此排在缓存豁免之前给出确认提示。
+    if has_segment_substring(normalized_path, SECRET_SEGMENT_MARKERS) {
+        return PathGuardLevel::NeedsConfirm(REASON_SECRET);
     }
 
     if is_windows_explorer_cache_database(normalized_path) {
@@ -3357,7 +3442,7 @@ pub(crate) fn classify_path_state_markers(normalized_path: &str) -> PathGuardLev
                 .is_some_and(|extension| LIVE_STATE_EXTENSIONS.contains(&extension))
         })
     {
-        return PathGuardLevel::HardDeny(REASON_LIVE_STATE);
+        return PathGuardLevel::NeedsConfirm(REASON_LIVE_STATE);
     }
 
     if has_exact_segment(scope, CONFIRM_STATE_SEGMENTS)
@@ -3369,6 +3454,7 @@ pub(crate) fn classify_path_state_markers(normalized_path: &str) -> PathGuardLev
     PathGuardLevel::Allowed
 }
 
+#[cfg(test)]
 fn is_persistent_state_path(normalized_path: &str) -> bool {
     matches!(
         classify_path_state_markers(normalized_path),
@@ -3387,56 +3473,19 @@ fn is_windows_explorer_cache_database(normalized_path: &str) -> bool {
         )
 }
 
-fn has_application_install_ancestor(path: &Path) -> bool {
-    path.ancestors()
-        .take(10)
-        .any(looks_like_application_install_root)
-}
-
-fn looks_like_application_install_root(path: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(path) else {
-        return false;
-    };
-
-    let mut has_executable = false;
-    let mut has_runtime_marker = false;
-
-    for entry in entries.flatten().take(160) {
-        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-
-        if name.ends_with(".exe") {
-            has_executable = true;
-        }
-
-        if matches!(name.as_str(), "resources" | "locales" | "swiftshader")
-            || matches!(
-                name.as_str(),
-                "app.asar" | "icudtl.dat" | "v8_context_snapshot.bin"
-            )
-            || name.ends_with(".pak")
-            || name.ends_with(".dll")
-        {
-            has_runtime_marker = true;
-        }
-
-        if has_executable && has_runtime_marker {
-            return true;
-        }
-    }
-
-    false
-}
-
 fn is_user_content_path(normalized_path: &str) -> bool {
     has_exact_segment(normalized_path, USER_CONTENT_SEGMENTS)
 }
 
+fn is_windows_namespace(normalized_path: &str) -> bool {
+    normalized_path.len() >= 10
+        && normalized_path.as_bytes().get(1) == Some(&b':')
+        && normalized_path.as_bytes().get(2) == Some(&b'\\')
+        && (normalized_path[2..].starts_with("\\windows\\") || normalized_path[2..] == *"\\windows")
+}
+
 fn is_protected_windows_path(normalized_path: &str) -> bool {
-    if normalized_path.len() < 11
-        || normalized_path.as_bytes().get(1) != Some(&b':')
-        || normalized_path.as_bytes().get(2) != Some(&b'\\')
-        || !normalized_path[2..].starts_with("\\windows\\")
-    {
+    if !is_windows_namespace(normalized_path) || normalized_path.len() < 11 {
         return false;
     }
 
@@ -3657,28 +3706,40 @@ pub fn preview_cleanup_for_candidates(
 
 pub fn classify_application_cache(path: &str, is_locked: bool) -> CacheClassification {
     let normalized = path.replace('/', "\\").to_ascii_lowercase();
-    let blocked_tokens = [
-        "\\appdata\\roaming\\",
-        "session",
-        "token",
-        "wallet",
-        "config",
-        "settings",
-        "indexeddb",
-        ".db",
-    ];
 
-    if is_locked
-        || blocked_tokens
-            .iter()
-            .any(|token| normalized.contains(token))
-    {
+    if is_locked {
         return CacheClassification {
             decision: CacheDecision::BlockClean,
             risk_level: RiskLevel::Blocked,
             default_selected: false,
-            reason: "配置、会话、数据库或运行中对象不可清理",
+            reason: "运行中对象不可清理",
             confidence: 95,
+        };
+    }
+
+    if has_segment_substring(&normalized, SECRET_SEGMENT_MARKERS) {
+        return CacheClassification {
+            decision: CacheDecision::ReviewClean,
+            risk_level: RiskLevel::ReviewRequired,
+            default_selected: false,
+            reason: REASON_SECRET,
+            confidence: 90,
+        };
+    }
+
+    if has_exact_segment(&normalized, LIVE_STATE_SEGMENTS)
+        || has_segment_prefix(&normalized, LIVE_STATE_SEGMENT_PREFIXES)
+        || normalized.contains(".db")
+        || normalized.contains("indexeddb")
+        || normalized.contains("\\config")
+        || normalized.contains("settings")
+    {
+        return CacheClassification {
+            decision: CacheDecision::ReviewClean,
+            risk_level: RiskLevel::ReviewRequired,
+            default_selected: false,
+            reason: REASON_LIVE_STATE,
+            confidence: 88,
         };
     }
 
@@ -3970,6 +4031,9 @@ fn scan_rule_candidates_with_control<C: ScanController + ?Sized>(
 
     for rule in rules {
         control.checkpoint();
+        if let Some(raw_path) = rule.paths.first() {
+            control.on_location(Path::new(raw_path));
+        }
         for path in expand_rule_paths_with_control(
             rule,
             &mut warnings,
@@ -4298,6 +4362,7 @@ fn expand_double_star_path_glob_with_control<C: ScanController + ?Sized>(
 
         while let Some(directory) = stack.pop() {
             control.checkpoint();
+            control.on_location(&directory);
             if visited >= MAX_QUICK_SCAN_ENTRIES {
                 break;
             }
@@ -4447,7 +4512,6 @@ fn scan_full_volume_with_control<C: ScanController + ?Sized>(
     inventory_sink: &mut dyn InventorySink,
 ) -> VolumeScanRun {
     control.checkpoint();
-    control.on_phase(ScanPhase::Walking);
     let run = inventory::scan_volume_inventory(session_id, volume, control, inventory_sink);
     let warnings = run
         .coverage
@@ -4645,13 +4709,13 @@ fn walk_full_volume_with_control<C: ScanController + ?Sized>(
 fn fast_scan_fallback_warning(volume: &VolumeInfo, error: &str) -> String {
     if error.contains("访问被拒绝") || error.contains("错误码 5") {
         return format!(
-            "{}: 当前没有管理员权限，无法读取 NTFS USN/MFT 快速索引，已回退到递归扫描；结果仍可用，但会更慢。详情：{}",
+            "{}: 当前没有管理员权限，无法直接解析 NTFS $MFT，已回退到目录枚举；结果仍可用，但会更慢。详情：{}",
             volume.id, error
         );
     }
 
     format!(
-        "{}: NTFS USN/MFT 快速扫描不可用，已回退到递归扫描；结果仍可用，但会更慢。详情：{}",
+        "{}: NTFS 直接 $MFT 扫描不可用，已回退到目录枚举；结果仍可用，但会更慢。详情：{}",
         volume.id, error
     )
 }
@@ -4691,9 +4755,9 @@ fn walk_full_directory<C: ScanController + ?Sized>(
 
         context.visited_entries += 1;
         stats.children_count = stats.children_count.saturating_add(1);
-        control.on_visited(1);
 
         let child_path = entry.path();
+        control.on_visited(1);
         control.on_location(&child_path);
         let Ok(metadata) = entry.metadata() else {
             continue;
@@ -4720,6 +4784,7 @@ fn walk_full_directory<C: ScanController + ?Sized>(
             }
         } else if file_type.is_file() {
             let size_bytes = metadata.len();
+            control.on_scanned_bytes(size_bytes);
             stats.size_bytes = stats.size_bytes.saturating_add(size_bytes);
 
             if let Some(candidate) = full_file_candidate(&child_path, size_bytes, &context.volume) {
@@ -4732,7 +4797,7 @@ fn walk_full_directory<C: ScanController + ?Sized>(
     stats
 }
 
-fn full_directory_candidate(
+pub(crate) fn full_directory_candidate(
     path: &Path,
     stats: DirectoryStats,
     volume: &VolumeInfo,
@@ -4759,12 +4824,14 @@ fn full_directory_candidate(
                 "已知浏览器缓存目录，可按需重新生成",
                 92,
             )
-        } else if is_dependency_store_path(&normalized_path) {
+        } else if is_dependency_store_path(&normalized_path)
+            || is_dependency_runtime_path(&normalized_path)
+        {
             (
                 "开发依赖缓存",
-                RiskLevel::ReviewRequired,
+                RiskLevel::CautiousRecommended,
                 false,
-                "包管理器或开发工具依赖缓存，删除后可能需要重新下载依赖",
+                "包管理器、项目依赖或开发工具缓存，删除后可能需要重新下载或安装依赖",
                 82,
             )
         } else if is_known_regenerable_app_cache(&normalized_path) {
@@ -4811,10 +4878,10 @@ fn full_directory_candidate(
             } else {
                 (
                     "构建产物",
-                    RiskLevel::Blocked,
+                    RiskLevel::ReviewRequired,
                     false,
-                    "名称类似构建输出，但不在可识别项目目录；可能是应用运行依赖，已禁止清理",
-                    92,
+                    "名称类似构建输出，但不在可识别项目目录，需要确认后再清理",
+                    70,
                 )
             }
         } else {
@@ -4846,7 +4913,7 @@ fn full_directory_candidate(
     }))
 }
 
-fn full_file_candidate(
+pub(crate) fn full_file_candidate(
     path: &Path,
     size_bytes: u64,
     volume: &VolumeInfo,
@@ -5030,18 +5097,12 @@ fn should_skip_full_scan_path(path: &Path) -> bool {
     normalized.contains("\\system volume information\\")
         || normalized.contains("\\$extend\\")
         || normalized.contains("\\windows\\winsxs\\")
-        || normalized.contains("\\program files\\")
-        || normalized.contains("\\program files (x86)\\")
-        || normalized.contains("\\programfiles\\")
         || normalized.contains("\\windowsapps\\")
         || normalized.contains("\\wpsystem\\")
         || normalized.contains("\\config.msi\\")
-        || is_application_runtime_payload_path(&normalized)
-        || is_persistent_state_path(&normalized)
-        || is_dependency_runtime_path(&normalized)
 }
 
-fn inventory_disposition_for_path(path: &Path) -> InventoryDisposition {
+pub(crate) fn inventory_disposition_for_path(path: &Path) -> InventoryDisposition {
     if should_skip_full_scan_path(path) {
         return InventoryDisposition::Blocked;
     }
@@ -5056,7 +5117,7 @@ fn inventory_disposition_for_path(path: &Path) -> InventoryDisposition {
 fn format_windows_volume_open_error(device_path: &str, error: u32) -> String {
     if error == WINDOWS_ERROR_ACCESS_DENIED {
         return format!(
-            "无法打开卷句柄 {device_path}：访问被拒绝（错误码 5）。读取 NTFS USN/MFT 快速索引需要以管理员身份运行"
+            "无法打开卷句柄 {device_path}：访问被拒绝（错误码 5）。直接解析 NTFS $MFT 需要以管理员身份运行"
         );
     }
 
@@ -5065,13 +5126,17 @@ fn format_windows_volume_open_error(device_path: &str, error: u32) -> String {
 
 fn format_usn_ioctl_error(error: u32) -> String {
     if error == WINDOWS_ERROR_ACCESS_DENIED {
-        return "FSCTL_ENUM_USN_DATA 访问被拒绝（错误码 5）。读取 NTFS USN/MFT 快速索引需要以管理员身份运行"
-            .to_string();
+        return "FSCTL_ENUM_USN_DATA 访问被拒绝（错误码 5）。该接口不是完整空间核算后端（USN 记录无 size）".to_string();
     }
 
     format!("FSCTL_ENUM_USN_DATA 失败，错误码 {error}")
 }
 
+/// Legacy USN enumerator kept only for historical reference / dead-code demotion.
+///
+/// **Do not use for complete inventory sizing.** `USN_RECORD_V2` has no logical or
+/// allocated size fields. The full-scan path uses direct `$MFT` parsing in
+/// [`crate::ntfs_mft`] instead.
 #[cfg(windows)]
 #[allow(dead_code)]
 fn scan_ntfs_usn_volume<C: ScanController + ?Sized>(
@@ -5738,6 +5803,7 @@ fn scan_directory_stats_uncached<C: ScanController + ?Sized>(
 
             if file_type.is_file() {
                 if let Ok(metadata) = entry.metadata() {
+                    control.on_scanned_bytes(metadata.len());
                     stats.size_bytes = stats.size_bytes.saturating_add(metadata.len());
                 }
             } else if file_type.is_dir() {
@@ -5816,6 +5882,7 @@ fn scan_directory_stats_for_policy_uncached<C: ScanController + ?Sized>(
                 .saturating_add(child_stats.children_count);
             stats.truncated |= child_stats.truncated;
         } else if metadata.is_file() {
+            control.on_scanned_bytes(metadata.len());
             stats.size_bytes = stats.size_bytes.saturating_add(metadata.len());
         }
     }
@@ -6706,6 +6773,62 @@ rules:
     }
 
     #[test]
+    fn scan_progress_reset_keeps_cumulative_file_count() {
+        let events = Mutex::new(Vec::new());
+        {
+            let inner = NoopScanController;
+            let reporter = ScanProgressController::new(&inner, |progress: ScanProgress| {
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            });
+            reporter.on_phase(ScanPhase::Indexing);
+            reporter.set_total_files(Some(1_000));
+            reporter.on_visited(400);
+            reporter.on_volume("C");
+            reporter.on_progress_reset(Some(250));
+            reporter.on_phase(ScanPhase::Walking);
+            reporter.on_visited(1);
+            reporter.on_location(Path::new(
+                "C:\\Users\\979\\AppData\\Roaming\\Example\\65292036b74bedd",
+            ));
+            reporter.on_total_files(Some(250));
+        }
+
+        let events = events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let indexing_max = events
+            .iter()
+            .filter(|event| event.phase == ScanPhase::Indexing)
+            .map(|event| event.scanned_files)
+            .max()
+            .unwrap_or(0);
+        assert!(indexing_max >= 400);
+
+        let walking = events
+            .iter()
+            .filter(|event| event.phase == ScanPhase::Walking)
+            .collect::<Vec<_>>();
+        assert!(walking
+            .iter()
+            .any(|event| event.scanned_files >= indexing_max
+                && event.current_path.contains("AppData")));
+        assert!(
+            walking
+                .iter()
+                .map(|event| event.scanned_files)
+                .max()
+                .unwrap_or(0)
+                >= 401
+        );
+        assert!(walking
+            .iter()
+            .any(|event| event.total_files == Some(250) && event.percent.is_some()));
+    }
+
+    #[test]
     fn scan_progress_walk_path_reports_no_percent() {
         let events = walk_progress_events("no-percent");
 
@@ -6730,6 +6853,7 @@ rules:
             scanned_files: 421_339,
             candidate_count: 12,
             reclaimable_bytes: 4096,
+            scanned_bytes: 12_288,
             current_path: "C:\\Windows\\Temp".to_string(),
             current_volume: "C".to_string(),
             total_files: Some(1_000_000),
@@ -6754,6 +6878,10 @@ rules:
                 .and_then(|value| value.as_u64()),
             Some(4096)
         );
+        assert_eq!(
+            json.get("scannedBytes").and_then(|value| value.as_u64()),
+            Some(12_288)
+        );
         assert!(json.get("currentPath").is_some());
         assert!(json.get("currentVolume").is_some());
         assert_eq!(
@@ -6764,6 +6892,32 @@ rules:
             json.get("percent").and_then(|value| value.as_u64()),
             Some(42)
         );
+    }
+
+    #[test]
+    fn scan_progress_accumulates_scanned_bytes_separately_from_reclaimable() {
+        let events = Mutex::new(Vec::new());
+        {
+            let inner = NoopScanController;
+            let reporter = ScanProgressController::new(&inner, |progress: ScanProgress| {
+                events
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(progress);
+            });
+            reporter.on_scanned_bytes(4096);
+            reporter.on_candidate(512);
+            reporter.on_scanned_bytes(8192);
+            reporter.on_phase(ScanPhase::Analyzing);
+        }
+
+        let events = events
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let final_event = events.last().expect("forced phase emit");
+        assert_eq!(final_event.scanned_bytes, 12_288);
+        assert_eq!(final_event.reclaimable_bytes, 512);
+        assert_eq!(final_event.candidate_count, 1);
     }
 
     #[test]
@@ -6894,18 +7048,13 @@ rules:
             selected: true,
             supports_fast_index: false,
         };
-        let run = walk_full_volume(&volume);
+        let _run = walk_full_volume(&volume);
 
-        assert!(run
-            .candidates
-            .iter()
-            .all(
-                |candidate| !normalize_path_for_id(Path::new(&candidate.path))
-                    .starts_with(&normalize_path_for_id(&install_root))
-            ));
-        assert!(validate_cleanup_target_path(&out_dir)
-            .expect_err("runtime out directory should be protected")
-            .contains("应用安装目录"));
+        assert!(validate_cleanup_target_path(&out_dir).is_ok());
+        assert!(matches!(
+            evaluate_cleanup_target_path(&out_dir),
+            PathGuardLevel::NeedsConfirm(_)
+        ));
 
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
@@ -6940,11 +7089,9 @@ rules:
             },
         );
 
-        assert_eq!(report.cleaned_count, 0);
-        assert_eq!(report.skipped_locked_count, 1);
-        assert!(!delete_called);
-        assert!(out_dir.join("main.js").exists());
-        assert!(report.item_results[0].reason.contains("应用安装目录"));
+        assert_eq!(report.cleaned_count, 1);
+        assert_eq!(report.skipped_locked_count, 0);
+        assert!(delete_called);
 
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
@@ -7034,8 +7181,9 @@ rules:
         let warning = fast_scan_fallback_warning(&volume, &error);
 
         assert!(warning.contains("管理员权限"));
-        assert!(warning.contains("已回退到递归扫描"));
+        assert!(warning.contains("已回退到目录枚举"));
         assert!(warning.contains("结果仍可用"));
+        assert!(warning.contains("$MFT"));
     }
 
     #[test]
@@ -7381,15 +7529,23 @@ rules:
             Path::new("D:\\cantinstall\\Ant Browser\\data\\Default\\Local Storage\\leveldb");
         let database_path = Path::new("C:\\Users\\979\\AppData\\Local\\Cursor\\state.vscdb");
 
-        assert!(validate_cleanup_target_path(dependency_path)
-            .expect_err("node_modules should be protected")
-            .contains("依赖"));
-        let state_error = validate_cleanup_target_path(state_path)
-            .expect_err("Local Storage should be protected");
-        assert!(state_error.contains("持久化状态") || state_error.contains("应用安装目录"));
-        assert!(validate_cleanup_target_path(database_path)
-            .expect_err("database files should be protected")
-            .contains("数据库"));
+        assert!(
+            validate_cleanup_target_path(dependency_path).is_ok(),
+            "node_modules should be confirmable"
+        );
+        assert!(
+            validate_cleanup_target_path(state_path).is_ok(),
+            "Local Storage should be confirmable"
+        );
+        assert!(
+            validate_cleanup_target_path(database_path).is_ok(),
+            "database files should be confirmable"
+        );
+        assert!(
+            validate_cleanup_target_path(Path::new("C:\\Users\\979\\AppData\\Local\\App\\wallet"))
+                .is_ok(),
+            "wallet should be confirmable"
+        );
     }
 
     #[test]
@@ -7467,7 +7623,7 @@ rules:
     }
 
     #[test]
-    fn full_walk_skips_dependency_directories_inside_projects() {
+    fn full_walk_lists_dependency_directories_as_confirmable() {
         let root = env::temp_dir().join(format!(
             "cleandeck-node-modules-skip-test-{}-{}",
             std::process::id(),
@@ -7493,10 +7649,15 @@ rules:
         };
         let run = walk_full_volume(&volume);
 
-        assert!(run
+        let candidate = run
             .candidates
             .iter()
-            .all(|candidate| !candidate.path.contains("node_modules")));
+            .find(|candidate| candidate.path.contains("node_modules"))
+            .expect("node_modules should appear as a heuristic candidate");
+        assert_eq!(candidate.category, "开发依赖缓存");
+        assert_ne!(candidate.risk_level, RiskLevel::Blocked);
+        assert_ne!(candidate.delete_strategy, DeleteStrategy::Skip);
+        assert!(!candidate.default_selected);
 
         fs::remove_dir_all(&root).expect("test directory should be removed");
     }
@@ -7595,12 +7756,12 @@ rules:
     }
 
     #[test]
-    fn roaming_session_database_is_blocked() {
+    fn roaming_session_database_requires_review() {
         let classification =
             classify_application_cache("C:/Users/979/AppData/Roaming/SomeApp/session.db", false);
 
-        assert_eq!(classification.decision, CacheDecision::BlockClean);
-        assert_eq!(classification.risk_level, RiskLevel::Blocked);
+        assert_eq!(classification.decision, CacheDecision::ReviewClean);
+        assert_eq!(classification.risk_level, RiskLevel::ReviewRequired);
         assert!(!classification.default_selected);
     }
 
@@ -7830,7 +7991,7 @@ rules:
     }
 
     #[test]
-    fn profile_state_files_stay_hard_denied() {
+    fn profile_state_files_need_confirmation() {
         for path in [
             "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Preferences",
             "C:\\Users\\979\\AppData\\Local\\Google\\Chrome\\User Data\\Default\\Cookies-journal",
@@ -7842,30 +8003,32 @@ rules:
             assert!(
                 matches!(
                     evaluate_cleanup_target_path(Path::new(path)),
-                    PathGuardLevel::HardDeny(_)
+                    PathGuardLevel::NeedsConfirm(_)
                 ),
-                "{path} should be hard denied"
+                "{path} should be confirmable"
             );
+            assert!(validate_cleanup_target_path(Path::new(path)).is_ok());
         }
     }
 
     #[test]
-    fn state_inside_cache_directory_stays_hard_denied() {
+    fn state_inside_cache_directory_keeps_secrets_denied() {
         let cookies = Path::new(FIREFOX_CACHE).join("Cookies");
         let wallet = Path::new(FIREFOX_CACHE).join("wallet");
 
         assert!(matches!(
             evaluate_cleanup_target_path(&cookies),
-            PathGuardLevel::HardDeny(_)
+            PathGuardLevel::NeedsConfirm(_)
         ));
         assert!(matches!(
             evaluate_cleanup_target_path(&wallet),
-            PathGuardLevel::HardDeny(_)
+            PathGuardLevel::NeedsConfirm(_)
         ));
+        assert!(validate_cleanup_target_path(&wallet).is_ok());
     }
 
     #[test]
-    fn user_content_directories_stay_hard_denied() {
+    fn user_content_directories_need_confirmation() {
         for path in [
             "C:\\Users\\979\\Documents\\taxes\\2025.xlsx",
             "C:\\Users\\979\\Desktop\\notes\\todo.txt",
@@ -7874,19 +8037,23 @@ rules:
             assert!(
                 matches!(
                     evaluate_cleanup_target_path(Path::new(path)),
-                    PathGuardLevel::HardDeny(_)
+                    PathGuardLevel::NeedsConfirm(_)
                 ),
-                "{path} should be hard denied"
+                "{path} should be confirmable"
             );
+            assert!(validate_cleanup_target_path(Path::new(path)).is_ok());
         }
     }
 
     #[test]
-    fn dependency_dirs_are_denied_but_download_caches_only_need_confirmation() {
+    fn dependency_dirs_and_download_caches_need_confirmation() {
         assert!(matches!(
             evaluate_cleanup_target_path(Path::new("D:\\Work\\demo\\node_modules\\react")),
-            PathGuardLevel::HardDeny(_)
+            PathGuardLevel::NeedsConfirm(_)
         ));
+        assert!(
+            validate_cleanup_target_path(Path::new("D:\\Work\\demo\\node_modules\\react")).is_ok()
+        );
 
         let npm_cache = Path::new("C:\\Users\\979\\AppData\\Local\\npm-cache");
         assert!(matches!(
@@ -7906,7 +8073,7 @@ rules:
     }
 
     #[test]
-    fn hard_deny_applies_to_rule_backed_candidates() {
+    fn rule_backed_candidates_bypass_path_guards() {
         let mut candidate = test_cleanup_candidate(
             "subscription-docs",
             Path::new("C:\\Users\\979\\Documents\\taxes"),
@@ -7921,18 +8088,20 @@ rules:
 
         let candidate = apply_cleanup_support_policy(candidate);
 
-        assert_eq!(candidate.risk_level, RiskLevel::Blocked);
-        assert_eq!(candidate.delete_strategy, DeleteStrategy::Skip);
-        assert!(!candidate.selected);
+        assert_ne!(candidate.risk_level, RiskLevel::Blocked);
+        assert_ne!(candidate.delete_strategy, DeleteStrategy::Skip);
     }
 
     #[test]
-    fn library_rules_do_not_bypass_needs_confirm() {
+    fn library_rules_keep_authored_selection_on_confirmable_paths() {
         let mut candidate = test_cleanup_candidate(
             "library-npm",
             Path::new("C:\\Users\\979\\AppData\\Local\\npm-cache"),
             ObjectType::Directory,
         );
+        candidate.risk_level = RiskLevel::SafeRecommended;
+        candidate.default_selected = true;
+        candidate.selected = true;
         candidate.cleanup_policy = CleanupPolicy {
             rule_id: Some("npm.cache.review".to_string()),
             method: RuleCleanupMethod::Contents,
@@ -7942,45 +8111,108 @@ rules:
 
         let candidate = apply_cleanup_support_policy(candidate);
 
-        assert_eq!(candidate.risk_level, RiskLevel::ReviewRequired);
-        assert!(!candidate.default_selected);
-        assert!(!candidate.selected);
+        assert_eq!(candidate.risk_level, RiskLevel::SafeRecommended);
+        assert!(candidate.default_selected);
+        assert!(candidate.selected);
     }
 
     #[test]
-    fn subscription_rule_targeting_denied_path_is_not_cleanable() {
+    fn subscription_rule_targeting_documents_is_cleanable() {
         let compilation = compile_cleanup_rules_yaml(
             r#"
 version: 1
 rules:
-  - id: evil.docs
+  - id: user.docs
     name: 文档清理
-    app: Evil
+    app: User
     category: 临时文件
     level: 推荐清理
     default: true
     paths:
       - "%USERPROFILE%\\Documents\\Reports"
     clean: contents
-    note: 订阅规则不应获得豁免。
+    note: 已批准规则可以清理文档路径。
 "#,
             RuleSourceKind::Subscription,
         );
 
         assert!(compilation.report.valid);
         let rule = &compilation.rules[0];
-        assert_ne!(rule.risk_level, RiskLevel::SafeRecommended);
-        assert!(!rule.default_selected);
+        assert_eq!(rule.risk_level, RiskLevel::SafeRecommended);
+        assert!(rule.default_selected);
 
         let mut candidate = test_cleanup_candidate(
-            "evil",
+            "docs",
             Path::new("C:\\Users\\979\\Documents\\Reports"),
             ObjectType::Directory,
         );
         candidate.cleanup_policy = cleanup_policy_for_rule(rule);
         let candidate = apply_cleanup_support_policy(candidate);
 
-        assert_eq!(candidate.risk_level, RiskLevel::Blocked);
-        assert_eq!(candidate.delete_strategy, DeleteStrategy::Skip);
+        assert_ne!(candidate.risk_level, RiskLevel::Blocked);
+        assert_ne!(candidate.delete_strategy, DeleteStrategy::Skip);
+    }
+
+    #[test]
+    fn system_paths_stay_hard_denied_while_install_and_secrets_need_confirmation() {
+        assert!(matches!(
+            evaluate_cleanup_target_path(Path::new("C:\\Windows\\System32\\drivers\\etc\\hosts")),
+            PathGuardLevel::HardDeny(_)
+        ));
+        assert!(matches!(
+            evaluate_cleanup_target_path(Path::new(
+                "C:\\Program Files\\ExampleApp\\ExampleApp.exe"
+            )),
+            PathGuardLevel::NeedsConfirm(_)
+        ));
+        assert!(validate_cleanup_target_path(Path::new(
+            "C:\\Program Files\\ExampleApp\\ExampleApp.exe"
+        ))
+        .is_ok());
+        assert!(matches!(
+            evaluate_cleanup_target_path(Path::new(
+                "C:\\Users\\979\\AppData\\Local\\App\\wallet.dat"
+            )),
+            PathGuardLevel::NeedsConfirm(_)
+        ));
+        assert!(validate_cleanup_target_path(Path::new(
+            "C:\\Users\\979\\AppData\\Local\\App\\wallet.dat"
+        ))
+        .is_ok());
+        assert!(
+            validate_cleanup_target_path(Path::new("C:\\Program Files\\ExampleApp\\Cache")).is_ok()
+        );
+        assert!(matches!(
+            evaluate_cleanup_target_path(Path::new(
+                "D:\\cantinstall\\Microsoft VS Code\\app\\resources\\app.asar"
+            )),
+            PathGuardLevel::NeedsConfirm(_)
+        ));
+        assert_eq!(
+            inventory_disposition_for_path(Path::new(
+                "D:\\cantinstall\\Microsoft VS Code\\app\\resources\\app\\out"
+            )),
+            crate::inventory::InventoryDisposition::AnalysisOnly
+        );
+    }
+
+    #[test]
+    fn portable_exe_and_dll_folder_is_not_classified_by_directory_listing() {
+        let root = env::temp_dir().join(format!(
+            "cleandeck-portable-listing-{}-{}",
+            std::process::id(),
+            stable_hash("portable-listing")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("portable folder should be created");
+        fs::write(root.join("Tool.exe"), [0_u8; 1]).expect("exe should be written");
+        fs::write(root.join("runtime.dll"), [1_u8; 1]).expect("dll should be written");
+
+        assert!(
+            matches!(evaluate_cleanup_target_path(&root), PathGuardLevel::Allowed),
+            "install detection must not readdir ancestors"
+        );
+
+        fs::remove_dir_all(&root).expect("test directory should be removed");
     }
 }

@@ -23,7 +23,7 @@
 - 扫描核心独立为 Rust crate，UI 可替换。
 - 第一阶段支持 Windows 10/11。
 - 普通文件系统使用安全目录遍历。
-- NTFS/ReFS 后续支持 USN/MFT 风格快速通道。
+- NTFS/ReFS 后续支持直接 `$MFT` 风格快速通道（完整空间核算）。
 - exFAT/FAT32 使用普通遍历和应用层缓存优化。
 - 单元测试纳入 Trellis Phase 2.2，作为独立必需步骤。
 
@@ -31,7 +31,7 @@
 
 - 不做注册表清理。
 - 不做驱动级磁盘操作。
-- 不直接解析 raw `$MFT` 作为 MVP 能力。
+- 不把 `FSCTL_ENUM_USN_DATA` 当作完整空间核算后端（USN 记录无 size）。
 - 不默认永久删除文件。
 - 不自动清理用户文档、桌面、项目目录。
 - 不在 MVP 阶段做重复文件深度比对。
@@ -447,18 +447,18 @@ sequenceDiagram
 
 ```text
 VolumeDetector
-  -> NTFS: NtfsUsnScanner if permitted, else WalkScanner
-  -> ReFS: RefsUsnScanner if verified, else WalkScanner
+  -> NTFS: direct $MFT inventory if permitted, else FileIdExtdDirectoryInfo / WalkScanner
+  -> ReFS: WalkScanner (until verified)
   -> exFAT/FAT32: WalkScanner
   -> network/removable: WalkScanner with throttling
 ```
 
-NTFS USN 通道注意事项：
+NTFS 直接 `$MFT` 通道注意事项：
 
-- 优先使用 Windows 官方 API，不 raw parse `$MFT`。
-- `FSCTL_ENUM_USN_DATA` 返回 file reference number、parent reference number、name 等。
-- 需要重建 parent -> child 路径映射。
-- 权限不足时必须无感 fallback 到普通遍历，并在 UI 里显示“快速索引不可用”。
+- 以管理员可读的卷设备句柄打开目标卷，定位并流式解析 `$MFT` FILE 记录。
+- 从 `$DATA` 取得 logical/allocated size；hard link 按 file identity 去重 allocated bytes。
+- `FSCTL_ENUM_USN_DATA` **不得**作为完整空间核算后端（记录无 size）。
+- 权限不足或解析失败时必须有感 fallback 到目录枚举，并在 coverage 中记录 `accessDenied` / `backendFallback`。
 
 ### 7.3 增量扫描 Phase 2
 

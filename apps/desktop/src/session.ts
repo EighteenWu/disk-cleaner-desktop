@@ -39,6 +39,8 @@ export interface ScanStats {
   scannedFiles: number;
   candidateCount: number;
   reclaimableBytes: number;
+  /** Total size of visited inventory, not just reclaimable cleanup hits. */
+  scannedBytes: number;
   currentPath: string;
   currentVolume: string;
   percent: number | null;
@@ -100,6 +102,7 @@ export const EMPTY_SCAN_STATS: ScanStats = {
   scannedFiles: 0,
   candidateCount: 0,
   reclaimableBytes: 0,
+  scannedBytes: 0,
   currentPath: "",
   currentVolume: "",
   percent: null,
@@ -173,6 +176,7 @@ export function sessionReducer(state: SessionState, event: SessionEvent): Sessio
           scannedFiles: event.progress.scannedFiles,
           candidateCount: event.progress.candidateCount,
           reclaimableBytes: event.progress.reclaimableBytes,
+          scannedBytes: event.progress.scannedBytes,
           currentPath: event.progress.currentPath,
           currentVolume: event.progress.currentVolume,
           percent: normalizePercent(event.progress.percent),
@@ -201,6 +205,7 @@ export function sessionReducer(state: SessionState, event: SessionEvent): Sessio
           // of a run can be summarised after the final tick was emitted.
           candidateCount: event.snapshot.summary.candidateCount,
           reclaimableBytes: event.snapshot.summary.estimatedReclaimBytes,
+          scannedBytes: snapshotScannedBytes(event.snapshot),
           currentPath: "",
           percent: 100,
           elapsedMs: elapsedSince(state.scan.startedAt, event.at, state.scan.elapsedMs),
@@ -327,6 +332,15 @@ export function isBusy(state: SessionState): boolean {
  */
 export function scanStatsVisible(state: SessionState): boolean {
   return state.scan.hasRun;
+}
+
+/** Prefer the finished inventory total; live progress only has reclaimable hits. */
+export function scanHeadlineBytes(scan: ScanStats): number {
+  return scan.scannedBytes > 0 ? scan.scannedBytes : scan.reclaimableBytes;
+}
+
+function snapshotScannedBytes(snapshot: ScanSnapshot): number {
+  return snapshot.coverage.allocatedBytes || snapshot.coverage.logicalBytes;
 }
 
 /**

@@ -16,6 +16,7 @@ function progress(overrides: Partial<ScanProgress> = {}): ScanProgress {
     scannedFiles: 0,
     candidateCount: 0,
     reclaimableBytes: 0,
+    scannedBytes: 0,
     currentPath: "",
     currentVolume: "C:",
     totalFiles: null,
@@ -119,5 +120,10 @@ describe("phase label localization", () => {
     const labels = phases.map((phase) => localizedScanPhase("en-US", phase));
 
     expect(new Set(labels).size).toBe(phases.length);
+  });
+
+  it("names the rule-matching phase instead of a vague analyzing label", () => {
+    expect(localizedScanPhase("zh-CN", "analyzing")).toBe("匹配规则");
+    expect(localizedScanPhase("en-US", "analyzing")).toBe("Matching rules");
   });
 });

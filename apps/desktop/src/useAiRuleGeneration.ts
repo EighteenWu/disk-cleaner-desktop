@@ -3,20 +3,29 @@ import {
   approveAiRuleDraft,
   buildAiScanSummary,
   cancelAiRuleGeneration,
+  generateAiRulePlan,
   generateAiRules,
   listenAiGenerationProgress,
   listAiProviderModels,
   listAiProviderProfiles,
   probeAiProviderGeneration,
-  reviseAiRuleDraft,
   saveAiProviderCredential,
   saveAiProviderProfile,
   testAiProviderConnection,
   validateAiRuleDraft
 } from "./api";
-import { aiGenerationRequest } from "./aiGeneration";
-import { aiDraftApprovalReady, aiDraftValidationReady } from "./aiDraftWorkflow";
-import { describeProviderError, describeProviderErrorOrTimeout } from "./providerError";
+import {
+  aiGeneratedRulesFromCompiled,
+  aiGenerationRequest,
+  appendPlanDelta,
+  canApproveAiPlan,
+  liveAiRuleYaml,
+  planMessagesForRequest,
+  previousRulesFromLiveAiLibrary,
+  resolvePlanUserContent,
+  shouldWarnReplaceAiRecord
+} from "./aiGeneration";
+import { describeProviderError, describeProviderErrorOrTimeout, isProviderError } from "./providerError";
 import {
   DEFAULT_PROVIDER_TIMEOUT_MS,
   inferVendorId,
@@ -24,27 +33,31 @@ import {
   providerDetectSavePlan,
   shouldAutoDetectProvider,
   shouldCreateProfileForVendor,
+  shouldQueueProviderDetect,
   vendorPreset,
   type ProviderVendorId
 } from "./providerPresets";
 import type { RuleSourcesState } from "./useRuleSources";
 import type {
+  AiChatMessage,
   AiGeneratedRuleSet,
   AiGenerationMode,
   AiProviderKind,
   AiProviderModel,
   AiProviderProfile,
-  AiRuleDraft,
-  AiRuleTier,
   AiSessionEvent,
   RedactedScanSummary,
   ScanSnapshot
 } from "./types";
 
-export { DEFAULT_PROVIDER_TIMEOUT_MS, shouldAutoDetectProvider, providerDetectSavePlan };
+export {
+  DEFAULT_PROVIDER_TIMEOUT_MS,
+  shouldAutoDetectProvider,
+  shouldQueueProviderDetect,
+  providerDetectSavePlan
+};
 export type { ProviderVendorId };
 
-const PROVIDER_DETECT_DEBOUNCE_MS = 800;
 export const MIN_PROVIDER_TIMEOUT_SECONDS = 15;
 export const MAX_PROVIDER_TIMEOUT_SECONDS = 600;
 const LEGACY_DEFAULT_TIMEOUT_MS = 45_000;
@@ -79,29 +92,26 @@ export interface AiRuleGenerationState {
   testingConnection: boolean;
   probingGeneration: boolean;
   summary: RedactedScanSummary | null;
-  generationMode: AiGenerationMode;
-  setGenerationMode: (value: AiGenerationMode) => void;
-  targetTier: AiRuleTier;
-  setTargetTier: (value: AiRuleTier) => void;
-  draft: AiRuleDraft | null;
-  draftEditor: string;
-  draftEditorDirty: boolean;
-  setDraftEditor: (value: string) => void;
+  messages: AiChatMessage[];
+  composer: string;
+  setComposer: (value: string) => void;
+  planning: boolean;
   generating: boolean;
+  canApprove: boolean;
+  replaceWarning: boolean;
   message: string;
   sessionEvents: AiSessionEvent[];
   clearSessionEvents: () => void;
+  resetConversation: () => void;
   loadModels: () => Promise<void>;
   testConnection: () => Promise<void>;
   probeGeneration: () => Promise<void>;
   onApiKeyBlur: () => void;
+  onApiKeyPaste: () => void;
   saveProvider: () => Promise<void>;
-  preparePreview: (snapshot: ScanSnapshot | null, ready: boolean) => Promise<void>;
-  generate: () => Promise<void>;
+  sendPlan: (snapshot: ScanSnapshot | null, ready: boolean) => Promise<void>;
+  approvePlan: () => Promise<void>;
   cancel: () => Promise<void>;
-  applyDraftEdit: () => Promise<void>;
-  validateDraft: () => Promise<void>;
-  approveAndImportDraft: () => Promise<void>;
 }
 
 export function pushSessionEvent(
@@ -141,16 +151,19 @@ export function useAiRuleGeneration(
   const [probingGeneration, setProbingGeneration] = useState(false);
   const detectGeneration = useRef(0);
   const lastAutoDetectKey = useRef("");
+  const pasteDetectPending = useRef(false);
+  const conversationEpoch = useRef(0);
+  const inFlight = useRef(false);
   const [summary, setSummary] = useState<RedactedScanSummary | null>(null);
-  const [generationMode, setGenerationModeValue] = useState<AiGenerationMode>("allTiers");
-  const [targetTierValue, setTargetTierValue] = useState<AiRuleTier>("light");
-  const [draft, setDraft] = useState<AiRuleDraft | null>(null);
-  const [draftEditor, setDraftEditorValue] = useState("");
-  const [draftEditorDirty, setDraftEditorDirty] = useState(false);
+  const [messages, setMessages] = useState<AiChatMessage[]>([]);
+  const [composer, setComposer] = useState("");
+  const [planning, setPlanning] = useState(false);
   const [generating, setGenerating] = useState(false);
+  const [previousRules, setPreviousRules] = useState<AiGeneratedRuleSet | null>(null);
   const [message, setMessage] = useState("");
   const [sessionEvents, setSessionEvents] = useState<AiSessionEvent[]>([]);
   const clearSessionEvents = useCallback(() => setSessionEvents([]), []);
+  const generationMode: AiGenerationMode = "allTiers";
 
   useEffect(() => {
     let disposed = false;
@@ -177,10 +190,11 @@ export function useAiRuleGeneration(
     lastAutoDetectKey.current = "";
   }
 
-  function setApiKey(value: string) {
-    bumpDetect();
+  const setApiKey = useCallback((value: string) => {
+    detectGeneration.current += 1;
+    lastAutoDetectKey.current = "";
     setApiKeyValue(value);
-  }
+  }, []);
 
   function setBaseUrl(value: string) {
     bumpDetect();
@@ -197,15 +211,6 @@ export function useAiRuleGeneration(
     setTimeoutMsValue(value);
   }
 
-  // Auto-detect on typed key + endpoint only. Model is chosen inside detectReady.
-  useEffect(() => {
-    if (!shouldAutoDetectProvider(apiKey) || !baseUrl.trim()) return;
-    const timer = window.setTimeout(() => {
-      void detectReady("auto");
-    }, PROVIDER_DETECT_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
-  }, [apiKey, baseUrl, providerKind, vendorId, selectedProfileIdValue, timeoutMs]);
-
   function recordSession(event: Omit<AiSessionEvent, "at"> & { at?: string }) {
     setSessionEvents((current) => pushSessionEvent(current, event));
   }
@@ -216,9 +221,16 @@ export function useAiRuleGeneration(
 
   function clearPreparedDraft() {
     setSummary(null);
-    setDraft(null);
-    setDraftEditorValue("");
-    setDraftEditorDirty(false);
+  }
+
+  function resetConversation() {
+    conversationEpoch.current += 1;
+    setMessages([]);
+    setComposer("");
+    setPlanning(false);
+    setGenerating(false);
+    setSummary(null);
+    setMessage("");
   }
 
   function applyProfileFields(profile: AiProviderProfile) {
@@ -255,16 +267,6 @@ export function useAiRuleGeneration(
     setTimeoutMsValue(preset.timeoutMs);
     setModel(preset.recommendedModel ?? "");
     setModels([]);
-    clearPreparedDraft();
-  }
-
-  function setGenerationMode(value: AiGenerationMode) {
-    setGenerationModeValue(value);
-    clearPreparedDraft();
-  }
-
-  function setTargetTier(value: AiRuleTier) {
-    setTargetTierValue(value);
     clearPreparedDraft();
   }
 
@@ -463,10 +465,23 @@ export function useAiRuleGeneration(
   }
 
   function onApiKeyBlur() {
-    if (shouldAutoDetectProvider(apiKey)) {
+    if (shouldQueueProviderDetect("blur", apiKey)) {
       void detectReady("auto");
     }
   }
+
+  function onApiKeyPaste() {
+    pasteDetectPending.current = true;
+  }
+
+  // Run after React commits the pasted value. setState inside the paste event
+  // would re-render the controlled input with the old "" and swallow the insert.
+  useEffect(() => {
+    if (!pasteDetectPending.current) return;
+    pasteDetectPending.current = false;
+    if (!shouldQueueProviderDetect("paste", apiKey)) return;
+    void detectReady("auto");
+  }, [apiKey]);
 
   async function saveProvider() {
     try {
@@ -477,7 +492,8 @@ export function useAiRuleGeneration(
     }
   }
 
-  async function preparePreview(snapshot: ScanSnapshot | null, ready: boolean) {
+  async function sendPlan(snapshot: ScanSnapshot | null, ready: boolean) {
+    if (inFlight.current || planning || generating) return;
     if (!snapshot || !selectedProfileIdValue) {
       setMessage(translate("rule.aiNeedsScanAndProvider"));
       return;
@@ -486,35 +502,42 @@ export function useAiRuleGeneration(
       setMessage(translate("rule.aiNeedsFullScan"));
       return;
     }
-    setDraft(null);
-    try {
-      const nextSummary = await buildAiScanSummary(snapshot);
-      setSummary(nextSummary);
-      const text = translate("rule.aiPreviewReady");
-      setMessage(text);
-      recordSession({
-        kind: "preview",
-        summaryHash: nextSummary.summaryHash,
-        mode: generationMode,
-        model: model.trim() || undefined,
-        message: text
-      });
-    } catch (error) {
-      setMessage(describeProviderError(error, translate));
-    }
-  }
-
-  async function generate() {
-    if (!summary || !selectedProfileIdValue) {
-      setMessage(translate("rule.aiPrepareFirst"));
-      return;
-    }
-    setGenerating(true);
-    setDraft(null);
+    const content = resolvePlanUserContent(composer, translate);
+    const userMessage: AiChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content,
+      status: "complete"
+    };
+    const assistantMessage: AiChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "",
+      status: "streaming"
+    };
+    const nextMessages = [...messages, userMessage, assistantMessage];
+    const epoch = conversationEpoch.current;
+    inFlight.current = true;
+    setComposer("");
+    setMessages(nextMessages);
+    setPlanning(true);
     const started = performance.now();
     let unlistenProgress: (() => void) | undefined;
     try {
+      const nextSummary = await buildAiScanSummary(snapshot);
+      if (epoch !== conversationEpoch.current) return;
+      setSummary(nextSummary);
       unlistenProgress = await listenAiGenerationProgress((progress) => {
+        if (epoch !== conversationEpoch.current) return;
+        if (progress.phase === "plan" && progress.delta) {
+          setMessages((current) =>
+            current.map((item) =>
+              item.id === assistantMessage.id && item.status === "streaming"
+                ? { ...item, content: appendPlanDelta(item.content, progress.delta) }
+                : item
+            )
+          );
+        }
         setMessage(
           translate("rule.aiGeneratingProgress", {
             chars: progress.outputChars,
@@ -522,33 +545,159 @@ export function useAiRuleGeneration(
           })
         );
       });
-      const request = aiGenerationRequest(
-        summary,
-        generationMode,
-        generationMode === "singleTier" ? targetTierValue : null
+      const response = await generateAiRulePlan(selectedProfileIdValue, {
+        summary: nextSummary,
+        messages: planMessagesForRequest([...messages, userMessage]),
+        scanSessionId: snapshot.scanSessionId
+      });
+      if (epoch !== conversationEpoch.current) return;
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantMessage.id
+            ? { ...item, content: response.reply, status: "complete" }
+            : item
+        )
       );
-      const response = await generateAiRules(selectedProfileIdValue, request);
       const elapsed = Math.round(performance.now() - started);
-      setDraft(response.draft);
-      setDraftEditorValue(JSON.stringify(response.draft.rules, null, 2));
-      setDraftEditorDirty(false);
-      const text = translate("rule.aiGenerated", { count: response.draft.rules.rules.length });
+      const text = translate("rule.aiChatPlanReady");
+      setMessage(text);
+      recordSession({
+        kind: "generate",
+        summaryHash: nextSummary.summaryHash,
+        mode: generationMode,
+        model: response.model,
+        latencyMs: elapsed,
+        message: text
+      });
+    } catch (error) {
+      if (epoch !== conversationEpoch.current) return;
+      const elapsed = Math.round(performance.now() - started);
+      const cancelled = isProviderError(error) && error.category === "cancelled";
+      const text = cancelled
+        ? translate("rule.aiChatCancelled")
+        : describeProviderErrorOrTimeout(
+            error,
+            translate,
+            translate("rule.aiGenerationTimeout", {
+              seconds: Math.round(timeoutMs / 1000),
+              elapsedSeconds: Math.max(1, Math.round(elapsed / 1000))
+            })
+          );
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantMessage.id
+            ? {
+                ...item,
+                status: cancelled ? "cancelled" : "error",
+                content: item.content || text
+              }
+            : item
+        )
+      );
+      setMessage(text);
+      recordSession({
+        kind: "error",
+        summaryHash: summary?.summaryHash,
+        mode: generationMode,
+        model: model.trim() || undefined,
+        latencyMs: elapsed,
+        message: text
+      });
+      logOperation(translate("rule.aiGenerateFailedLog"), text, model.trim() || undefined);
+    } finally {
+      unlistenProgress?.();
+      inFlight.current = false;
+      if (epoch === conversationEpoch.current) setPlanning(false);
+    }
+  }
+
+  async function approvePlan() {
+    if (
+      inFlight.current ||
+      !canApproveAiPlan(messages, planning || generating) ||
+      !summary ||
+      !selectedProfileIdValue
+    ) {
+      return;
+    }
+    const planText = [...messages].reverse().find((item) => item.role === "assistant" && item.status === "complete")
+      ?.content;
+    if (!planText?.trim()) return;
+    const epoch = conversationEpoch.current;
+    inFlight.current = true;
+    setGenerating(true);
+    setMessage(translate("rule.aiChatApproving"));
+    const started = performance.now();
+    let unlistenProgress: (() => void) | undefined;
+    try {
+      unlistenProgress = await listenAiGenerationProgress((progress) => {
+        if (epoch !== conversationEpoch.current) return;
+        setMessage(
+          translate("rule.aiGeneratingProgress", {
+            chars: progress.outputChars,
+            seconds: Math.max(1, Math.round(progress.elapsedMs / 1000))
+          })
+        );
+      });
+      const libraryRecords = rules.library?.snapshot?.records;
+      let prior = previousRules ?? previousRulesFromLiveAiLibrary(libraryRecords, rules.activeLibrarySnapshot);
+      if (!prior) {
+        const yaml = liveAiRuleYaml(libraryRecords);
+        if (yaml) {
+          try {
+            const compilation = await rules.validateLibraryDraft(yaml);
+            prior = aiGeneratedRulesFromCompiled(compilation.rules);
+          } catch {
+            prior = null;
+          }
+        }
+      }
+      if (epoch !== conversationEpoch.current) return;
+      const revision = prior
+        ? {
+            previousRules: prior,
+            droppedIds: [],
+            tierChanges: [],
+            rewriteIds: []
+          }
+        : null;
+      const response = await generateAiRules(
+        selectedProfileIdValue,
+        aiGenerationRequest(summary, "allTiers", null, revision, planText)
+      );
+      const validated = await validateAiRuleDraft(
+        response.draft,
+        response.draft.revision,
+        response.draft.summaryHash
+      );
+      const envelope = await approveAiRuleDraft(
+        validated,
+        validated.revision,
+        validated.summaryHash
+      );
+      if (epoch !== conversationEpoch.current) return;
+      await rules.importAndApproveAiRule(translate("rule.aiDraftName"), envelope);
+      if (epoch !== conversationEpoch.current) return;
+      setPreviousRules(validated.rules);
+      const elapsed = Math.round(performance.now() - started);
+      const text = translate("rule.aiDraftEnabled", { count: validated.rules.rules.length });
       setMessage(text);
       recordSession({
         kind: "generate",
         summaryHash: summary.summaryHash,
         mode: generationMode,
-        model: response.draft.model,
+        model: validated.model,
         latencyMs: elapsed,
-        ruleCount: response.draft.rules.rules.length,
+        ruleCount: validated.rules.rules.length,
         message: text
       });
       logOperation(
         translate("rule.aiGeneratedLog"),
         text,
-        [response.draft.model, `${elapsed} ms`].filter(Boolean).join(" · ")
+        [validated.model, `${elapsed} ms`].filter(Boolean).join(" · ")
       );
     } catch (error) {
+      if (epoch !== conversationEpoch.current) return;
       const elapsed = Math.round(performance.now() - started);
       const text = describeProviderErrorOrTimeout(
         error,
@@ -574,56 +723,16 @@ export function useAiRuleGeneration(
       );
     } finally {
       unlistenProgress?.();
-      setGenerating(false);
+      inFlight.current = false;
+      if (epoch === conversationEpoch.current) setGenerating(false);
     }
   }
 
   async function cancel() {
     try {
       await cancelAiRuleGeneration();
-    } catch (error) {
-      setMessage(describeProviderError(error, translate));
-    }
-  }
-
-  function setDraftEditor(value: string) {
-    setDraftEditorValue(value);
-    setDraftEditorDirty(true);
-  }
-
-  async function applyDraftEdit() {
-    if (!draft) return;
-    try {
-      const nextRules = JSON.parse(draftEditor) as AiGeneratedRuleSet;
-      const next = await reviseAiRuleDraft(draft, draft.revision, nextRules);
-      setDraft(next);
-      setDraftEditorValue(JSON.stringify(next.rules, null, 2));
-      setDraftEditorDirty(false);
-      setMessage(translate("rule.aiDraftRevised", { revision: next.revision }));
-    } catch (error) {
-      setMessage(describeProviderError(error, translate));
-    }
-  }
-
-  async function validateDraft() {
-    if (!aiDraftValidationReady(draft, draftEditorDirty) || !draft) return;
-    try {
-      const next = await validateAiRuleDraft(draft, draft.revision, draft.summaryHash);
-      setDraft(next);
-      setMessage(translate("rule.aiDraftValidated", { revision: next.revision }));
-    } catch (error) {
-      setMessage(describeProviderError(error, translate));
-    }
-  }
-
-  async function approveAndImportDraft() {
-    if (!aiDraftApprovalReady(draft, draftEditorDirty) || !draft) return;
-    try {
-      const envelope = await approveAiRuleDraft(draft, draft.revision, draft.summaryHash);
-      await rules.importApprovedAiDraft(translate("rule.aiDraftName"), envelope);
-      setMessage(translate("rule.aiDraftSavedEditable"));
-    } catch (error) {
-      setMessage(describeProviderError(error, translate));
+    } catch {
+      // Idle cancel is expected when the dialog closes or the request already finished.
     }
   }
 
@@ -650,28 +759,25 @@ export function useAiRuleGeneration(
     testingConnection,
     probingGeneration,
     summary,
-    generationMode,
-    setGenerationMode,
-    targetTier: targetTierValue,
-    setTargetTier,
-    draft,
-    draftEditor,
-    draftEditorDirty,
-    setDraftEditor,
+    messages,
+    composer,
+    setComposer,
+    planning,
     generating,
+    canApprove: canApproveAiPlan(messages, planning || generating),
+    replaceWarning: shouldWarnReplaceAiRecord(rules.library?.snapshot?.records),
     message,
     sessionEvents,
     clearSessionEvents,
+    resetConversation,
     loadModels,
     testConnection,
     probeGeneration,
     onApiKeyBlur,
+    onApiKeyPaste,
     saveProvider,
-    preparePreview,
-    generate,
-    cancel,
-    applyDraftEdit,
-    validateDraft,
-    approveAndImportDraft
+    sendPlan,
+    approvePlan,
+    cancel
   };
 }

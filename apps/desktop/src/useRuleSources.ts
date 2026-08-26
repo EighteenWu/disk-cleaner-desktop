@@ -21,6 +21,7 @@ import type {
   RuleLibraryMutationAction,
   RuleOrigin,
   RuleProvenance,
+  RuleLibrarySnapshot,
   RuleRecord,
   RuleValidationReport
 } from "./types";
@@ -32,6 +33,23 @@ import type {
 
 export const DEFAULT_RULE_SUBSCRIPTION_URL =
   "https://raw.githubusercontent.com/MoscaDotTo/Winapp2/master/Winapp2.ini";
+
+export const AI_RULE_IMPORT_MUTATION = "importAndApproveAiRule" as const;
+
+export type LibraryTableAction = "edit" | "approve" | "disable" | "enable" | "delete";
+
+export function visibleRuleLibraryRecords(records: RuleRecord[] | undefined): RuleRecord[] {
+  return records?.filter((record) => record.state !== "deleted") ?? [];
+}
+
+export function libraryTableActions(record: RuleRecord): LibraryTableAction[] {
+  const actions: LibraryTableAction[] = ["edit"];
+  if (record.pendingRevisionId) actions.push("approve");
+  if (record.state === "approved") actions.push("disable");
+  if (record.state === "disabled") actions.push("enable");
+  actions.push("delete");
+  return actions;
+}
 
 const REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const STARTUP_REFRESH_DELAY_MS = 3000;
@@ -75,9 +93,11 @@ export interface RuleSourcesState {
     origin?: RuleOrigin
   ) => Promise<void>;
   importApprovedAiDraft: (displayName: string, envelope: ApprovedRuleEnvelope) => Promise<void>;
+  importAndApproveAiRule: (displayName: string, envelope: ApprovedRuleEnvelope) => Promise<void>;
   validateLibraryDraft: (content: string) => Promise<RuleCompilation>;
   saveSubscriptionDraft: () => Promise<void>;
   enableSubscriptionPack: () => Promise<void>;
+  importStarterRules: () => Promise<void>;
   /** Replaces a record's pending content, creating a new revision to approve. */
   saveLibraryDraft: (
     record: RuleRecord,
@@ -86,6 +106,7 @@ export interface RuleSourcesState {
   ) => Promise<void>;
   approveLibraryRecord: (record: RuleRecord) => Promise<void>;
   disableLibraryRecord: (record: RuleRecord) => Promise<void>;
+  enableLibraryRecord: (record: RuleRecord) => Promise<void>;
   deleteLibraryRecord: (record: RuleRecord) => Promise<void>;
   restoreLibraryRecord: (record: RuleRecord) => Promise<void>;
   rollbackLibraryRecord: (record: RuleRecord, revisionId: string) => Promise<void>;
@@ -230,15 +251,59 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     translate
   ]);
 
+  const importStarterRules = useCallback(async () => {
+    if (libraryMutating) {
+      return;
+    }
+    const existing = findBundledStarterRecord(library?.snapshot ?? null);
+    const existingHash = bundledStarterHeadHash(existing);
+    setLibraryMutating(true);
+    try {
+      const nextSnapshot = await mutateRuleLibrary({
+        expectedGeneration: library?.snapshot?.generation ?? 0,
+        expectedHeadRevisionId: null,
+        mutationId: crypto.randomUUID(),
+        actorId: actorId.current,
+        deviceId: deviceId.current,
+        timestamp: new Date().toISOString(),
+        action: {
+          type: "importAndApproveStarter",
+          displayName: translate("rule.starterPackName")
+        }
+      });
+      await reloadRuleLibrary();
+      const nextHash = bundledStarterHeadHash(findBundledStarterRecord(nextSnapshot));
+      const noticeKey =
+        existing?.state === "approved" && existingHash && nextHash && existingHash !== nextHash
+          ? "rule.starterUpdated"
+          : existing?.state === "approved"
+            ? "rule.starterAlreadyImported"
+            : "rule.starterImported";
+      const message = translate(noticeKey);
+      onNotice(message);
+      onLog(translate("rule.starterImportedLog"), message);
+    } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      const message = starterImportErrorNotice(raw, translate);
+      onNotice(message);
+      onLog(translate("rule.starterImportFailedLog"), message);
+      throw error;
+    } finally {
+      setLibraryMutating(false);
+    }
+  }, [library?.snapshot, libraryMutating, onLog, onNotice, reloadRuleLibrary, translate]);
+
   const importApprovedAiDraft = useCallback(
     async (displayName: string, envelope: ApprovedRuleEnvelope) => {
       await applyLibraryMutation(
-        { type: "importApprovedAiDraft", displayName, envelope },
+        { type: AI_RULE_IMPORT_MUTATION, displayName, envelope },
         null
       );
     },
     [applyLibraryMutation]
   );
+
+  const importAndApproveAiRule = importApprovedAiDraft;
 
   const validateLibraryDraft = useCallback(async (content: string) => {
     return looksLikeWinapp2(content)
@@ -284,6 +349,16 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     async (record: RuleRecord) => {
       await applyLibraryMutation(
         { type: "disable", recordId: record.id },
+        record.pendingRevisionId ?? record.activeRevisionId
+      );
+    },
+    [applyLibraryMutation]
+  );
+
+  const enableLibraryRecord = useCallback(
+    async (record: RuleRecord) => {
+      await applyLibraryMutation(
+        { type: "enable", recordId: record.id },
         record.pendingRevisionId ?? record.activeRevisionId
       );
     },
@@ -588,12 +663,15 @@ export function useRuleSources(callbacks: RuleSourcesCallbacks): RuleSourcesStat
     reloadRuleLibrary,
     createLibraryDraft,
     importApprovedAiDraft,
+    importAndApproveAiRule,
     validateLibraryDraft,
     saveSubscriptionDraft,
     enableSubscriptionPack,
+    importStarterRules,
     saveLibraryDraft,
     approveLibraryRecord,
     disableLibraryRecord,
+    enableLibraryRecord,
     deleteLibraryRecord,
     restoreLibraryRecord,
     rollbackLibraryRecord,
@@ -620,6 +698,41 @@ function sanitizeSubscriptionUrl(value: string): string | null {
   } catch {
     return null;
   }
+}
+
+function findBundledStarterRecord(snapshot: RuleLibrarySnapshot | null): RuleRecord | undefined {
+  return snapshot?.records.find(
+    (record) =>
+      record.state !== "deleted" &&
+      record.revisions.some((revision) => revision.provenance.sourceLabel === "bundledStarter")
+  );
+}
+
+function bundledStarterHeadHash(record: RuleRecord | undefined): string | null {
+  if (!record) {
+    return null;
+  }
+  const headId = record.pendingRevisionId ?? record.activeRevisionId;
+  return record.revisions.find((revision) => revision.id === headId)?.contentHash ?? null;
+}
+
+function starterImportErrorNotice(
+  message: string,
+  translate: (key: string) => string
+): string {
+  if (message.includes("starterRulesDisabled")) {
+    return translate("rule.starterDisabled");
+  }
+  if (message.includes("starterRulesEdited")) {
+    return translate("rule.starterEdited");
+  }
+  if (message.includes("rule identifier conflicts with an active rule")) {
+    return translate("rule.starterConflict");
+  }
+  if (message.includes("rule validation failed")) {
+    return translate("rule.starterCompileFailed");
+  }
+  return message;
 }
 
 function manualProvenance(): RuleProvenance {

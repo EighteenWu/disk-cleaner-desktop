@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { aiDraftApprovalReady, aiDraftValidationReady } from "./aiDraftWorkflow";
+import {
+  aiConfirmApprovalReady,
+  aiDraftApprovalReady,
+  aiDraftValidationReady
+} from "./aiDraftWorkflow";
 import type { AiRuleDraft } from "./types";
 
 function draft(overrides: Partial<AiRuleDraft> = {}): AiRuleDraft {
@@ -52,5 +56,12 @@ describe("AI draft workflow gates", () => {
         false
       )
     ).toBe(false);
+  });
+
+  it("blocks approval while rewrite marks or an instruction are pending", () => {
+    const current = draft();
+    expect(aiConfirmApprovalReady(current, false, [], "")).toBe(true);
+    expect(aiConfirmApprovalReady(current, false, ["cache.temp"], "")).toBe(false);
+    expect(aiConfirmApprovalReady(current, false, [], "只要缓存")).toBe(false);
   });
 });

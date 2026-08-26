@@ -15,7 +15,10 @@ export interface DialogProps {
   children: ReactNode;
   footer?: ReactNode;
   className?: string;
+  overlayClassName?: string;
 }
+
+const dialogEscapeStack: Array<() => void> = [];
 
 export function Dialog({
   title,
@@ -24,22 +27,31 @@ export function Dialog({
   onClose,
   children,
   footer,
-  className
+  className,
+  overlayClassName
 }: DialogProps) {
   const panelRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
   useEffect(() => {
+    const close = () => onCloseRef.current();
+    dialogEscapeStack.push(close);
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        event.stopPropagation();
-        onClose();
-      }
+      if (event.key !== "Escape") return;
+      if (dialogEscapeStack[dialogEscapeStack.length - 1] !== close) return;
+      event.stopPropagation();
+      close();
     }
 
     document.addEventListener("keydown", handleKeyDown);
 
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      const index = dialogEscapeStack.lastIndexOf(close);
+      if (index >= 0) dialogEscapeStack.splice(index, 1);
+    };
+  }, []);
 
   useEffect(() => {
     // Move focus into the dialog so keyboard users are not left behind on the
@@ -53,7 +65,7 @@ export function Dialog({
 
   return (
     <div
-      className="dialogOverlay"
+      className={overlayClassName ? `dialogOverlay ${overlayClassName}` : "dialogOverlay"}
       role="presentation"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {

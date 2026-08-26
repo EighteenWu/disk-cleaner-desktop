@@ -9,18 +9,19 @@ mod windows_scheduler;
 
 use ai_provider::{
     ProviderConnectionResult, ProviderError, ProviderErrorCategory, ProviderGenerationRequest,
-    ProviderModel, ProviderModelQuery, ProviderProfile,
+    ProviderModel, ProviderModelQuery, ProviderPlanRequest, ProviderProfile,
 };
 use app_storage::{AppLogEntry, StoredRuleSubscription};
 use cleaner_core::{
-    compile_cleanup_rules_yaml, execute_cleanup_for_candidates_with_progress_and_control,
-    import_winapp2_ini, initial_scan_snapshot, preview_cleanup_for_candidates,
-    redacted_scan_summary, scan_candidate_children_for_candidate,
-    scan_snapshot_with_request_and_progress, scan_snapshot_with_request_and_progress_and_inventory,
-    validate_rule_subscription_url, CleanupCandidate, CleanupControlFlow, CleanupController,
-    CleanupExecutionOptions, CleanupPlan, CleanupReport, InventoryPage, InventorySort,
-    RuleCompilation, RuleLibrarySnapshot, RuleSourceKind, RuleValidationReport, ScanController,
-    ScanMode, ScanRequest, ScanSnapshot,
+    build_space_digest, compile_cleanup_rules_yaml,
+    execute_cleanup_for_candidates_with_progress_and_control, import_winapp2_ini,
+    initial_scan_snapshot, preview_cleanup_for_candidates, redacted_scan_summary,
+    scan_candidate_children_for_candidate, scan_snapshot_with_request_and_progress,
+    scan_snapshot_with_request_and_progress_and_inventory, validate_rule_subscription_url,
+    CleanupCandidate, CleanupControlFlow, CleanupController, CleanupExecutionOptions, CleanupPlan,
+    CleanupReport, InventoryPage, InventorySort, RuleCompilation, RuleLibrarySnapshot,
+    RuleSourceKind, RuleValidationReport, ScanController, ScanMode, ScanRequest, ScanSnapshot,
+    SPACE_DIGEST_FETCH_LIMIT,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -114,6 +115,10 @@ enum RuleLibraryMutationAction {
         display_name: String,
         envelope: cleaner_core::ApprovedRuleEnvelope,
     },
+    ImportAndApproveAiRule {
+        display_name: String,
+        envelope: cleaner_core::ApprovedRuleEnvelope,
+    },
     SaveDraft {
         record_id: uuid::Uuid,
         content: String,
@@ -124,6 +129,9 @@ enum RuleLibraryMutationAction {
         expected_hash: String,
     },
     Disable {
+        record_id: uuid::Uuid,
+    },
+    Enable {
         record_id: uuid::Uuid,
     },
     Delete {
@@ -140,6 +148,9 @@ enum RuleLibraryMutationAction {
         display_name: String,
         content: String,
         provenance: cleaner_core::RuleProvenance,
+    },
+    ImportAndApproveStarter {
+        display_name: String,
     },
 }
 
@@ -721,7 +732,13 @@ async fn mutate_rule_library(
             RuleLibraryMutationAction::ImportApprovedAiDraft {
                 display_name,
                 envelope,
-            } => cleaner_core::import_approved_ai_rule(&current, display_name, &envelope, context),
+            }
+            | RuleLibraryMutationAction::ImportAndApproveAiRule {
+                display_name,
+                envelope,
+            } => {
+                cleaner_core::import_and_approve_ai_rule(&current, display_name, &envelope, context)
+            }
             RuleLibraryMutationAction::SaveDraft {
                 record_id,
                 content,
@@ -744,8 +761,14 @@ async fn mutate_rule_library(
                 provenance,
                 context,
             ),
+            RuleLibraryMutationAction::ImportAndApproveStarter { display_name } => {
+                cleaner_core::import_and_approve_starter_rules(&current, display_name, context)
+            }
             RuleLibraryMutationAction::Disable { record_id } => {
                 cleaner_core::disable_rule_record(&current, record_id, context)
+            }
+            RuleLibraryMutationAction::Enable { record_id } => {
+                cleaner_core::enable_rule_record(&current, record_id, context)
             }
             RuleLibraryMutationAction::Delete { record_id } => {
                 cleaner_core::delete_rule_record(&current, record_id, context)
@@ -947,6 +970,72 @@ async fn generate_ai_rules(
         request_id: response.request_id,
         draft,
     })
+}
+
+#[tauri::command]
+async fn generate_ai_rule_plan(
+    app: AppHandle,
+    generation_control: State<'_, AiGenerationControl>,
+    inventory_repository: State<'_, InventoryRepository>,
+    profile_id: String,
+    mut request: ProviderPlanRequest,
+) -> Result<ai_provider::ProviderPlanResponse, ProviderError> {
+    let root = app_storage::app_storage_root(&app).map_err(|message| ProviderError {
+        category: ProviderErrorCategory::Configuration,
+        message,
+        retry_after_seconds: None,
+    })?;
+    let profiles = ai_provider::read_profiles(&root, &credentials::WindowsCredentialStore)
+        .map_err(|message| ProviderError {
+            category: ProviderErrorCategory::Configuration,
+            message,
+            retry_after_seconds: None,
+        })?;
+    let profile = profiles
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+        .ok_or_else(|| ProviderError {
+            category: ProviderErrorCategory::Configuration,
+            message: "未找到指定的 AI Provider 配置。".to_string(),
+            retry_after_seconds: None,
+        })?;
+    if let Some(session_id) = request.scan_session_id.clone() {
+        let repository = inventory_repository.inner().clone();
+        request.space_digest = tauri::async_runtime::spawn_blocking(move || {
+            repository
+                .list_largest_directories(&session_id, SPACE_DIGEST_FETCH_LIMIT)
+                .ok()
+                .map(build_space_digest)
+        })
+        .await
+        .ok()
+        .flatten();
+    }
+    let token = generation_control
+        .start()
+        .map_err(|message| ProviderError {
+            category: ProviderErrorCategory::Configuration,
+            message,
+            retry_after_seconds: None,
+        })?;
+    let app_for_progress = app.clone();
+    let result = tokio::select! {
+        result = ai_provider::generate_plan(
+            &profile,
+            &request,
+            &credentials::WindowsCredentialStore,
+            |progress| {
+                let _ = app_for_progress.emit(AI_GENERATION_PROGRESS_EVENT, &progress);
+            },
+        ) => result,
+        _ = token.cancelled() => Err(ProviderError {
+            category: ProviderErrorCategory::Cancelled,
+            message: "AI 规则对话已取消。".to_string(),
+            retry_after_seconds: None,
+        }),
+    };
+    generation_control.finish();
+    result
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1206,6 +1295,7 @@ pub fn run() {
             test_ai_provider_connection,
             test_ai_provider_generation,
             generate_ai_rules,
+            generate_ai_rule_plan,
             cancel_ai_rule_generation,
             revise_ai_rule_draft,
             validate_ai_rule_draft,
